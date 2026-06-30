@@ -17,7 +17,6 @@ pub mod cst;
 pub mod db;
 pub mod enzymes;
 pub mod identify;
-pub mod iibdb;
 pub mod markers;
 pub mod parallel;
 

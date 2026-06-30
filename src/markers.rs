@@ -40,12 +40,8 @@ pub fn canonical(seq: &[u8]) -> Vec<u8> {
     }
 }
 
-/// FNV-1a 64-bit hash.
-///
-/// NOTE: Fast2bRAD-M hashes tags with `fxhash::FxHasher`. To consume its `*.iibdb`
-/// files directly, production should hash with the identical FxHash function instead
-/// of FNV so marker values are byte-compatible. We use FNV here only to stay
-/// dependency-free; DBs built by this prototype are internally consistent.
+/// FNV-1a 64-bit hash. Dependency-free; genome and sample tags are hashed with the same
+/// function, so marker values are internally consistent across DB build and profiling.
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;

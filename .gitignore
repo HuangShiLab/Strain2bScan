@@ -8,5 +8,4 @@
 # local databases / test outputs (regenerate with `build`/`cluster`)
 *.db.tsv
 *.db.members.tsv
-*.iibdb
 *.iibsp

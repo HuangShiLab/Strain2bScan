@@ -76,8 +76,10 @@ STRAIN2BSCAN_THREADS=8 strain2bscan cluster ...   # control threads (default: al
 Within a species each tag is classified by its **within-species incidence**: `SpeciesCore`
 (in all clusters → detects the species, not strains), `ClusterSpecific` (one cluster),
 `StrainSpecific` (one genome), `SharedPartial`. Cluster/strain-specific tags are the Layer-2
-markers. These are derived from **all** tags of the species' genomes — not from a pre-built
-species-specific database (which is dominated by `SpeciesCore`).
+markers. They are derived from **all** 2b tags of the species' genomes (StrainScan's
+all-k-mer approach) — *not* from a species-unique marker set. Fast2bRAD-M's species-unique
+markers are computed by comparing each genome against genomes of *other* species (for species
+detection) and are orthogonal to within-species strain structure.
 
 ## Modules
 
@@ -90,7 +92,6 @@ species-specific database (which is dominated by `SpeciesCore`).
 | `identify.rs` | Layer-2: unique-marker detection + unique-marker-depth abundance (+ NNLS) |
 | `parallel.rs` | dependency-free parallel map (`std::thread::scope`) |
 | `bench.rs` | precision/recall/F1, L1, Bray–Curtis metrics |
-| `iibdb.rs` | reader for Fast2bRAD-M `*.iibdb`/`*.iibsp` (uses stored hashes) |
 | `main.rs` | CLI |
 
 ## Performance (vs StrainScan, real C. acnes)
@@ -112,7 +113,8 @@ throughput is linear. Full benchmarks, scaling curves and accuracy: see the
   use case.
 - Reads are matched exactly; an error-tolerant mode and gzip/streaming I/O
   ([needletail](https://crates.io/crates/needletail)) are planned.
-- To consume Fast2bRAD-M `*.iibdb` hashes directly, swap the FNV hash for `fxhash`.
+- Species selection (which species to resolve at strain level) comes from Fast2bRAD-M's
+  species-level profiling output; Strain2bScan then digests those species' genomes itself.
 
 ## Citation
 
