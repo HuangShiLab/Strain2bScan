@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# OS
+.DS_Store
+
+# local databases / test outputs (regenerate with `build`/`cluster`)
+*.db.tsv
+*.db.members.tsv
+*.iibdb
+*.iibsp

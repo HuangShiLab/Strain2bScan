@@ -1,0 +1,29 @@
+[package]
+name = "strain2bscan"
+version = "0.1.0"
+edition = "2021"
+authors = ["Shi Huang Lab (HuangShiLab)"]
+description = "Fast strain-level metagenomic profiling on 2bRAD-reduced k-mer markers (a 2bRAD extension of StrainScan)"
+license = "MIT"
+repository = "https://github.com/HuangShiLab/Strain2bScan"
+homepage = "https://github.com/HuangShiLab/Strain2bScan"
+readme = "README.md"
+keywords = ["metagenomics", "strain", "2bRAD", "bioinformatics", "kmer"]
+categories = ["science", "command-line-utilities"]
+
+# Dependency-free (std only); multi-threading uses std::thread::scope. Optional future deps:
+#   - needletail  (streaming + gzip FASTA/FASTQ, replaces markers::read_fastx)
+#   - fxhash      (byte-compatible with Fast2bRAD-M *.iibdb hashes)
+#   - clap        (richer CLI; replaces the hand-rolled parser in main.rs)
+[dependencies]
+
+[lib]
+name = "strain2bscan"
+path = "src/lib.rs"
+
+[[bin]]
+name = "strain2bscan"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
