@@ -27,6 +27,10 @@ while clustering and Layer-2 logic are preserved.
   unique-marker depth (non-negative Elastic Net solver also included).
 - **Multi-species mode (`multi-profile`):** digest a sample **once**, match all per-species
   DBs in parallel; a Layer-1 **species gate** suppresses cross-species false positives.
+- **Assembly-quality aware:** variable completeness biases Jaccard toward *spurious splits*
+  (an incomplete genome looks distant from its complete twin). `build`/`cluster` always flag
+  likely-incomplete genomes (single-copy tag count ≪ the conspecific median) and can drop
+  fragmented/incomplete assemblies before clustering (`--max-contigs N`, `--min-tag-fraction F`).
 - **Parallel** (dependency-free, `std` threads) — ~10× build, ~7× profile on 16 cores.
 - Honest reporting: tells you when a species is detectable but **not strain-resolvable** with
   the given enzyme set (e.g. BcgI alone on a low-diversity species).
@@ -91,6 +95,7 @@ detection) and are orthogonal to within-species strain structure.
 | `cst.rs` | within-species clustering (exact + MinHash) and marker classification |
 | `identify.rs` | Layer-2: unique-marker detection + unique-marker-depth abundance (+ NNLS) |
 | `parallel.rs` | dependency-free parallel map (`std::thread::scope`) |
+| `quality.rs` | assembly-quality filter (contig count + tag-count completeness proxy) |
 | `bench.rs` | precision/recall/F1, L1, Bray–Curtis metrics |
 | `main.rs` | CLI |
 

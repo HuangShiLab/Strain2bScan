@@ -19,5 +19,6 @@ pub mod enzymes;
 pub mod identify;
 pub mod markers;
 pub mod parallel;
+pub mod quality;
 
 pub use markers::Marker;

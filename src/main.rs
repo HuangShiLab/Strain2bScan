@@ -1,7 +1,7 @@
 //! strain2bscan CLI (prototype).
 //!
-//!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv>
-//!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95]
+//!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]
+//!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]
 //!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N]
 //!   strain2bscan info     --db <db.tsv>
 //!   strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]
@@ -28,6 +28,7 @@ use strain2bscan::markers::{
     Marker,
 };
 use strain2bscan::parallel::{num_threads, par_map};
+use strain2bscan::quality::{self, GenomeRec, QualityFilter};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,8 +47,8 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage:\n  \
-                 strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv>\n  \
-                 strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95]\n  \
+                 strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
+                 strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set>   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
@@ -105,12 +106,9 @@ fn enzyme_names(set: &[&Enzyme]) -> Vec<String> {
     set.iter().map(|e| e.name.to_string()).collect()
 }
 
-/// Digest every FASTA genome in `dir` → (genome name, single-copy tag markers), in parallel
-/// across genomes (the dominant build cost).
-fn digest_genome_dir(
-    dir: &Path,
-    enzymes: &[&Enzyme],
-) -> Result<Vec<(String, Vec<Marker>)>, String> {
+/// Digest every FASTA genome in `dir` → `GenomeRec` (name, contig count, single-copy tag
+/// markers), in parallel across genomes (the dominant build cost).
+fn digest_genome_dir(dir: &Path, enzymes: &[&Enzyme]) -> Result<Vec<GenomeRec>, String> {
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
@@ -123,17 +121,62 @@ fn digest_genome_dir(
         return Err("no FASTA genomes (.fa/.fasta/.fna) found".into());
     }
     paths.sort(); // deterministic genome order regardless of threading
-    let results: Vec<Result<(String, Vec<Marker>), String>> = par_map(&paths, |path| {
+    let results: Vec<Result<GenomeRec, String>> = par_map(&paths, |path| {
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
         let seqs = read_fastx(path).map_err(|e| e.to_string())?;
+        let n_contigs = seqs.len();
         let counts = genome_marker_counts_multi(&seqs, enzymes);
-        Ok((name, single_copy_markers(&counts)))
+        Ok(GenomeRec { name, n_contigs, markers: single_copy_markers(&counts) })
     });
     results.into_iter().collect()
+}
+
+/// Parse `--max-contigs` / `--min-tag-fraction` into a `QualityFilter`.
+fn parse_quality_filter(opts: &HashMap<String, String>) -> Result<QualityFilter, String> {
+    let max_contigs = match opts.get("max-contigs") {
+        Some(s) => Some(s.parse().map_err(|_| "bad --max-contigs (want integer)")?),
+        None => None,
+    };
+    let min_tag_fraction = match opts.get("min-tag-fraction") {
+        Some(s) => Some(s.parse().map_err(|_| "bad --min-tag-fraction (want 0..1)")?),
+        None => None,
+    };
+    Ok(QualityFilter { max_contigs, min_tag_fraction, ..QualityFilter::default() })
+}
+
+/// Digest a genome dir, apply the assembly-quality filter, print the report, and return the
+/// kept `(name, markers)`. Variable assembly completeness biases Jaccard clustering toward
+/// spurious splits; flagging is always on, dropping happens only when a threshold is set.
+fn digest_and_filter(
+    dir: &Path,
+    enzymes: &[&Enzyme],
+    opts: &HashMap<String, String>,
+) -> Result<Vec<(String, Vec<Marker>)>, String> {
+    let genomes = digest_genome_dir(dir, enzymes)?;
+    let filt = parse_quality_filter(opts)?;
+    let rep = quality::apply(genomes, &filt);
+    println!(
+        "quality: {} genomes, median single-copy tags = {}",
+        rep.n_input, rep.median_tags
+    );
+    for (name, nt) in &rep.flagged {
+        println!(
+            "  ⚠ likely incomplete: {name} has {nt} tags (< {:.0}% of median {}) — kept; pass --min-tag-fraction to drop",
+            filt.warn_fraction * 100.0,
+            rep.median_tags
+        );
+    }
+    for (name, reason) in &rep.dropped {
+        println!("  ✗ dropped {name}: {reason}");
+    }
+    if rep.kept.is_empty() {
+        return Err("all genomes removed by the quality filter".into());
+    }
+    Ok(rep.kept.into_iter().map(|g| (g.name, g.markers)).collect())
 }
 
 fn cmd_build(opts: &HashMap<String, String>) -> Result<(), String> {
@@ -141,7 +184,7 @@ fn cmd_build(opts: &HashMap<String, String>) -> Result<(), String> {
     let genomes = PathBuf::from(req(opts, "genomes")?);
     let out = PathBuf::from(req(opts, "out")?);
 
-    let strains = digest_genome_dir(&genomes, &set)?;
+    let strains = digest_and_filter(&genomes, &set, opts)?;
     for (name, m) in &strains {
         println!("  {name}: {} single-copy tag markers", m.len());
     }
@@ -163,7 +206,7 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SIMILARITY);
 
-    let strains = digest_genome_dir(&genomes, &set)?;
+    let strains = digest_and_filter(&genomes, &set, opts)?;
     let n_genomes = strains.len();
     let cst = SpeciesCst::build(strains, similarity);
     let method = if n_genomes > MINHASH_ABOVE {
