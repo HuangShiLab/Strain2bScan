@@ -2,7 +2,7 @@
 //!
 //!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]
 //!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]
-//!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N]
+//!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]
 //!   strain2bscan info     --db <db.tsv>
 //!   strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]
 //!   strain2bscan demo | cst-demo
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N]\n  \
+                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set>   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
@@ -327,6 +327,9 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     let mut params = Params::default();
     if let Some(v) = opts.get("min-support") {
         params.min_support_markers = v.parse().map_err(|_| "bad --min-support")?;
+    }
+    if let Some(v) = opts.get("min-coverage") {
+        params.min_coverage = v.parse().map_err(|_| "bad --min-coverage (want 0..1)")?;
     }
     let calls = profile(&db, &counts, &params);
 

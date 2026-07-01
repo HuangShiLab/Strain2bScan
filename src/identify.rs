@@ -39,7 +39,7 @@ impl Default for Params {
             // Recalibrated for sparse 2bRAD markers (full-k-mer StrainScan uses msn*k≈1240
             // k-mers; tag markers are ~50-100x sparser, so the floor is in *tag* units).
             min_support_markers: 10,
-            min_coverage: 0.7,
+            min_coverage: 0.1,
             min_rel_abundance: 0.02,
             alpha: 0.01,
             l1_ratio: 0.5,
@@ -131,10 +131,12 @@ pub fn profile(db: &StrainDb, counts: &HashMap<Marker, u32>, p: &Params) -> Vec<
             rel_abundance: rel,
         });
     }
-    // Detection already gated on unique markers, so filter only by abundance here. Coverage
-    // is retained as a reported confidence metric (errors can lower it below min_coverage).
-    calls.retain(|c| c.rel_abundance >= p.min_rel_abundance);
-    let _ = p.min_coverage;
+    // Filter by relative abundance AND a minimum coverage *fraction* of the cluster's unique
+    // markers. The coverage gate suppresses spurious calls of large, similar clusters whose
+    // absolute unique-marker count clears the floor at a tiny coverage fraction — common in
+    // low-diversity species (e.g. S. epidermidis) where genomes cluster heavily. The default
+    // (0.1) is permissive to tolerate errors / low depth / multi-genome clusters.
+    calls.retain(|c| c.coverage >= p.min_coverage && c.rel_abundance >= p.min_rel_abundance);
     let kept_sum: f64 = calls.iter().map(|c| c.rel_abundance).sum();
     if kept_sum > 0.0 {
         for c in &mut calls {
