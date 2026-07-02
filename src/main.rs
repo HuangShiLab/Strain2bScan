@@ -130,7 +130,8 @@ fn digest_genome_dir(dir: &Path, enzymes: &[&Enzyme]) -> Result<Vec<GenomeRec>, 
         let seqs = read_fastx(path).map_err(|e| e.to_string())?;
         let n_contigs = seqs.len();
         let counts = genome_marker_counts_multi(&seqs, enzymes);
-        Ok(GenomeRec { name, n_contigs, markers: single_copy_markers(&counts) })
+        let full_markers: Vec<Marker> = counts.keys().copied().collect();
+        Ok(GenomeRec { name, n_contigs, markers: single_copy_markers(&counts), full_markers })
     });
     results.into_iter().collect()
 }
@@ -155,7 +156,7 @@ fn digest_and_filter(
     dir: &Path,
     enzymes: &[&Enzyme],
     opts: &HashMap<String, String>,
-) -> Result<Vec<(String, Vec<Marker>)>, String> {
+) -> Result<Vec<GenomeRec>, String> {
     let genomes = digest_genome_dir(dir, enzymes)?;
     let filt = parse_quality_filter(opts)?;
     let rep = quality::apply(genomes, &filt);
@@ -176,7 +177,7 @@ fn digest_and_filter(
     if rep.kept.is_empty() {
         return Err("all genomes removed by the quality filter".into());
     }
-    Ok(rep.kept.into_iter().map(|g| (g.name, g.markers)).collect())
+    Ok(rep.kept)
 }
 
 fn cmd_build(opts: &HashMap<String, String>) -> Result<(), String> {
@@ -184,11 +185,11 @@ fn cmd_build(opts: &HashMap<String, String>) -> Result<(), String> {
     let genomes = PathBuf::from(req(opts, "genomes")?);
     let out = PathBuf::from(req(opts, "out")?);
 
-    let strains = digest_and_filter(&genomes, &set, opts)?;
-    for (name, m) in &strains {
-        println!("  {name}: {} single-copy tag markers", m.len());
+    let recs = digest_and_filter(&genomes, &set, opts)?;
+    for r in &recs {
+        println!("  {}: {} single-copy tag markers", r.name, r.markers.len());
     }
-    let mut db = StrainDb::build(strains);
+    let mut db = StrainDb::build(recs.into_iter().map(|r| (r.name, r.markers)).collect());
     db.enzymes = enzyme_names(&set);
     db.save(&out).map_err(|e| e.to_string())?;
     print_stats(&db);
@@ -206,9 +207,12 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SIMILARITY);
 
-    let strains = digest_and_filter(&genomes, &set, opts)?;
-    let n_genomes = strains.len();
-    let cst = SpeciesCst::build(strains, similarity);
+    let recs = digest_and_filter(&genomes, &set, opts)?;
+    let n_genomes = recs.len();
+    let cst = SpeciesCst::build(
+        recs.into_iter().map(|r| (r.name, r.markers, r.full_markers)).collect(),
+        similarity,
+    );
     let method = if n_genomes > MINHASH_ABOVE {
         "MinHash"
     } else {
@@ -521,17 +525,17 @@ fn cmd_cst_demo() -> Result<(), String> {
     let core: Vec<Marker> = (0..200).collect();
     let clu_a: Vec<Marker> = (200..240).collect();
     let clu_b: Vec<Marker> = (300..340).collect();
-    let mk = |extra: &[Marker], base: Marker| {
+    let mk = |name: &str, extra: &[Marker], base: Marker| {
         let mut v = core.clone();
         v.extend_from_slice(extra);
         v.extend((0..3).map(|i| base + i));
-        v
+        (name.to_string(), v.clone(), v) // (name, single-copy, full) — no multi-copy here
     };
     let genomes = vec![
-        ("g0".to_string(), mk(&clu_a, 1000)),
-        ("g1".to_string(), mk(&clu_a, 1100)),
-        ("g2".to_string(), mk(&clu_b, 2000)),
-        ("g3".to_string(), mk(&clu_b, 2100)),
+        mk("g0", &clu_a, 1000),
+        mk("g1", &clu_a, 1100),
+        mk("g2", &clu_b, 2000),
+        mk("g3", &clu_b, 2100),
     ];
 
     println!("== CST demo: 1 species, 4 genomes (g0/g1 ~identical, g2/g3 ~identical) ==");

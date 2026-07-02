@@ -18,7 +18,10 @@ use crate::markers::Marker;
 pub struct GenomeRec {
     pub name: String,
     pub n_contigs: usize,
+    /// single-copy tag markers (used for clustering / scoring / the completeness proxy)
     pub markers: Vec<Marker>,
+    /// full tag set (any copy) — carried for occurrence-based uniqueness in the CST DB
+    pub full_markers: Vec<Marker>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +104,8 @@ mod tests {
     use super::*;
 
     fn rec(name: &str, n_contigs: usize, n_tags: usize) -> GenomeRec {
-        GenomeRec { name: name.into(), n_contigs, markers: (0..n_tags as u64).collect() }
+        let m: Vec<Marker> = (0..n_tags as u64).collect();
+        GenomeRec { name: name.into(), n_contigs, markers: m.clone(), full_markers: m }
     }
 
     #[test]

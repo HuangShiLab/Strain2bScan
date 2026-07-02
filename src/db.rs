@@ -23,6 +23,12 @@ pub struct StrainDb {
     pub marker_degree: HashMap<Marker, u32>,
     /// Enzyme set used to build this DB (samples must be digested with the same set).
     pub enzymes: Vec<String>,
+    /// Truly-unique markers, defined by **full genome occurrence** (a marker absent — at any
+    /// copy number — from every other cluster's genomes), set by CST `cluster_db`. Stricter
+    /// than `marker_degree == 1` (single-copy membership), which mislabels a tag as unique when
+    /// it is multi-copy in another cluster (single-copy-filter asymmetry) and thus reachable
+    /// from that cluster's reads. If empty, uniqueness falls back to `marker_degree`.
+    pub unique_set: HashSet<Marker>,
 }
 
 impl StrainDb {
@@ -44,10 +50,15 @@ impl StrainDb {
         self.strain_names.len()
     }
 
-    /// Is `marker` carried by exactly one strain in the DB?
+    /// Is `marker` unique to a single cluster? Uses the occurrence-based `unique_set` when set
+    /// (CST databases), else falls back to single-copy membership degree.
     #[inline]
     pub fn is_unique(&self, marker: Marker) -> bool {
-        self.marker_degree.get(&marker).copied() == Some(1)
+        if self.unique_set.is_empty() {
+            self.marker_degree.get(&marker).copied() == Some(1)
+        } else {
+            self.unique_set.contains(&marker)
+        }
     }
 
     /// The unique markers of strain `j`.
@@ -76,6 +87,15 @@ impl StrainDb {
             self.n_strains(),
             self.enzymes.join(",")
         )?;
+        if !self.unique_set.is_empty() {
+            let joined = self
+                .unique_set
+                .iter()
+                .map(|m| format!("{m:x}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(w, "#unique\t{joined}")?;
+        }
         for (name, markers) in self.strain_names.iter().zip(&self.strain_markers) {
             let joined = markers
                 .iter()
@@ -91,16 +111,24 @@ impl StrainDb {
         let reader = BufReader::new(File::open(path)?);
         let mut strains = Vec::new();
         let mut enzymes: Vec<String> = Vec::new();
-        for (i, line) in reader.lines().enumerate() {
+        let mut unique_set: HashSet<Marker> = HashSet::new();
+        let hexset = |csv: &str| {
+            csv.split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| Marker::from_str_radix(s, 16).ok())
+                .collect::<HashSet<Marker>>()
+        };
+        for line in reader.lines() {
             let line = line?;
-            if i == 0 && line.starts_with('#') {
-                // header: "#strain2bscan-db\t<n>\t<enzymes_csv>"
-                if let Some(csv) = line.split('\t').nth(2) {
-                    enzymes = csv
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect();
+            if line.starts_with('#') {
+                if line.starts_with("#strain2bscan-db") {
+                    if let Some(csv) = line.split('\t').nth(2) {
+                        enzymes = csv.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+                    }
+                } else if line.starts_with("#unique") {
+                    if let Some(csv) = line.split('\t').nth(1) {
+                        unique_set = hexset(csv);
+                    }
                 }
                 continue;
             }
@@ -120,6 +148,7 @@ impl StrainDb {
         }
         let mut db = StrainDb::build(strains);
         db.enzymes = enzymes;
+        db.unique_set = unique_set;
         Ok(db)
     }
 

@@ -46,7 +46,10 @@ pub enum MarkerClass {
 #[derive(Debug, Clone)]
 pub struct SpeciesCst {
     pub genome_names: Vec<String>,
+    /// Per genome: single-copy tag markers (used for clustering, scoring, abundance).
     pub genome_markers: Vec<HashSet<Marker>>,
+    /// Per genome: full tag set (any copy) — used only to define occurrence-based uniqueness.
+    pub genome_full: Vec<HashSet<Marker>>,
     /// cluster id -> member genome indices.
     pub clusters: Vec<Vec<usize>>,
     /// genome index -> cluster id.
@@ -185,12 +188,16 @@ pub fn single_linkage_minhash(
 }
 
 impl SpeciesCst {
-    /// Build the CST for one species from `(name, single-copy tag markers)` per genome.
-    pub fn build(genomes: Vec<(String, Vec<Marker>)>, similarity: f64) -> Self {
-        let genome_names: Vec<String> = genomes.iter().map(|(n, _)| n.clone()).collect();
+    /// Build the CST for one species from `(name, single-copy markers, full tag set)` per
+    /// genome. Clustering uses the single-copy markers; the full sets define occurrence-based
+    /// uniqueness in `cluster_db`.
+    pub fn build(genomes: Vec<(String, Vec<Marker>, Vec<Marker>)>, similarity: f64) -> Self {
+        let genome_names: Vec<String> = genomes.iter().map(|(n, _, _)| n.clone()).collect();
+        let genome_full: Vec<HashSet<Marker>> =
+            genomes.iter().map(|(_, _, f)| f.iter().copied().collect()).collect();
         let genome_markers: Vec<HashSet<Marker>> = genomes
             .into_iter()
-            .map(|(_, m)| m.into_iter().collect())
+            .map(|(_, m, _)| m.into_iter().collect())
             .collect();
         // Exact Jaccard for small panels (deterministic, accurate); MinHash sketches scale
         // to large panels where O(n²·m) exact comparison is too costly. STRAIN2BSCAN_CLUSTER
@@ -214,6 +221,7 @@ impl SpeciesCst {
         SpeciesCst {
             genome_names,
             genome_markers,
+            genome_full,
             clusters,
             genome_cluster,
         }
@@ -294,7 +302,31 @@ impl SpeciesCst {
                 (format!("C{cid}"), set.into_iter().collect())
             })
             .collect();
-        StrainDb::build(units)
+        let mut db = StrainDb::build(units);
+        // Occurrence-based uniqueness: a scored (single-copy) marker is unique iff it occurs
+        // — at any copy number — in exactly one cluster's genomes. This guards against the
+        // single-copy-filter asymmetry that mislabels a tag as cluster-unique when it is
+        // multi-copy (hence filtered) in another cluster yet reachable from that cluster's reads.
+        let full_unions: Vec<HashSet<Marker>> = self
+            .clusters
+            .iter()
+            .map(|members| {
+                let mut s = HashSet::new();
+                for &g in members {
+                    s.extend(self.genome_full[g].iter().copied());
+                }
+                s
+            })
+            .collect();
+        let mut scored: HashSet<Marker> = HashSet::new();
+        for sm in &db.strain_markers {
+            scored.extend(sm.iter().copied());
+        }
+        db.unique_set = scored
+            .into_iter()
+            .filter(|m| full_unions.iter().filter(|fu| fu.contains(m)).count() == 1)
+            .collect();
+        db
     }
 }
 
@@ -303,21 +335,23 @@ mod tests {
     use super::*;
 
     /// Two clusters: {g0,g1} share a lot; {g2,g3} share a lot; the two pairs are distant.
-    fn two_cluster_species() -> Vec<(String, Vec<Marker>)> {
+    /// (single-copy markers and full set are identical here — synthetic genomes have no
+    /// multi-copy tags, so occurrence-based uniqueness reduces to cluster degree.)
+    fn two_cluster_species() -> Vec<(String, Vec<Marker>, Vec<Marker>)> {
         let core: Vec<Marker> = (0..200).collect(); // shared by all 4 (species core)
         let clu_a: Vec<Marker> = (200..240).collect(); // g0,g1 only
         let clu_b: Vec<Marker> = (300..340).collect(); // g2,g3 only
-        let mk = |extra: &[Marker], priv_base: Marker| {
+        let g = |name: &str, extra: &[Marker], priv_base: Marker| {
             let mut v = core.clone();
             v.extend_from_slice(extra);
             v.extend((0..3).map(|i| priv_base + i)); // 3 private markers
-            v
+            (name.to_string(), v.clone(), v)
         };
         vec![
-            ("g0".into(), mk(&clu_a, 1000)),
-            ("g1".into(), mk(&clu_a, 1100)),
-            ("g2".into(), mk(&clu_b, 2000)),
-            ("g3".into(), mk(&clu_b, 2100)),
+            g("g0", &clu_a, 1000),
+            g("g1", &clu_a, 1100),
+            g("g2", &clu_b, 2000),
+            g("g3", &clu_b, 2100),
         ]
     }
 
