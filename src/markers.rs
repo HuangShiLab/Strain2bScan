@@ -62,22 +62,19 @@ pub fn marker_from_tag(tag: &[u8]) -> Marker {
 
 /// Digest one sequence, returning every tag marker (with multiplicity).
 ///
-/// Scans **both strands** (the sequence and its reverse complement). This is required for
-/// strand invariance: the enzyme patterns frame a tag window differently depending on which
-/// strand a site is read from, so a forward-only scan of a genome captures only one strand's
-/// tags, while sequencing reads (which come from both strands) produce both. Scanning both
-/// strands here makes genome-DB and read-sample digestion live in the same marker space.
+/// Forward-strand scan only. Each enzyme carries forward+reverse patterns that are exact
+/// reverse-complement pairs at its tag length, so a single forward pass finds sites in both
+/// orientations, and `marker_from_tag` canonicalizes each tag — making digestion strand-invariant
+/// (`digest(seq) == digest(revcomp(seq))`) without scanning both strands. This mirrors
+/// Fast2bRAD-M / `2bRADExtraction.pl` and keeps the marker set at 1× (no doubling).
 pub fn digest_sequence(seq: &[u8], enzyme: &Enzyme) -> Vec<Marker> {
     let mut up = seq.to_vec();
     up.make_ascii_uppercase();
-    let rc = revcomp(&up);
-    let mut out = Vec::new();
-    for strand in [&up, &rc] {
-        for (pos, len) in enzyme.find_all_tags(strand) {
-            out.push(marker_from_tag(&strand[pos..pos + len]));
-        }
-    }
-    out
+    enzyme
+        .find_all_tags(&up)
+        .into_iter()
+        .map(|(pos, len)| marker_from_tag(&up[pos..pos + len]))
+        .collect()
 }
 
 /// Digest one sequence with a **set** of enzymes, pooling all tag markers.
@@ -88,15 +85,12 @@ pub fn digest_sequence(seq: &[u8], enzyme: &Enzyme) -> Vec<Marker> {
 pub fn digest_sequence_multi(seq: &[u8], enzymes: &[&Enzyme]) -> Vec<Marker> {
     let mut up = seq.to_vec();
     up.make_ascii_uppercase();
-    let rc = revcomp(&up);
     let mut out = Vec::new();
-    // Both strands (see `digest_sequence`): required for strand-invariant markers so that a
-    // reference genome (scanned here) and reads from either strand yield the same tag set.
-    for strand in [&up, &rc] {
-        for enzyme in enzymes {
-            for (pos, len) in enzyme.find_all_tags(strand) {
-                out.push(marker_from_tag(&strand[pos..pos + len]));
-            }
+    // Forward-strand scan only (see `digest_sequence`): the forward+reverse patterns are RC pairs,
+    // so this is strand-invariant after canonicalization — no both-strand scan / no 2× markers.
+    for enzyme in enzymes {
+        for (pos, len) in enzyme.find_all_tags(&up) {
+            out.push(marker_from_tag(&up[pos..pos + len]));
         }
     }
     out
@@ -244,22 +238,22 @@ mod tests {
 
     #[test]
     fn digestion_is_strand_invariant() {
-        // Digesting a sequence and its reverse complement must yield the SAME marker set.
-        // (Regression test for the strand bug: the enzyme patterns frame a tag window
-        // differently per strand, so a forward-only scan is not strand-invariant; digestion
-        // must scan both strands. Without this, genome DBs (one strand) and reads (both
-        // strands) live in different marker spaces and similar strains are massively
-        // over-detected.) Uses a real-ish sequence long enough to contain several sites.
-        use crate::enzymes::parse_enzyme_set;
-        let set = parse_enzyme_set("all").unwrap();
-        let seq: Vec<u8> = (0..4000)
+        // Digesting a sequence and its reverse complement must yield the SAME marker set, for
+        // every enzyme. This holds because each enzyme's forward/reverse patterns are exact
+        // reverse-complement pairs at its tag length, so a forward-only scan + canonical hashing
+        // is strand-invariant (mirroring Fast2bRAD-M / 2bRADExtraction.pl) — no both-strand scan.
+        use crate::enzymes::ALL_ENZYMES;
+        let seq: Vec<u8> = (0..8000)
             .map(|i| b"ACGT"[((i * 7 + i / 3 + (i % 11)) % 4) as usize])
             .collect();
         let rc = revcomp(&seq);
-        let fwd: std::collections::HashSet<Marker> = digest_sequence_multi(&seq, &set).into_iter().collect();
-        let rev: std::collections::HashSet<Marker> = digest_sequence_multi(&rc, &set).into_iter().collect();
-        assert_eq!(fwd, rev, "digestion must be strand-invariant");
-        assert!(!fwd.is_empty(), "test sequence should contain some tags");
+        for e in ALL_ENZYMES {
+            let fwd: std::collections::HashSet<Marker> =
+                digest_sequence(&seq, e).into_iter().collect();
+            let rev: std::collections::HashSet<Marker> =
+                digest_sequence(&rc, e).into_iter().collect();
+            assert_eq!(fwd, rev, "{} digestion must be strand-invariant", e.name);
+        }
     }
 
     #[test]
