@@ -50,7 +50,7 @@ fn main() -> ExitCode {
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set>   (many species, sample digested once)\n  \
+                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N]   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
@@ -353,6 +353,44 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Layer-1 outcome for one species in a multi-species sample.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpeciesTier {
+    /// Enough species-specific marker evidence to attempt within-species strain resolution.
+    Resolved,
+    /// Present, but below the evidence needed to resolve strains at this depth.
+    DetectedNotResolved,
+    /// Not enough evidence to call the species present.
+    Absent,
+}
+
+/// Classify a species from ABSOLUTE species-specific marker evidence (never relative abundance).
+/// `present` = its species-specific markers observed in the sample (count >= 2); `total` = its
+/// species-specific markers that exist in the DB; `detect`/`floor` are absolute thresholds and
+/// `frac` is the breadth fraction. resolve gate = max(floor, ceil(frac*total)); detect gate =
+/// min(detect, resolve gate) so detection is never stricter than resolution. Pure + tested.
+fn species_tier(present: usize, total: usize, detect: usize, floor: usize, frac: f64) -> SpeciesTier {
+    let frac_gate = (frac.max(0.0) * total as f64).ceil() as usize;
+    let resolve_gate = floor.max(frac_gate).max(1);
+    let detect_gate = detect.min(resolve_gate);
+    if present >= resolve_gate {
+        SpeciesTier::Resolved
+    } else if present >= detect_gate {
+        SpeciesTier::DetectedNotResolved
+    } else {
+        SpeciesTier::Absent
+    }
+}
+
+/// Per-species Layer-1 result carried out of the parallel map.
+struct SpeciesResult {
+    species: String,
+    present_specific: usize,
+    total_specific: usize,
+    tier: SpeciesTier,
+    calls: Vec<StrainCall>,
+}
+
 /// Multi-species strain profiling: digest the sample reads ONCE, then match the shared tag
 /// counts against every per-species cluster DB in `--dbs <dir>`, in parallel across species.
 /// This is the scalability advantage over running a full k-mer profiler once per species
@@ -390,16 +428,33 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         (sp, StrainDb::load(path).unwrap_or_default())
     });
 
-    // 3) Layer-1 species gate. Strain markers are unique only *within* a species, so an
-    //    absent species can be spuriously hit by a present relative's shared tags. Derive
-    //    species-specific markers (carried by exactly ONE species across the panel — the
-    //    Fast2bRAD species layer) and require enough of them present before profiling strains.
-    // Default tuned on a 40-species real-genome panel (precision ~0.94 @ recall 1.0); the
-    // proper production gate is Fast2bRAD-M's species-level call. Calibrate per panel/depth.
+    // 3) Layer-1 species gate (breadth-aware, three-tier). Strain markers are unique only
+    //    *within* a species, so an absent species can be spuriously hit by a present relative's
+    //    shared tags. We derive species-specific markers — tags carried by exactly ONE species
+    //    across the panel (Strain2bScan's own species layer, same tag space as Fast2bRAD-M) —
+    //    and decide per species from ABSOLUTE marker evidence, never relative abundance:
+    //      total_specific   = the species' species-specific markers that exist in the DB
+    //      present_specific = those observed in this sample (count >= 2)
+    //    resolve_gate = max(min_species_markers, ceil(frac * total_specific)); the fraction term
+    //    makes the bar comparable across species of very different panel sizes and maps to a
+    //    minimum marker-panel coverage. detect_gate = min(min_species_detect, resolve_gate).
+    //    Three outcomes: >= resolve_gate -> strain-resolved (Layer-2); >= detect_gate ->
+    //    detected-not-resolvable (species-level only); else absent. All inputs come from
+    //    Strain2bScan's own DBs + one digest of the raw reads — no external abundance needed.
+    //    Defaults tuned on a 40-species panel (precision ~0.94 @ recall 1.0); calibrate per
+    //    enzyme set and depth.
     let min_species_markers: usize = opts
         .get("min-species-markers")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
+    let min_species_marker_frac: f64 = opts
+        .get("min-species-marker-frac")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let min_species_detect: usize = opts
+        .get("min-species-detect")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
     let mut species_degree: HashMap<Marker, u32> = HashMap::new();
     for (_, db) in &loaded {
         for &m in db.marker_degree.keys() {
@@ -408,16 +463,23 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     }
 
     println!(
-        "sample: {} distinct tag markers; {} species DBs; species-gate≥{} specific markers (threads: {})",
+        "sample: {} distinct tag markers; {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
         counts.len(),
         loaded.len(),
         min_species_markers,
+        min_species_marker_frac * 100.0,
+        min_species_detect,
         num_threads()
     );
 
     // 4) gate + strain-profile each species, in parallel
     let params = Params::default();
-    let per_species: Vec<(String, usize, Vec<StrainCall>)> = par_map(&loaded, |(species, db)| {
+    let per_species: Vec<SpeciesResult> = par_map(&loaded, |(species, db)| {
+        let total_specific = db
+            .marker_degree
+            .keys()
+            .filter(|m| species_degree.get(m).copied().unwrap_or(0) == 1)
+            .count();
         let present_specific = db
             .marker_degree
             .keys()
@@ -426,31 +488,69 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
                     && counts.get(m).copied().unwrap_or(0) >= 2
             })
             .count();
-        if present_specific < min_species_markers {
-            return (species.clone(), present_specific, Vec::new());
-        }
-        (
-            species.clone(),
+        let tier = species_tier(
             present_specific,
-            profile(db, &counts, &params),
-        )
+            total_specific,
+            min_species_detect,
+            min_species_markers,
+            min_species_marker_frac,
+        );
+        let calls = if tier == SpeciesTier::Resolved {
+            profile(db, &counts, &params)
+        } else {
+            Vec::new()
+        };
+        SpeciesResult {
+            species: species.clone(),
+            present_specific,
+            total_specific,
+            tier,
+            calls,
+        }
     });
 
     let mut total_calls = 0;
-    for (species, _, calls) in &per_species {
-        total_calls += calls.len();
-        for c in calls {
-            println!(
-                "  {species}\t{}\t{:.4}\t{:.2}\t{:.0}",
-                c.name, c.rel_abundance, c.coverage, c.support
-            );
+    let (mut n_resolved, mut n_detected) = (0usize, 0usize);
+    for r in &per_species {
+        match r.tier {
+            SpeciesTier::Resolved => {
+                n_resolved += 1;
+                total_calls += r.calls.len();
+                if r.calls.is_empty() {
+                    println!(
+                        "  {}\t[strain-resolved, no cluster above threshold]\tmarkers={}/{}",
+                        r.species, r.present_specific, r.total_specific
+                    );
+                }
+                for c in &r.calls {
+                    println!(
+                        "  {}\t{}\t{:.4}\t{:.2}\t{:.0}",
+                        r.species, c.name, c.rel_abundance, c.coverage, c.support
+                    );
+                }
+            }
+            SpeciesTier::DetectedNotResolved => {
+                n_detected += 1;
+                let breadth = if r.total_specific > 0 {
+                    100.0 * r.present_specific as f64 / r.total_specific as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "  {}\t[detected, not strain-resolvable]\tmarkers={}/{} ({:.1}%)",
+                    r.species, r.present_specific, r.total_specific, breadth
+                );
+            }
+            SpeciesTier::Absent => {}
         }
     }
     println!(
-        "detected strains in {}/{} species ({} strain calls total)",
-        per_species.iter().filter(|(_, _, c)| !c.is_empty()).count(),
+        "summary: {}/{} species strain-resolved ({} strain calls), {} detected-not-resolvable, {} absent",
+        n_resolved,
         loaded.len(),
-        total_calls
+        total_calls,
+        n_detected,
+        loaded.len() - n_resolved - n_detected
     );
     Ok(())
 }
@@ -616,4 +716,33 @@ fn print_stats(db: &StrainDb) {
         s.unique_fraction * 100.0,
         s.avg_markers_per_strain
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{species_tier, SpeciesTier};
+
+    #[test]
+    fn absolute_floor_gates_when_no_fraction() {
+        // frac = 0 -> resolve gate is the absolute floor (200); detect gate = min(10, 200) = 10.
+        assert_eq!(species_tier(250, 5000, 10, 200, 0.0), SpeciesTier::Resolved);
+        assert_eq!(species_tier(50, 5000, 10, 200, 0.0), SpeciesTier::DetectedNotResolved);
+        assert_eq!(species_tier(5, 5000, 10, 200, 0.0), SpeciesTier::Absent);
+    }
+
+    #[test]
+    fn breadth_fraction_raises_the_bar_for_large_panels() {
+        // 10% of a 5000-marker panel = 500 > floor 200, so 300 observed is below the resolve gate
+        // even though it clears the absolute floor. This is the whole point of the breadth term.
+        assert_eq!(species_tier(300, 5000, 10, 200, 0.10), SpeciesTier::DetectedNotResolved);
+        assert_eq!(species_tier(600, 5000, 10, 200, 0.10), SpeciesTier::Resolved);
+    }
+
+    #[test]
+    fn small_panel_species_can_still_be_detected() {
+        // total 150 < floor 200 -> can never clear the resolve gate, but the detect gate
+        // (min(10, 200) = 10) still flags presence rather than dropping it silently.
+        assert_eq!(species_tier(150, 150, 10, 200, 0.0), SpeciesTier::DetectedNotResolved);
+        assert_eq!(species_tier(5, 150, 10, 200, 0.0), SpeciesTier::Absent);
+    }
 }
