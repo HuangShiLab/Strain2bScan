@@ -1,7 +1,7 @@
 //! strain2bscan CLI (prototype).
 //!
 //!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]
-//!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]
+//!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment] [--max-contigs N] [--min-tag-fraction F]
 //!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]
 //!   strain2bscan info     --db <db.tsv>
 //!   strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]\n  \
+                 strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment] [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N]   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
@@ -207,24 +207,28 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SIMILARITY);
 
+    let containment = opts.contains_key("containment");
     let recs = digest_and_filter(&genomes, &set, opts)?;
     let n_genomes = recs.len();
     let cst = SpeciesCst::build(
         recs.into_iter().map(|r| (r.name, r.markers, r.full_markers)).collect(),
         similarity,
+        containment,
     );
+    let dist = if containment { "max-containment" } else { "Jaccard" };
     let method = if n_genomes > MINHASH_ABOVE {
         "MinHash"
     } else {
-        "exact-Jaccard"
+        "exact"
     };
     println!(
-        "clustered {} genomes into {} cluster(s) @ similarity {similarity} (enzymes: {}, threads: {}, clustering: {})",
+        "clustered {} genomes into {} cluster(s) @ similarity {similarity} (enzymes: {}, threads: {}, clustering: {}-{})",
         cst.genome_names.len(),
         cst.n_clusters(),
         enzyme_names(&set).join("+"),
         num_threads(),
-        method
+        method,
+        dist
     );
     for (cid, members) in cst.clusters.iter().enumerate() {
         let names: Vec<&str> = members
@@ -639,7 +643,7 @@ fn cmd_cst_demo() -> Result<(), String> {
     ];
 
     println!("== CST demo: 1 species, 4 genomes (g0/g1 ~identical, g2/g3 ~identical) ==");
-    let cst = SpeciesCst::build(genomes, DEFAULT_SIMILARITY);
+    let cst = SpeciesCst::build(genomes, DEFAULT_SIMILARITY, false);
     println!("single-linkage @ 0.95 -> {} clusters:", cst.n_clusters());
     for (cid, members) in cst.clusters.iter().enumerate() {
         let names: Vec<&str> = members

@@ -70,6 +70,38 @@ pub fn jaccard(a: &HashSet<Marker>, b: &HashSet<Marker>) -> f64 {
     }
 }
 
+/// Max-containment between two marker sets: |A∩B| / min(|A|,|B|). Unlike Jaccard, this stays near
+/// 1 when a low-completeness genome's marker set is (approximately) a subset of a complete
+/// relative's — so uneven-completeness genomes cluster together instead of fragmenting into spurious
+/// singletons. This is the containment estimator used by Mash-screen / sourmash; exact here for
+/// small panels. Note max-containment ≥ Jaccard, so containment clustering merges at least as much.
+pub fn max_containment(a: &HashSet<Marker>, b: &HashSet<Marker>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return if a.is_empty() && b.is_empty() { 1.0 } else { 0.0 };
+    }
+    let inter = a.iter().filter(|m| b.contains(m)).count();
+    inter as f64 / a.len().min(b.len()) as f64
+}
+
+/// Exact single-linkage on max-containment ≥ threshold (see `max_containment`). O(n²·m).
+pub fn single_linkage_containment(genome_markers: &[HashSet<Marker>], threshold: f64) -> Vec<Vec<usize>> {
+    let n = genome_markers.len();
+    let rows: Vec<usize> = (0..n).collect();
+    let edges: Vec<(usize, usize)> = par_map(&rows, |&i| {
+        let mut local = Vec::new();
+        for j in (i + 1)..n {
+            if max_containment(&genome_markers[i], &genome_markers[j]) >= threshold {
+                local.push((i, j));
+            }
+        }
+        local
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    union_find_components(n, &edges)
+}
+
 /// Connected components of an undirected graph given by `edges` (union-find), as sorted
 /// index groups in deterministic order.
 fn union_find_components(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
@@ -187,11 +219,48 @@ pub fn single_linkage_minhash(
     union_find_components(n, &edges)
 }
 
+/// Scalable single-linkage on max-containment for large panels: the intersection size is estimated
+/// from the MinHash-sketch Jaccard and the exact set sizes (|A∩B| = J·(|A|+|B|)/(1+J)), then
+/// containment = |A∩B| / min(|A|,|B|). O(n·m) to sketch + O(n²·k) to compare.
+pub fn single_linkage_containment_minhash(
+    genome_markers: &[HashSet<Marker>],
+    threshold: f64,
+    k: usize,
+) -> Vec<Vec<usize>> {
+    let n = genome_markers.len();
+    let sketches: Vec<Vec<u64>> = par_map(genome_markers, |s| minhash_sketch(s, k));
+    let sizes: Vec<usize> = genome_markers.iter().map(|s| s.len()).collect();
+    let rows: Vec<usize> = (0..n).collect();
+    let edges: Vec<(usize, usize)> = par_map(&rows, |&i| {
+        let mut local = Vec::new();
+        for j in (i + 1)..n {
+            let jac = minhash_jaccard(&sketches[i], &sketches[j], k);
+            let (sa, sb) = (sizes[i] as f64, sizes[j] as f64);
+            let inter = if jac > 0.0 { jac * (sa + sb) / (1.0 + jac) } else { 0.0 };
+            if inter / sa.min(sb).max(1.0) >= threshold {
+                local.push((i, j));
+            }
+        }
+        local
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    union_find_components(n, &edges)
+}
+
 impl SpeciesCst {
     /// Build the CST for one species from `(name, single-copy markers, full tag set)` per
     /// genome. Clustering uses the single-copy markers; the full sets define occurrence-based
     /// uniqueness in `cluster_db`.
-    pub fn build(genomes: Vec<(String, Vec<Marker>, Vec<Marker>)>, similarity: f64) -> Self {
+    /// `containment = true` clusters on max-containment instead of Jaccard (see `max_containment`):
+    /// the fix for reference panels of uneven completeness, where an incomplete genome's tags are a
+    /// subset of a complete relative's and Jaccard would spuriously split them.
+    pub fn build(
+        genomes: Vec<(String, Vec<Marker>, Vec<Marker>)>,
+        similarity: f64,
+        containment: bool,
+    ) -> Self {
         let genome_names: Vec<String> = genomes.iter().map(|(n, _, _)| n.clone()).collect();
         let genome_full: Vec<HashSet<Marker>> =
             genomes.iter().map(|(_, _, f)| f.iter().copied().collect()).collect();
@@ -207,10 +276,11 @@ impl SpeciesCst {
             Some("exact") => false,
             _ => genome_markers.len() > MINHASH_ABOVE,
         };
-        let clusters = if use_minhash {
-            single_linkage_minhash(&genome_markers, similarity, SKETCH_K)
-        } else {
-            single_linkage(&genome_markers, similarity)
+        let clusters = match (containment, use_minhash) {
+            (true, true) => single_linkage_containment_minhash(&genome_markers, similarity, SKETCH_K),
+            (true, false) => single_linkage_containment(&genome_markers, similarity),
+            (false, true) => single_linkage_minhash(&genome_markers, similarity, SKETCH_K),
+            (false, false) => single_linkage(&genome_markers, similarity),
         };
         let mut genome_cluster = vec![0usize; genome_names.len()];
         for (cid, members) in clusters.iter().enumerate() {
@@ -357,7 +427,7 @@ mod tests {
 
     #[test]
     fn clusters_match_expectation_at_0_95() {
-        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY);
+        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY, false);
         assert_eq!(cst.n_clusters(), 2, "clusters: {:?}", cst.clusters);
         // g0 and g1 land in the same cluster; g2/g3 in the other.
         assert_eq!(cst.genome_cluster[0], cst.genome_cluster[1]);
@@ -366,8 +436,26 @@ mod tests {
     }
 
     #[test]
+    fn containment_clusters_incomplete_genome_with_complete_twin() {
+        // An incomplete assembly whose tags are a 50% SUBSET of its complete twin.
+        let full: Vec<Marker> = (0..400).collect();
+        let partial: Vec<Marker> = (0..200).collect();
+        let genomes = vec![
+            ("complete".to_string(), full.clone(), full.clone()),
+            ("partial".to_string(), partial.clone(), partial),
+        ];
+        // Jaccard = 200/400 = 0.5 < 0.95 → the incomplete genome spuriously splits off.
+        let j = SpeciesCst::build(genomes.clone(), DEFAULT_SIMILARITY, false);
+        assert_eq!(j.n_clusters(), 2, "Jaccard should split the incomplete genome: {:?}", j.clusters);
+        // Max-containment = 200/min(200,400) = 1.0 ≥ 0.95 → correctly one cluster.
+        let c = SpeciesCst::build(genomes, DEFAULT_SIMILARITY, true);
+        assert_eq!(c.n_clusters(), 1, "containment should merge incomplete with its twin: {:?}", c.clusters);
+        assert_eq!(c.genome_cluster[0], c.genome_cluster[1]);
+    }
+
+    #[test]
     fn marker_classification_is_correct() {
-        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY);
+        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY, false);
         assert_eq!(cst.classify(0), MarkerClass::SpeciesCore); // in all 4 / both clusters
                                                                // cluster-A shared marker (200): present in g0,g1 → one cluster, ≥2 genomes
         assert!(matches!(cst.classify(200), MarkerClass::ClusterSpecific(_)));
@@ -381,7 +469,7 @@ mod tests {
 
     #[test]
     fn cluster_db_marks_cluster_specific_as_unique() {
-        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY);
+        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY, false);
         let db = cst.cluster_db();
         assert_eq!(db.n_strains(), 2);
         // a cluster-A marker is unique (cluster-specific) in the cluster DB...
