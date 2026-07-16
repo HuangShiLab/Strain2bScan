@@ -56,8 +56,13 @@ pub struct StrainCall {
     pub support: f64,
     /// Fraction of the strain's unique markers detected in the sample.
     pub coverage: f64,
-    /// Relative abundance (sums to 1 across kept strains).
+    /// Relative abundance (sums to 1 across kept strains *within this database call*).
     pub rel_abundance: f64,
+    /// Absolute median read-depth over the strain's detected unique markers (∝ genome copy
+    /// number). Unlike `rel_abundance` (normalised within the call) this is comparable *across*
+    /// per-species databases, so summing/normalising it across species gives community-level
+    /// (species) abundance under the per-species `multi-profile` architecture.
+    pub depth: f64,
 }
 
 /// Effective sample count for a marker, applying StrainScan's singleton-error filter.
@@ -129,6 +134,7 @@ pub fn profile(db: &StrainDb, counts: &HashMap<Marker, u32>, p: &Params) -> Vec<
             support: selected[c].1,
             coverage,
             rel_abundance: rel,
+            depth: depths[c],
         });
     }
     // Filter by relative abundance AND a minimum coverage *fraction* of the cluster's unique

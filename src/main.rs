@@ -2,7 +2,7 @@
 //!
 //!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]
 //!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]
-//!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]
+//!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F]
 //!   strain2bscan info     --db <db.tsv>
 //!   strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]
 //!   strain2bscan demo | cst-demo
@@ -49,8 +49,8 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N]   (many species, sample digested once)\n  \
+                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F]\n  \
+                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-support N] [--min-coverage F] [--min-abundance F]   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
@@ -339,6 +339,9 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     if let Some(v) = opts.get("min-coverage") {
         params.min_coverage = v.parse().map_err(|_| "bad --min-coverage (want 0..1)")?;
     }
+    if let Some(v) = opts.get("min-abundance") {
+        params.min_rel_abundance = v.parse().map_err(|_| "bad --min-abundance (want 0..1)")?;
+    }
     let calls = profile(&db, &counts, &params);
 
     if calls.is_empty() {
@@ -477,7 +480,16 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     );
 
     // 4) gate + strain-profile each species, in parallel
-    let params = Params::default();
+    let mut params = Params::default();
+    if let Some(v) = opts.get("min-support") {
+        params.min_support_markers = v.parse().map_err(|_| "bad --min-support")?;
+    }
+    if let Some(v) = opts.get("min-coverage") {
+        params.min_coverage = v.parse().map_err(|_| "bad --min-coverage (want 0..1)")?;
+    }
+    if let Some(v) = opts.get("min-abundance") {
+        params.min_rel_abundance = v.parse().map_err(|_| "bad --min-abundance (want 0..1)")?;
+    }
     let per_species: Vec<SpeciesResult> = par_map(&loaded, |(species, db)| {
         let total_specific = db
             .marker_degree
@@ -528,8 +540,8 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
                 }
                 for c in &r.calls {
                     println!(
-                        "  {}\t{}\t{:.4}\t{:.2}\t{:.0}",
-                        r.species, c.name, c.rel_abundance, c.coverage, c.support
+                        "  {}\t{}\t{:.4}\t{:.2}\t{:.0}\t{:.2}",
+                        r.species, c.name, c.rel_abundance, c.coverage, c.support, c.depth
                     );
                 }
             }
@@ -686,11 +698,12 @@ fn report(calls: &[StrainCall]) {
     }
     for c in calls {
         println!(
-            "  {:<12} abundance={:>6.2}%  coverage={:>6.2}%  support={:.0}",
+            "  {:<12} abundance={:>6.2}%  coverage={:>6.2}%  support={:.0}  depth={:.2}",
             c.name,
             c.rel_abundance * 100.0,
             c.coverage * 100.0,
-            c.support
+            c.support,
+            c.depth
         );
     }
 }
@@ -699,12 +712,12 @@ fn report(calls: &[StrainCall]) {
 fn write_pred_tsv(path: &Path, calls: &[StrainCall]) -> std::io::Result<()> {
     use std::io::Write;
     let mut w = std::fs::File::create(path)?;
-    writeln!(w, "#cluster\tabundance\tcoverage\tsupport")?;
+    writeln!(w, "#cluster\tabundance\tcoverage\tsupport\tdepth")?;
     for c in calls {
         writeln!(
             w,
-            "{}\t{:.6}\t{:.4}\t{:.0}",
-            c.name, c.rel_abundance, c.coverage, c.support
+            "{}\t{:.6}\t{:.4}\t{:.0}\t{:.3}",
+            c.name, c.rel_abundance, c.coverage, c.support, c.depth
         )?;
     }
     Ok(())
