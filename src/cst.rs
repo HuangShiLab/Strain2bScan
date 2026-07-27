@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::db::StrainDb;
+use crate::fxhash::FxHashSet;
 use crate::markers::Marker;
 use crate::parallel::par_map;
 
@@ -47,9 +48,9 @@ pub enum MarkerClass {
 pub struct SpeciesCst {
     pub genome_names: Vec<String>,
     /// Per genome: single-copy tag markers (used for clustering, scoring, abundance).
-    pub genome_markers: Vec<HashSet<Marker>>,
+    pub genome_markers: Vec<FxHashSet<Marker>>,
     /// Per genome: full tag set (any copy) — used only to define occurrence-based uniqueness.
-    pub genome_full: Vec<HashSet<Marker>>,
+    pub genome_full: Vec<FxHashSet<Marker>>,
     /// cluster id -> member genome indices.
     pub clusters: Vec<Vec<usize>>,
     /// genome index -> cluster id.
@@ -57,7 +58,7 @@ pub struct SpeciesCst {
 }
 
 /// Jaccard similarity between two marker sets.
-pub fn jaccard(a: &HashSet<Marker>, b: &HashSet<Marker>) -> f64 {
+pub fn jaccard(a: &FxHashSet<Marker>, b: &FxHashSet<Marker>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
@@ -99,7 +100,7 @@ fn union_find_components(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> 
 
 /// Exact single-linkage = connected components of the τ-similarity graph (full-set Jaccard,
 /// parallel edge scan). O(n²·m); used for ≲100 genomes.
-pub fn single_linkage(genome_markers: &[HashSet<Marker>], similarity: f64) -> Vec<Vec<usize>> {
+pub fn single_linkage(genome_markers: &[FxHashSet<Marker>], similarity: f64) -> Vec<Vec<usize>> {
     let n = genome_markers.len();
     let rows: Vec<usize> = (0..n).collect();
     let edges: Vec<(usize, usize)> = par_map(&rows, |&i| {
@@ -131,7 +132,7 @@ fn mix64(mut z: u64) -> u64 {
 }
 
 /// Bottom-k MinHash sketch: the k smallest mixed marker hashes, sorted ascending, deduped.
-pub fn minhash_sketch(markers: &HashSet<Marker>, k: usize) -> Vec<u64> {
+pub fn minhash_sketch(markers: &FxHashSet<Marker>, k: usize) -> Vec<u64> {
     let mut v: Vec<u64> = markers.iter().map(|&m| mix64(m)).collect();
     v.sort_unstable();
     v.dedup();
@@ -165,7 +166,7 @@ pub fn minhash_jaccard(a: &[u64], b: &[u64], k: usize) -> f64 {
 /// Scalable single-linkage using MinHash sketches (parallel sketch build + parallel edge
 /// scan). O(n·m) to sketch + O(n²·k) to compare, with small k ≪ m.
 pub fn single_linkage_minhash(
-    genome_markers: &[HashSet<Marker>],
+    genome_markers: &[FxHashSet<Marker>],
     similarity: f64,
     k: usize,
 ) -> Vec<Vec<usize>> {
@@ -193,9 +194,9 @@ impl SpeciesCst {
     /// uniqueness in `cluster_db`.
     pub fn build(genomes: Vec<(String, Vec<Marker>, Vec<Marker>)>, similarity: f64) -> Self {
         let genome_names: Vec<String> = genomes.iter().map(|(n, _, _)| n.clone()).collect();
-        let genome_full: Vec<HashSet<Marker>> =
+        let genome_full: Vec<FxHashSet<Marker>> =
             genomes.iter().map(|(_, _, f)| f.iter().copied().collect()).collect();
-        let genome_markers: Vec<HashSet<Marker>> = genomes
+        let genome_markers: Vec<FxHashSet<Marker>> = genomes
             .into_iter()
             .map(|(_, m, _)| m.into_iter().collect())
             .collect();
@@ -268,7 +269,7 @@ impl SpeciesCst {
 
     /// Summary counts of each marker class across all tags in the species.
     pub fn marker_class_summary(&self) -> HashMap<&'static str, usize> {
-        let mut all: HashSet<Marker> = HashSet::new();
+        let mut all: FxHashSet<Marker> = FxHashSet::default();
         for s in &self.genome_markers {
             all.extend(s.iter().copied());
         }
@@ -294,7 +295,7 @@ impl SpeciesCst {
             .iter()
             .enumerate()
             .map(|(cid, members)| {
-                let mut set: HashSet<Marker> = HashSet::new();
+                let mut set: FxHashSet<Marker> = FxHashSet::default();
                 for &g in members {
                     set.extend(self.genome_markers[g].iter().copied());
                 }
@@ -307,18 +308,18 @@ impl SpeciesCst {
         // — at any copy number — in exactly one cluster's genomes. This guards against the
         // single-copy-filter asymmetry that mislabels a tag as cluster-unique when it is
         // multi-copy (hence filtered) in another cluster yet reachable from that cluster's reads.
-        let full_unions: Vec<HashSet<Marker>> = self
+        let full_unions: Vec<FxHashSet<Marker>> = self
             .clusters
             .iter()
             .map(|members| {
-                let mut s = HashSet::new();
+                let mut s = FxHashSet::default();
                 for &g in members {
                     s.extend(self.genome_full[g].iter().copied());
                 }
                 s
             })
             .collect();
-        let mut scored: HashSet<Marker> = HashSet::new();
+        let mut scored: FxHashSet<Marker> = FxHashSet::default();
         for sm in &db.strain_markers {
             scored.extend(sm.iter().copied());
         }

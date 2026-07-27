@@ -7,20 +7,20 @@
 //! 2bRAD tags, are exactly the taxonomy-specific tags Fast2bRAD-M already selects in
 //! `build_quan_db.rs` (`taxonomies.len() == 1`) — here applied at strain resolution.
 
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::markers::Marker;
 
 #[derive(Debug, Default, Clone)]
 pub struct StrainDb {
     pub strain_names: Vec<String>,
     /// Per strain: the set of markers it carries.
-    pub strain_markers: Vec<HashSet<Marker>>,
+    pub strain_markers: Vec<FxHashSet<Marker>>,
     /// marker -> number of strains carrying it (inverted-index degree).
-    pub marker_degree: HashMap<Marker, u32>,
+    pub marker_degree: FxHashMap<Marker, u32>,
     /// Enzyme set used to build this DB (samples must be digested with the same set).
     pub enzymes: Vec<String>,
     /// Truly-unique markers, defined by **full genome occurrence** (a marker absent — at any
@@ -28,7 +28,17 @@ pub struct StrainDb {
     /// than `marker_degree == 1` (single-copy membership), which mislabels a tag as unique when
     /// it is multi-copy in another cluster (single-copy-filter asymmetry) and thus reachable
     /// from that cluster's reads. If empty, uniqueness falls back to `marker_degree`.
-    pub unique_set: HashSet<Marker>,
+    pub unique_set: FxHashSet<Marker>,
+    /// Optional **cross-species** restriction on which markers may be used for detection and
+    /// quantification, applied by `multi-profile` (see [`StrainDb::restrict_to`]).
+    ///
+    /// `unique_set` / `marker_degree` only know about *this* species: a tag carried by exactly
+    /// one cluster here can still occur in a congener's genomes, and then a co-present congener's
+    /// reads land on it and inflate this cluster's depth. In a panel with several species of the
+    /// same genus (the norm in mock communities and in saliva) that is a systematic abundance
+    /// error, not a rare accident. Runtime-only — never serialized, and `None` for a DB loaded on
+    /// its own, since a single DB carries no cross-species information.
+    pub quant_mask: Option<FxHashSet<Marker>>,
 }
 
 impl StrainDb {
@@ -36,7 +46,7 @@ impl StrainDb {
     pub fn build(strains: Vec<(String, Vec<Marker>)>) -> Self {
         let mut db = StrainDb::default();
         for (name, markers) in strains {
-            let set: HashSet<Marker> = markers.into_iter().collect();
+            let set: FxHashSet<Marker> = markers.into_iter().collect();
             for &m in &set {
                 *db.marker_degree.entry(m).or_insert(0) += 1;
             }
@@ -61,12 +71,37 @@ impl StrainDb {
         }
     }
 
-    /// The unique markers of strain `j`.
+    /// May `marker` be used for detection/quantification? True unless a cross-species
+    /// restriction is in force and excludes it.
+    #[inline]
+    pub fn is_quantifiable(&self, marker: Marker) -> bool {
+        match &self.quant_mask {
+            Some(allowed) => allowed.contains(&marker),
+            None => true,
+        }
+    }
+
+    /// Restrict detection and quantification to `allowed` — the markers that are specific to
+    /// this species across the whole panel of databases being profiled together.
+    ///
+    /// Only the intersection with this DB's own markers is stored, so the mask stays small.
+    pub fn restrict_to(&mut self, allowed: &FxHashSet<Marker>) {
+        let kept: FxHashSet<Marker> = self
+            .marker_degree
+            .keys()
+            .copied()
+            .filter(|m| allowed.contains(m))
+            .collect();
+        self.quant_mask = Some(kept);
+    }
+
+    /// The unique markers of strain `j` — cluster-specific within this species, and (when a
+    /// cross-species restriction is in force) not shared with any other species in the panel.
     pub fn unique_markers(&self, j: usize) -> impl Iterator<Item = Marker> + '_ {
         self.strain_markers[j]
             .iter()
             .copied()
-            .filter(move |&m| self.is_unique(m))
+            .filter(move |&m| self.is_unique(m) && self.is_quantifiable(m))
     }
 
     pub fn unique_marker_count(&self, j: usize) -> usize {
@@ -111,12 +146,12 @@ impl StrainDb {
         let reader = BufReader::new(File::open(path)?);
         let mut strains = Vec::new();
         let mut enzymes: Vec<String> = Vec::new();
-        let mut unique_set: HashSet<Marker> = HashSet::new();
+        let mut unique_set: FxHashSet<Marker> = FxHashSet::default();
         let hexset = |csv: &str| {
             csv.split(',')
                 .filter(|s| !s.is_empty())
                 .filter_map(|s| Marker::from_str_radix(s, 16).ok())
-                .collect::<HashSet<Marker>>()
+                .collect::<FxHashSet<Marker>>()
         };
         for line in reader.lines() {
             let line = line?;
@@ -205,6 +240,30 @@ mod tests {
         assert!(!db.is_unique(1));
         assert_eq!(db.unique_marker_count(0), 1);
         assert_eq!(db.unique_markers(0).next(), Some(10));
+    }
+
+    /// Cluster-uniqueness is defined within one species, so a tag can be unique to a cluster
+    /// here and still occur in a congener's genomes — where a co-present congener's reads land
+    /// on it and inflate this cluster's depth. `restrict_to` removes exactly those markers.
+    #[test]
+    fn restrict_to_drops_markers_shared_with_another_species() {
+        // A carries 10 (private) and 99 (also present in another species' DB).
+        let db_unrestricted = StrainDb::build(vec![
+            ("A".into(), vec![1, 2, 10, 99]),
+            ("B".into(), vec![1, 2, 20]),
+        ]);
+        let mut db = db_unrestricted.clone();
+        assert_eq!(db.unique_markers(0).count(), 2, "10 and 99 are unique within the species");
+
+        // Panel-wide species-specific markers: 99 is shared with another species, so it is out.
+        let specific: FxHashSet<Marker> = [1, 2, 10, 20].into_iter().collect();
+        db.restrict_to(&specific);
+
+        let kept: Vec<Marker> = db.unique_markers(0).collect();
+        assert_eq!(kept, vec![10], "only the genuinely species-specific marker may be used");
+        assert!(db.is_quantifiable(10) && !db.is_quantifiable(99));
+        // Unrestricted DBs (e.g. single-species `profile`) are unaffected.
+        assert!(db_unrestricted.is_quantifiable(99));
     }
 
     #[test]

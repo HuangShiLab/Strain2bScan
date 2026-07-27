@@ -2,7 +2,8 @@
 //!
 //!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]
 //!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]
-//!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]
+//!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]
+//!   strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--fixed-gate]
 //!   strain2bscan info     --db <db.tsv>
 //!   strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]
 //!   strain2bscan demo | cst-demo
@@ -22,10 +23,11 @@ use strain2bscan::bench::{evaluate, parse_abundance_tsv};
 use strain2bscan::cst::{SpeciesCst, DEFAULT_SIMILARITY, MINHASH_ABOVE};
 use strain2bscan::db::StrainDb;
 use strain2bscan::enzymes::{parse_enzyme_set, Enzyme};
-use strain2bscan::identify::{naive_profile, profile, Params, StrainCall};
+use strain2bscan::fxhash::{FxHashMap, FxHashSet};
+use strain2bscan::identify::{detectable_fraction, naive_profile, profile, Params, StrainCall};
 use strain2bscan::markers::{
-    genome_marker_counts_multi, read_fastx, sample_marker_counts_multi_par, single_copy_markers,
-    Marker,
+    fastx_stem, genome_marker_counts_multi, is_fasta_path, read_fastx, sample_marker_counts_stream,
+    single_copy_markers, Marker, MarkerCounts,
 };
 use strain2bscan::parallel::{num_threads, par_map};
 use strain2bscan::quality::{self, GenomeRec, QualityFilter};
@@ -49,12 +51,21 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N]   (many species, sample digested once)\n  \
+                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]\n  \
+                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--fixed-gate] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
-                 <set> = all | BcgI | BcgI,CspCI  (use BcgI for 2bRAD data; all for conventional metagenomes)"
+                 <set> = all | BcgI | BcgI,CspCI  (use BcgI for 2bRAD data; all for conventional metagenomes)\n\
+                 reads/genomes may be gzipped (.fq.gz, .fna.gz).\n\
+                 multi-profile reports two scopes: `abundance` sums to 1.0 WITHIN each species\n\
+                 (the primary number), `global_abundance` sums to 1.0 over the strain-resolved\n\
+                 part of the sample. --min-abundance applies within-species. Detection and depth\n\
+                 use only markers specific to their species across the whole panel, so a\n\
+                 co-present congener cannot inflate a cluster's depth; disable with\n\
+                 --no-cross-species-filter (single-species `profile` cannot do this).\n\
+                 --fixed-gate restores the pre-0.2 fixed singleton filter (count>=2) and unscaled\n\
+                 species floor; by default those scale with the estimated per-tag depth."
             );
             return ExitCode::from(2);
         }
@@ -112,21 +123,21 @@ fn digest_genome_dir(dir: &Path, enzymes: &[&Enzyme]) -> Result<Vec<GenomeRec>, 
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if matches!(ext, "fa" | "fasta" | "fna") {
+        // `.fna.gz` included: RefSeq/ENA assemblies ship gzipped, and decompressing a whole
+        // reference panel just to build a DB is pure friction. FASTA only — a stray read file
+        // in this directory must not be digested as though it were a reference genome.
+        if path.is_file() && is_fasta_path(&path) {
             paths.push(path);
         }
     }
     if paths.is_empty() {
-        return Err("no FASTA genomes (.fa/.fasta/.fna) found".into());
+        return Err("no FASTA genomes (.fa/.fasta/.fna, optionally .gz) found".into());
     }
     paths.sort(); // deterministic genome order regardless of threading
     let results: Vec<Result<GenomeRec, String>> = par_map(&paths, |path| {
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
+        // `fastx_stem`, not `file_stem`: the latter leaves `X.fna.gz` named `X.fna`, so the same
+        // genome would get a different identifier depending only on whether it was compressed.
+        let name = fastx_stem(path);
         let seqs = read_fastx(path).map_err(|e| e.to_string())?;
         let n_contigs = seqs.len();
         let counts = genome_marker_counts_multi(&seqs, enzymes);
@@ -308,6 +319,24 @@ fn cmd_evaluate(opts: &HashMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse the Layer-2 tuning flags shared by `profile` and `multi-profile`.
+fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
+    let mut p = Params::default();
+    if let Some(v) = opts.get("min-support") {
+        p.min_support_markers = v.parse().map_err(|_| "bad --min-support")?;
+    }
+    if let Some(v) = opts.get("min-coverage") {
+        p.min_coverage = v.parse().map_err(|_| "bad --min-coverage (want 0..1)")?;
+    }
+    if let Some(v) = opts.get("min-abundance") {
+        p.min_rel_abundance = v.parse().map_err(|_| "bad --min-abundance (want 0..1)")?;
+    }
+    if opts.contains_key("fixed-gate") {
+        p.adaptive = false;
+    }
+    Ok(p)
+}
+
 fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     let db = StrainDb::load(Path::new(req(opts, "db")?)).map_err(|e| e.to_string())?;
 
@@ -319,8 +348,7 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     };
 
     let reads = PathBuf::from(req(opts, "reads")?);
-    let seqs = read_fastx(&reads).map_err(|e| e.to_string())?;
-    let counts = sample_marker_counts_multi_par(&seqs, &set);
+    let counts = sample_marker_counts_stream(&reads, &set).map_err(|e| e.to_string())?;
     println!(
         "sample: {} distinct tag markers (enzymes: {}, threads: {})",
         counts.len(),
@@ -328,13 +356,7 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         num_threads()
     );
 
-    let mut params = Params::default();
-    if let Some(v) = opts.get("min-support") {
-        params.min_support_markers = v.parse().map_err(|_| "bad --min-support")?;
-    }
-    if let Some(v) = opts.get("min-coverage") {
-        params.min_coverage = v.parse().map_err(|_| "bad --min-coverage (want 0..1)")?;
-    }
+    let params = parse_params(opts)?;
     let calls = profile(&db, &counts, &params);
 
     if calls.is_empty() {
@@ -365,13 +387,41 @@ enum SpeciesTier {
 }
 
 /// Classify a species from ABSOLUTE species-specific marker evidence (never relative abundance).
-/// `present` = its species-specific markers observed in the sample (count >= 2); `total` = its
+///
+/// `present` = its species-specific markers observed in the sample; `total` = its
 /// species-specific markers that exist in the DB; `detect`/`floor` are absolute thresholds and
-/// `frac` is the breadth fraction. resolve gate = max(floor, ceil(frac*total)); detect gate =
-/// min(detect, resolve gate) so detection is never stricter than resolution. Pure + tested.
-fn species_tier(present: usize, total: usize, detect: usize, floor: usize, frac: f64) -> SpeciesTier {
-    let frac_gate = (frac.max(0.0) * total as f64).ceil() as usize;
-    let resolve_gate = floor.max(frac_gate).max(1);
+/// `frac` is the breadth fraction.
+///
+/// `reachable` is the fraction of the panel that *can* be observed at this species' estimated
+/// depth (`1 − e^(−λ)`), and both gates are scaled by it. Without that scaling the fixed floor
+/// of 200 markers is unreachable by construction in low-input or high-host samples: at 0.05×
+/// depth only ~5% of any panel is visible, so a genuinely present species is filed as absent no
+/// matter how clean the data is. The gate never falls below `detect`, which keeps random
+/// sequencing errors — which produce scattered tags, not repeated hits on one species' panel —
+/// from manufacturing calls. Pure + tested.
+/// The adaptive relaxation is bounded: the floor is never scaled below this fraction of its
+/// configured value.
+///
+/// Without a bound the scaling cancels out and stops being a gate at all. The observed count is
+/// itself proportional to the reachable fraction (`present ≈ total·r` under Poisson sampling),
+/// so testing `present ≥ floor·r` reduces to `total ≥ floor` — true for every species with a
+/// panel above the floor, at every depth, leaving `detect` (10 markers) as the only real
+/// threshold. Clamping the relaxation keeps a genuine floor at low depth while still recovering
+/// species that an unscaled 200-marker bar makes unreachable by construction.
+const MIN_FLOOR_FRACTION: f64 = 0.25;
+
+fn species_tier(
+    present: usize,
+    total: usize,
+    detect: usize,
+    floor: usize,
+    frac: f64,
+    reachable: f64,
+) -> SpeciesTier {
+    let r = reachable.clamp(0.0, 1.0).max(MIN_FLOOR_FRACTION);
+    let frac_gate = (frac.max(0.0) * total as f64 * r).ceil() as usize;
+    let scaled_floor = (floor as f64 * r).ceil() as usize;
+    let resolve_gate = scaled_floor.max(frac_gate).max(detect).max(1);
     let detect_gate = detect.min(resolve_gate);
     if present >= resolve_gate {
         SpeciesTier::Resolved
@@ -387,6 +437,8 @@ struct SpeciesResult {
     species: String,
     present_specific: usize,
     total_specific: usize,
+    /// Estimated per-tag depth over this species' species-specific markers (zero-inclusive).
+    lambda: f64,
     tier: SpeciesTier,
     calls: Vec<StrainCall>,
 }
@@ -400,9 +452,8 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     let dbs_dir = PathBuf::from(req(opts, "dbs")?);
     let reads = PathBuf::from(req(opts, "reads")?);
 
-    // 1) digest sample reads ONCE
-    let seqs = read_fastx(&reads).map_err(|e| e.to_string())?;
-    let counts = sample_marker_counts_multi_par(&seqs, &set);
+    // 1) digest sample reads ONCE (streamed: peak memory is one batch, not the whole file)
+    let counts = sample_marker_counts_stream(&reads, &set).map_err(|e| e.to_string())?;
 
     // 2) collect + load per-species DBs
     let mut db_paths: Vec<PathBuf> = std::fs::read_dir(&dbs_dir)
@@ -419,7 +470,7 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     if db_paths.is_empty() {
         return Err("no *.tsv species DBs found in --dbs dir".into());
     }
-    let loaded: Vec<(String, StrainDb)> = par_map(&db_paths, |path| {
+    let mut loaded: Vec<(String, StrainDb)> = par_map(&db_paths, |path| {
         let sp = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -455,12 +506,51 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         .get("min-species-detect")
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
-    let mut species_degree: HashMap<Marker, u32> = HashMap::new();
+    let mut species_degree: FxHashMap<Marker, u32> = FxHashMap::default();
     for (_, db) in &loaded {
         for &m in db.marker_degree.keys() {
             *species_degree.entry(m).or_insert(0) += 1;
         }
     }
+
+    // Per species: the markers specific to it across the WHOLE panel (species degree == 1).
+    let specific_sets: Vec<FxHashSet<Marker>> = loaded
+        .iter()
+        .map(|(_, db)| {
+            db.marker_degree
+                .keys()
+                .copied()
+                .filter(|m| species_degree.get(m).copied() == Some(1))
+                .collect()
+        })
+        .collect();
+
+    // Restrict detection AND quantification to those markers.
+    //
+    // Cluster-uniqueness is only defined within one species DB, so a tag can be unique to a
+    // cluster here and still occur in a congener's genomes. When that congener is co-present —
+    // S. aureus/S. epidermidis, the three streptococci, the two lactobacilli in MSA-1002, and
+    // routinely in saliva — its reads land on that tag and inflate this cluster's depth. Using
+    // the cross-species evidence for the species gate but not for quantification leaves exactly
+    // that error in the abundances. `--no-cross-species-filter` disables this for comparison.
+    let cross_species_filter = !opts.contains_key("no-cross-species-filter");
+    if cross_species_filter {
+        let (mut before, mut after) = (0usize, 0usize);
+        for ((_, db), specific) in loaded.iter_mut().zip(&specific_sets) {
+            before += db.marker_degree.len();
+            db.restrict_to(specific);
+            after += specific.len();
+        }
+        println!(
+            "cross-species filter: {after}/{before} markers usable for quantification ({:.1}% shared with another species in the panel, excluded)",
+            if before > 0 {
+                100.0 * (before - after) as f64 / before as f64
+            } else {
+                0.0
+            }
+        );
+    }
+    let loaded = loaded;
 
     println!(
         "sample: {} distinct tag markers; {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
@@ -472,28 +562,48 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         num_threads()
     );
 
-    // 4) gate + strain-profile each species, in parallel
-    let params = Params::default();
-    let per_species: Vec<SpeciesResult> = par_map(&loaded, |(species, db)| {
-        let total_specific = db
-            .marker_degree
-            .keys()
-            .filter(|m| species_degree.get(m).copied().unwrap_or(0) == 1)
+    // 4) gate + strain-profile each species, in parallel.
+    //    `--min-abundance` applies WITHIN a species, matching the primary output column: it
+    //    decides which clusters of a present species are real. Whether the *species* is present
+    //    at all is the Layer-1 species gate's decision (step 3), not this filter's.
+    let params = parse_params(opts)?;
+    let order: Vec<usize> = (0..loaded.len()).collect();
+    let per_species: Vec<SpeciesResult> = par_map(&order, |&i| {
+        let (species, db) = &loaded[i];
+        let specific = &specific_sets[i];
+        let total_specific = specific.len();
+        // Zero-inclusive mean over the species-specific panel — an absolute depth estimate
+        // that does not presuppose the species passed any gate (so it is not circular).
+        let observed: u64 = specific
+            .iter()
+            .map(|m| counts.get(m).copied().unwrap_or(0) as u64)
+            .sum();
+        let lambda = if total_specific > 0 {
+            observed as f64 / total_specific as f64
+        } else {
+            0.0
+        };
+        let min_count = if params.adaptive {
+            strain2bscan::identify::min_count_for(lambda)
+        } else {
+            2
+        };
+        let present_specific = specific
+            .iter()
+            .filter(|m| counts.get(*m).copied().unwrap_or(0) >= min_count)
             .count();
-        let present_specific = db
-            .marker_degree
-            .keys()
-            .filter(|m| {
-                species_degree.get(m).copied().unwrap_or(0) == 1
-                    && counts.get(m).copied().unwrap_or(0) >= 2
-            })
-            .count();
+        let reachable = if params.adaptive {
+            detectable_fraction(lambda)
+        } else {
+            1.0
+        };
         let tier = species_tier(
             present_specific,
             total_specific,
             min_species_detect,
             min_species_markers,
             min_species_marker_frac,
+            reachable,
         );
         let calls = if tier == SpeciesTier::Resolved {
             profile(db, &counts, &params)
@@ -504,28 +614,79 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
             species: species.clone(),
             present_specific,
             total_specific,
+            lambda,
             tier,
             calls,
         }
     });
 
-    let mut total_calls = 0;
+    // 5) Quantification. Two scopes, both reported:
+    //
+    //    `abundance`        — WITHIN-species (sums to 1.0 per species). This is the primary
+    //                         number and the one Layer-2 is actually answering: given that this
+    //                         species is present, how is it split across strains/clusters?
+    //                         Species-level abundance is Fast2bRAD-M's job, not this layer's.
+    //    `global_abundance` — cross-species, derived from the absolute `depth`. Provided so a
+    //                         community composition can be plotted without re-deriving it:
+    //                         per-species fractions cannot be concatenated into one, because
+    //                         each species sums to 1.0 independently and a 10x-more-abundant
+    //                         species would otherwise look identical to a rare one.
+    //
+    //    `depth` is reads-per-tag on single-copy markers (one copy per cell), so it is
+    //    comparable between species and these are cell fractions.
+    //
+    //    IMPORTANT: the denominator spans only the clusters actually emitted. Species that were
+    //    detected but not strain-resolvable, and clusters dropped by --min-abundance, carry real
+    //    biomass that is NOT in it, so `global_abundance` is a composition of the strain-resolved
+    //    fraction of the sample, not of the whole community. The summary line below reports how
+    //    many species fell outside it; use `depth` directly if you need absolute quantities.
+    let depth_sum: f64 = per_species
+        .iter()
+        .flat_map(|r| r.calls.iter())
+        .map(|c| c.depth)
+        .sum();
+    let global_of = |c: &StrainCall| {
+        if depth_sum > 0.0 {
+            c.depth / depth_sum
+        } else {
+            0.0
+        }
+    };
+
+    // 6) report, grouped by species, most abundant cluster first within each
+    let mut flat: Vec<(&str, &StrainCall, f64)> = per_species
+        .iter()
+        .flat_map(|r| {
+            r.calls
+                .iter()
+                .map(move |c| (r.species.as_str(), c, global_of(c)))
+        })
+        .collect();
+    flat.sort_by(|a, b| {
+        a.0.cmp(b.0).then(
+            b.1.rel_abundance
+                .partial_cmp(&a.1.rel_abundance)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+
+    println!("#species\tcluster\tabundance\tglobal_abundance\tdepth\tcoverage\tsupport");
+    for (species, c, g) in &flat {
+        println!(
+            "  {}\t{}\t{:.6}\t{:.6}\t{:.3}\t{:.2}\t{:.0}",
+            species, c.name, c.rel_abundance, g, c.depth, c.coverage, c.support
+        );
+    }
+
     let (mut n_resolved, mut n_detected) = (0usize, 0usize);
     for r in &per_species {
         match r.tier {
             SpeciesTier::Resolved => {
                 n_resolved += 1;
-                total_calls += r.calls.len();
                 if r.calls.is_empty() {
                     println!(
-                        "  {}\t[strain-resolved, no cluster above threshold]\tmarkers={}/{}",
-                        r.species, r.present_specific, r.total_specific
-                    );
-                }
-                for c in &r.calls {
-                    println!(
-                        "  {}\t{}\t{:.4}\t{:.2}\t{:.0}",
-                        r.species, c.name, c.rel_abundance, c.coverage, c.support
+                        "  {}\t[strain-resolved, no cluster above threshold]\tmarkers={}/{} (depth {:.2}x)",
+                        r.species, r.present_specific, r.total_specific, r.lambda
                     );
                 }
             }
@@ -537,8 +698,8 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
                     0.0
                 };
                 println!(
-                    "  {}\t[detected, not strain-resolvable]\tmarkers={}/{} ({:.1}%)",
-                    r.species, r.present_specific, r.total_specific, breadth
+                    "  {}\t[detected, not strain-resolvable]\tmarkers={}/{} ({:.1}%, depth {:.2}x)",
+                    r.species, r.present_specific, r.total_specific, breadth, r.lambda
                 );
             }
             SpeciesTier::Absent => {}
@@ -548,10 +709,29 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         "summary: {}/{} species strain-resolved ({} strain calls), {} detected-not-resolvable, {} absent",
         n_resolved,
         loaded.len(),
-        total_calls,
+        flat.len(),
         n_detected,
         loaded.len() - n_resolved - n_detected
     );
+
+    if let Some(out) = opts.get("out") {
+        use std::io::Write;
+        let mut w = std::fs::File::create(out).map_err(|e| e.to_string())?;
+        writeln!(
+            w,
+            "#species\tcluster\tabundance\tglobal_abundance\tdepth\tcoverage\tsupport"
+        )
+        .map_err(|e| e.to_string())?;
+        for (species, c, g) in &flat {
+            writeln!(
+                w,
+                "{}\t{}\t{:.6}\t{:.6}\t{:.4}\t{:.4}\t{:.0}",
+                species, c.name, c.rel_abundance, g, c.depth, c.coverage, c.support
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        println!("predictions -> {out}");
+    }
     Ok(())
 }
 
@@ -595,7 +775,7 @@ fn cmd_demo() -> Result<(), String> {
             *present.entry(m).or_insert(0.0) += ab;
         }
     }
-    let mut counts: HashMap<Marker, u32> = HashMap::new();
+    let mut counts = MarkerCounts::default();
     for (m, frac) in present {
         let c = (30.0 * frac).round() as u32;
         if c > 0 {
@@ -663,7 +843,7 @@ fn cmd_cst_demo() -> Result<(), String> {
             *present.entry(m).or_insert(0.0) += ab;
         }
     }
-    let mut counts: HashMap<Marker, u32> = HashMap::new();
+    let mut counts = MarkerCounts::default();
     for (m, frac) in present {
         let c = (30.0 * frac).round() as u32;
         if c > 0 {
@@ -682,25 +862,29 @@ fn report(calls: &[StrainCall]) {
     }
     for c in calls {
         println!(
-            "  {:<12} abundance={:>6.2}%  coverage={:>6.2}%  support={:.0}",
+            "  {:<12} abundance={:>6.2}%  depth={:>7.3}x  coverage={:>6.2}%  support={:.0}",
             c.name,
             c.rel_abundance * 100.0,
+            c.depth,
             c.coverage * 100.0,
             c.support
         );
     }
 }
 
-/// Write predictions as `name<TAB>abundance<TAB>coverage<TAB>support` (header commented).
+/// Write predictions as `name<TAB>abundance<TAB>depth<TAB>coverage<TAB>support`.
+///
+/// `depth` is the absolute per-tag read depth; unlike `abundance` (normalized within this DB)
+/// it is comparable across separately-profiled species.
 fn write_pred_tsv(path: &Path, calls: &[StrainCall]) -> std::io::Result<()> {
     use std::io::Write;
     let mut w = std::fs::File::create(path)?;
-    writeln!(w, "#cluster\tabundance\tcoverage\tsupport")?;
+    writeln!(w, "#cluster\tabundance\tdepth\tcoverage\tsupport")?;
     for c in calls {
         writeln!(
             w,
-            "{}\t{:.6}\t{:.4}\t{:.0}",
-            c.name, c.rel_abundance, c.coverage, c.support
+            "{}\t{:.6}\t{:.4}\t{:.4}\t{:.0}",
+            c.name, c.rel_abundance, c.depth, c.coverage, c.support
         )?;
     }
     Ok(())
@@ -721,28 +905,77 @@ fn print_stats(db: &StrainDb) {
 #[cfg(test)]
 mod tests {
     use super::{species_tier, SpeciesTier};
+    use strain2bscan::identify::detectable_fraction;
+
+    /// Ample depth: essentially the whole panel is reachable, so the gates are the original
+    /// absolute ones.
+    const FULL: f64 = 1.0;
 
     #[test]
     fn absolute_floor_gates_when_no_fraction() {
         // frac = 0 -> resolve gate is the absolute floor (200); detect gate = min(10, 200) = 10.
-        assert_eq!(species_tier(250, 5000, 10, 200, 0.0), SpeciesTier::Resolved);
-        assert_eq!(species_tier(50, 5000, 10, 200, 0.0), SpeciesTier::DetectedNotResolved);
-        assert_eq!(species_tier(5, 5000, 10, 200, 0.0), SpeciesTier::Absent);
+        assert_eq!(species_tier(250, 5000, 10, 200, 0.0, FULL), SpeciesTier::Resolved);
+        assert_eq!(species_tier(50, 5000, 10, 200, 0.0, FULL), SpeciesTier::DetectedNotResolved);
+        assert_eq!(species_tier(5, 5000, 10, 200, 0.0, FULL), SpeciesTier::Absent);
     }
 
     #[test]
     fn breadth_fraction_raises_the_bar_for_large_panels() {
         // 10% of a 5000-marker panel = 500 > floor 200, so 300 observed is below the resolve gate
         // even though it clears the absolute floor. This is the whole point of the breadth term.
-        assert_eq!(species_tier(300, 5000, 10, 200, 0.10), SpeciesTier::DetectedNotResolved);
-        assert_eq!(species_tier(600, 5000, 10, 200, 0.10), SpeciesTier::Resolved);
+        assert_eq!(species_tier(300, 5000, 10, 200, 0.10, FULL), SpeciesTier::DetectedNotResolved);
+        assert_eq!(species_tier(600, 5000, 10, 200, 0.10, FULL), SpeciesTier::Resolved);
     }
 
     #[test]
     fn small_panel_species_can_still_be_detected() {
         // total 150 < floor 200 -> can never clear the resolve gate, but the detect gate
         // (min(10, 200) = 10) still flags presence rather than dropping it silently.
-        assert_eq!(species_tier(150, 150, 10, 200, 0.0), SpeciesTier::DetectedNotResolved);
-        assert_eq!(species_tier(5, 150, 10, 200, 0.0), SpeciesTier::Absent);
+        assert_eq!(species_tier(150, 150, 10, 200, 0.0, FULL), SpeciesTier::DetectedNotResolved);
+        assert_eq!(species_tier(5, 150, 10, 200, 0.0, FULL), SpeciesTier::Absent);
+    }
+
+    /// At low depth only a few percent of any panel is observable, so an unscaled 200-marker
+    /// floor is unreachable by construction and a genuinely present species is filed as
+    /// unresolvable. The floor relaxes — but only to `MIN_FLOOR_FRACTION` of its configured
+    /// value (200 -> 50), never all the way down.
+    #[test]
+    fn low_depth_relaxes_the_floor_but_only_to_the_bound() {
+        let reachable = detectable_fraction(0.05);
+        assert!(reachable < 0.05);
+        // 60 observed markers: below the full-depth floor of 200 ...
+        assert_eq!(species_tier(60, 5000, 10, 200, 0.0, FULL), SpeciesTier::DetectedNotResolved);
+        // ... but above the relaxed floor of 50 at low depth.
+        assert_eq!(species_tier(60, 5000, 10, 200, 0.0, reachable), SpeciesTier::Resolved);
+    }
+
+    /// The relaxation must be **bounded**. Scaling the floor by the reachable fraction `r` alone
+    /// is self-cancelling: the observed count is itself ~ `total * r`, so `present >= floor * r`
+    /// reduces to `total >= floor` — independent of depth. That leaves `detect` (10 markers) as
+    /// the only real threshold, and a 20 000-marker panel hit by 40 stray tags would be declared
+    /// strain-resolvable. The bound keeps a genuine floor.
+    #[test]
+    fn adaptive_floor_does_not_cancel_itself_away() {
+        let r = detectable_fraction(0.002); // ~0.2% reachable
+        // 40 stray tags on a 20k panel: detected as present, but NOT strain-resolvable.
+        assert_eq!(
+            species_tier(40, 20_000, 10, 200, 0.0, r),
+            SpeciesTier::DetectedNotResolved
+        );
+        // The bounded floor is 50, so real evidence still resolves.
+        assert_eq!(species_tier(50, 20_000, 10, 200, 0.0, r), SpeciesTier::Resolved);
+    }
+
+    /// The gate must never fall below the absolute detect floor, at any depth.
+    #[test]
+    fn adaptive_gate_never_falls_below_the_detect_floor() {
+        for lambda in [0.0, 1e-6, 0.001, 0.01] {
+            let r = detectable_fraction(lambda);
+            assert_eq!(species_tier(9, 5000, 10, 200, 0.0, r), SpeciesTier::Absent);
+            assert_eq!(
+                species_tier(10, 5000, 10, 200, 0.0, r),
+                SpeciesTier::DetectedNotResolved
+            );
+        }
     }
 }

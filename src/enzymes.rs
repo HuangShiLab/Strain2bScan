@@ -44,12 +44,19 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// Match `window` against this pattern, **case-insensitively**.
+    ///
+    /// Case insensitivity here is what lets the digest hot path scan the caller's sequence
+    /// buffer directly: without it every read/contig had to be copied and upper-cased before
+    /// scanning (one heap allocation + one full pass per sequence). Soft-masked reference
+    /// genomes (lower-case repeat regions) are also handled correctly as a result.
+    #[inline]
     pub fn matches(&self, window: &[u8]) -> bool {
         self.anchors.iter().all(|a| {
             let end = a.offset + a.motif.len();
-            end <= window.len() && &window[a.offset..end] == a.motif
+            end <= window.len() && window[a.offset..end].eq_ignore_ascii_case(a.motif)
         }) && self.classes.iter().all(|c| {
-            c.offset < window.len() && c.allowed.contains(&window[c.offset])
+            c.offset < window.len() && c.allowed.contains(&window[c.offset].to_ascii_uppercase())
         })
     }
 }
@@ -82,20 +89,30 @@ fn is_pure_atcg(window: &[u8]) -> bool {
 }
 
 impl Enzyme {
-    /// Return all distinct `(offset, tag_length)` digestion sites in `sequence` (forward-strand
+    /// Call `f(offset, tag_length)` for every digestion site in `sequence` (forward-strand
     /// scan; the forward+reverse patterns catch both orientations).
-    pub fn find_all_tags(&self, sequence: &[u8]) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
+    ///
+    /// This is the allocation-free form used by the digest hot path — the previous
+    /// `find_all_tags` built a `Vec` per enzyme per sequence, i.e. up to 16 allocations for
+    /// every read in a multi-enzyme digest.
+    #[inline]
+    pub fn for_each_tag<F: FnMut(usize, usize)>(&self, sequence: &[u8], mut f: F) {
         if sequence.len() < self.tag_length {
-            return out;
+            return;
         }
         let last = sequence.len() - self.tag_length;
         for offset in 0..=last {
             let window = &sequence[offset..offset + self.tag_length];
             if self.patterns.iter().any(|p| p.matches(window)) && is_pure_atcg(window) {
-                out.push((offset, self.tag_length));
+                f(offset, self.tag_length);
             }
         }
+    }
+
+    /// Collecting form of [`Enzyme::for_each_tag`], kept for tests and external callers.
+    pub fn find_all_tags(&self, sequence: &[u8]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        self.for_each_tag(sequence, |pos, len| out.push((pos, len)));
         out
     }
 }

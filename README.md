@@ -23,10 +23,24 @@ while clustering and Layer-2 logic are preserved.
   digestion of shotgun reads (`--enzyme all`).
 - **Within-species clustering (CST):** single-linkage at 0.95; exact Jaccard for small panels,
   **MinHash sketches** for large ones (identical partitions on real data, near-linear build).
-- **Layer-2 profiling:** present-cluster detection from unique markers + robust abundance from
-  unique-marker depth (non-negative Elastic Net solver also included).
-- **Multi-species mode (`multi-profile`):** digest a sample **once**, match all per-species
-  DBs in parallel; a Layer-1 **species gate** suppresses cross-species false positives.
+- **Layer-2 profiling:** present-cluster detection from unique markers + **absolute** per-tag
+  depth from a zero-inclusive trimmed mean over the unique-marker panel (non-negative Elastic
+  Net solver also included, but not on the main path).
+- **Multi-species mode (`multi-profile`):** digest a sample **once**, match all per-species DBs
+  in parallel. A Layer-1 **species gate** suppresses absent species, and detection/quantification
+  are automatically restricted to markers specific to their species *across the whole panel* —
+  without that, a co-present congener's reads land on tags that merely look cluster-specific
+  within one database and inflate its depth (3× on a two-congener mock). Abundance is
+  reported at **both** scopes — `abundance` within each species (the primary number: given this
+  species is present, how does it split across strains?) and `global_abundance` across the whole
+  sample, derived from absolute depth. Per-species fractions cannot simply be concatenated into
+  a community composition, so the global column is provided rather than left to the caller.
+- **Depth-adaptive gating:** the singleton filter and the species-marker floor scale with the
+  estimated per-tag depth (`1 − e^(−λ)`), so low-input and high-host samples are not gated out
+  by thresholds unreachable at their depth. The relaxation is bounded, and the coverage floor
+  stays absolute, so precision is not traded away. `--fixed-gate` restores the old constants.
+- **Streaming I/O with gzip:** `.fq.gz` / `.fna.gz` read directly; peak memory is one batch,
+  not the whole file (still dependency-free — decompression pipes through `gzip -dc`).
 - **Assembly-quality aware:** variable completeness biases Jaccard toward *spurious splits*
   (an incomplete genome looks distant from its complete twin). `build`/`cluster` always flag
   likely-incomplete genomes (single-copy tag count ≪ the conspecific median) and can drop
@@ -41,7 +55,7 @@ while clustering and Layer-2 logic are preserved.
 git clone https://github.com/HuangShiLab/Strain2bScan
 cd Strain2bScan
 cargo build --release      # binary at target/release/strain2bscan
-cargo test                 # 23 tests
+cargo test                 # 37 tests
 ```
 
 ## Two input modes (`--enzyme`)
@@ -116,8 +130,8 @@ throughput is linear. Full benchmarks, scaling curves and accuracy: see the
   <1× per-strain depth** than full-k-mer StrainScan; it matches accuracy at sufficient depth
   (≈≥5×) while being much faster/lighter. The wet-lab-2bRAD low-input advantage is a separate
   use case.
-- Reads are matched exactly; an error-tolerant mode and gzip/streaming I/O
-  ([needletail](https://crates.io/crates/needletail)) are planned.
+- Reads are matched **exactly** — an error-tolerant digestion mode is still planned. (Streaming
+  and gzip I/O are implemented; no `needletail` dependency was needed.)
 - Species selection (which species to resolve at strain level) comes from Fast2bRAD-M's
   species-level profiling output; Strain2bScan then digests those species' genomes itself.
 
