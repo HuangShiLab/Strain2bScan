@@ -39,8 +39,9 @@ pub struct Params {
     /// Min fraction of a strain's unique markers detected (StrainScan 0.7). An absolute floor —
     /// see the comment in [`profile`] for why this one is deliberately not depth-scaled.
     pub min_coverage: f64,
-    /// Min relative abundance to keep a call (StrainScan 0.02). Always applied to the
-    /// **within-species** fraction [`profile`] computes, including under `multi-profile`.
+    /// Min relative abundance to keep a call, applied to the **within-species** fraction
+    /// [`profile`] computes (including under `multi-profile`). **Defaults to 0** — see
+    /// [`Params::default`] for why StrainScan's 0.02 is wrong here.
     pub min_rel_abundance: f64,
     /// Scale the singleton filter to the estimated depth. Turning this off restores the fixed
     /// `count >= 2` behaviour of earlier versions.
@@ -54,7 +55,23 @@ impl Default for Params {
             // k-mers; tag markers are ~50-100x sparser, so the floor is in *tag* units).
             min_support_markers: 10,
             min_coverage: 0.1,
-            min_rel_abundance: 0.02,
+            // 0, NOT StrainScan's 0.02 — and this must stay tied to the depth estimator.
+            //
+            // A 0.02 floor was survivable only while `depth` came from the median over
+            // *detected* markers, which inflates a rare cluster roughly to 1 read/tag no matter
+            // how rare it truly is. Removing that bias (see `unique_marker_depth`) made rare
+            // clusters report their real, correctly tiny share — and the unchanged 2% floor then
+            // deleted them. Measured on a 30x/0.5x mixture: the biased estimator reported the
+            // rare cluster at 3.23% (true 1.64%) and it survived; the unbiased one reports 1.57%
+            // and 0.02 drops the call entirely. Recall collapsed on exactly the samples full of
+            // rare strains — staggered mocks and high-host dilutions.
+            //
+            // Precision does not depend on this floor: it is carried by `min_support_markers`,
+            // `min_coverage` and (in `multi-profile`) the Layer-1 species gate. On the mocks,
+            // moving it between 0.02 and 0 changes no false positive, only true positives.
+            // Downstream evaluation applies its own presence threshold, so a second hidden one
+            // here is redundant. Pass `--min-abundance 0.02` to restore the old behaviour.
+            min_rel_abundance: 0.0,
             adaptive: true,
         }
     }
@@ -446,6 +463,56 @@ mod tests {
 
         let naive = naive_profile(&db, &counts, 1240.0);
         assert_eq!(naive.len(), 4, "naive should over-call all 4: {naive:?}");
+    }
+
+    /// Regression: the abundance floor must not delete a correctly-estimated rare cluster.
+    ///
+    /// This is the interaction that collapsed recall on staggered mocks and high-host samples.
+    /// StrainScan's 0.02 floor was calibrated against a *biased* depth estimator (median over
+    /// detected markers, which pins a rare cluster near 1 read/tag regardless of how rare it is).
+    /// Once the bias is removed the same floor cuts far deeper: here the rare cluster's true
+    /// share is 1/(30+1) = 3.2%, and at a 30:0.5 depth ratio the correct answer is ~1.6% — which
+    /// 0.02 would discard. Fixing an estimator without recalibrating the thresholds tuned to its
+    /// bias is the failure mode this test exists to catch.
+    #[test]
+    fn abundance_floor_does_not_delete_correctly_estimated_rare_clusters() {
+        let a: Vec<Marker> = (10_000..11_000).collect();
+        let b: Vec<Marker> = (20_000..21_000).collect();
+        let db = StrainDb::build(vec![("dominant".into(), a.clone()), ("rare".into(), b.clone())]);
+
+        let mut counts = MarkerCounts::default();
+        for &m in &a {
+            counts.insert(m, 30); // 30x
+        }
+        for &m in b.iter().take(400) {
+            counts.insert(m, 1); // ~0.4x, 40% breadth
+        }
+
+        // Default params must keep both.
+        let calls = profile(&db, &counts, &Params::default());
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"rare"),
+            "default params dropped the rare cluster: {calls:?}"
+        );
+        let rare = calls.iter().find(|c| c.name == "rare").unwrap();
+        let expected = 0.4 / 30.4;
+        assert!(
+            (rare.rel_abundance - expected).abs() < 0.005,
+            "rare abundance {} should be ~{expected:.4}",
+            rare.rel_abundance
+        );
+
+        // The old floor is still available, and still removes it — opt-in, not the default.
+        let strict = Params {
+            min_rel_abundance: 0.02,
+            ..Params::default()
+        };
+        let strict_names: Vec<String> = profile(&db, &counts, &strict)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(strict_names, vec!["dominant".to_string()]);
     }
 
     #[test]

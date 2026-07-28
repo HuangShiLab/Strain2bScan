@@ -144,7 +144,8 @@ used below, and using the wrong one is the subtle error to avoid.
     abundance_j = depth_j / Σ_{k ∈ s(j)} depth_k
 
 over the clusters of species `s(j)` that passed the support and coverage gates, then
-low-abundance clusters are dropped (`--min-abundance`) and the survivors renormalized. Sums
+low-abundance clusters are dropped (`--min-abundance`, **default 0**) and the survivors
+renormalized. Sums
 to 1.0 within each species. Answers: *given this species is present, how does it split across
 strains?* The denominator is the species itself, so it is comparable between samples.
 

@@ -702,13 +702,15 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         )
     });
 
+    // Append-only column order: the first six match what `multi-profile` wrote before the
+    // accuracy rewrite, so positional readers keep working; new columns go on the end.
     println!(
-        "#species\tcluster\tabundance\tglobal_abundance\tsample_fraction\tdepth\tcoverage\tsupport"
+        "#species\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction"
     );
     for (species, c, g, sf) in &flat {
         println!(
-            "  {}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.3}\t{:.2}\t{:.0}",
-            species, c.name, c.rel_abundance, g, sf, c.depth, c.coverage, c.support
+            "  {}\t{}\t{:.6}\t{:.2}\t{:.0}\t{:.3}\t{:.6}\t{:.6}",
+            species, c.name, c.rel_abundance, c.coverage, c.support, c.depth, g, sf
         );
     }
 
@@ -766,14 +768,14 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         let mut w = std::fs::File::create(out).map_err(|e| e.to_string())?;
         writeln!(
             w,
-            "#species\tcluster\tabundance\tglobal_abundance\tsample_fraction\tdepth\tcoverage\tsupport"
+            "#species\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction\tn_markers"
         )
         .map_err(|e| e.to_string())?;
         for (species, c, g, sf) in &flat {
             writeln!(
                 w,
-                "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.4}\t{:.4}\t{:.0}",
-                species, c.name, c.rel_abundance, g, sf, c.depth, c.coverage, c.support
+                "{}\t{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{:.6}\t{:.6}\t{}",
+                species, c.name, c.rel_abundance, c.coverage, c.support, c.depth, g, sf, c.n_markers
             )
             .map_err(|e| e.to_string())?;
         }
@@ -919,19 +921,25 @@ fn report(calls: &[StrainCall]) {
     }
 }
 
-/// Write predictions as `name<TAB>abundance<TAB>depth<TAB>coverage<TAB>support`.
+/// Write predictions as `name<TAB>abundance<TAB>coverage<TAB>support<TAB>depth<TAB>n_markers`.
+///
+/// Column order is **append-only**: the first five columns are exactly those written before the
+/// accuracy rewrite, so scripts that index positionally keep working. Inserting `depth` in the
+/// middle silently shifts `coverage` and `support` by one, which does not fail loudly — it just
+/// makes every downstream number wrong.
 ///
 /// `depth` is the absolute per-tag read depth; unlike `abundance` (normalized within this DB)
-/// it is comparable across separately-profiled species.
+/// it is comparable across separately-profiled species. `n_markers` is the cluster's tag count,
+/// needed to convert depth into a DNA-mass share.
 fn write_pred_tsv(path: &Path, calls: &[StrainCall]) -> std::io::Result<()> {
     use std::io::Write;
     let mut w = std::fs::File::create(path)?;
-    writeln!(w, "#cluster\tabundance\tdepth\tcoverage\tsupport")?;
+    writeln!(w, "#cluster\tabundance\tcoverage\tsupport\tdepth\tn_markers")?;
     for c in calls {
         writeln!(
             w,
-            "{}\t{:.6}\t{:.4}\t{:.4}\t{:.0}",
-            c.name, c.rel_abundance, c.depth, c.coverage, c.support
+            "{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{}",
+            c.name, c.rel_abundance, c.coverage, c.support, c.depth, c.n_markers
         )?;
     }
     Ok(())

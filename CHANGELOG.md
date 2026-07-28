@@ -2,7 +2,36 @@
 
 All notable changes to Strain2bScan are documented here.
 
-## [Unreleased]
+## [Unreleased] — recalibration after the accuracy rewrite
+
+### Fixed — recall regression introduced by the depth fix
+- **`--min-abundance` now defaults to 0, not 0.02.** The 0.02 floor was inherited from
+  StrainScan and was only survivable while `depth` came from the median over *detected*
+  markers, which pins a rare cluster near 1 read/tag no matter how rare it truly is. Removing
+  that bias made rare clusters report their real, correctly tiny share — and the unchanged
+  floor then deleted them. On a 30x/0.5x mixture the biased estimator reported the rare
+  cluster at 3.23% (true 1.64%) and it survived; the unbiased one reports 1.57% and 0.02
+  discarded the call outright. This collapsed recall on precisely the samples full of rare
+  strains: staggered mocks (MSA1003) and high-host dilutions (99.9% host).
+
+  Precision does not depend on this floor — it is carried by `--min-support`, `--min-coverage`
+  and the Layer-1 species gate. Moving it between 0.02 and 0 changes no false positive on the
+  mocks, only true positives, and downstream evaluation applies its own presence threshold.
+  Pass `--min-abundance 0.02` to restore the previous behaviour.
+
+  The general lesson, now covered by a regression test: **a threshold calibrated against a
+  biased estimator has to be recalibrated when the bias is removed.** Fixing the estimator
+  alone made the tool measurably more accurate and measurably less sensitive at the same time.
+
+### Fixed — output column order is append-only again
+- `profile` writes `cluster/abundance/coverage/support/depth/n_markers` and `multi-profile`
+  writes `species/cluster/abundance/coverage/support/depth/global_abundance/sample_fraction/
+  n_markers`. The previous rewrite inserted `depth` as the third column, shifting `coverage`
+  and `support` by one; positional readers do not fail on that, they just silently produce
+  wrong numbers. The leading columns now match the pre-rewrite layout exactly and every new
+  quantity is appended.
+
+## [Unreleased] — accuracy and performance rewrite
 
 Accuracy first, then speed. Existing databases remain readable — marker values are still
 FNV-1a of the canonical tag, and the on-disk format is unchanged.
