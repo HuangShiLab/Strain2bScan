@@ -653,13 +653,37 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         }
     };
 
+    // `sample_fraction` — share of ALL tag observations in the sample.
+    //
+    // `global_abundance`'s denominator is whatever this run happened to resolve, so it is not
+    // comparable between samples: change the depth, the reference panel, or the number of
+    // unknown organisms present, and the denominator moves. In a defined mock (membership known,
+    // everything detectable) that is harmless; in a real sample, where most of the community may
+    // have no reference at all, it silently rescales everything.
+    //
+    // This column uses a sample-intrinsic denominator instead — the total tag observations —
+    // which is fixed by the sequencing, not by how well profiling went. A cluster's numerator is
+    // its estimated tag mass, `depth * n_markers` (per-tag depth times how many tags it carries;
+    // the units of `depth` alone are reads-per-tag, which cannot be compared against a read
+    // total). Clusters sharing a tag each contribute their own depth to it, so the shares add up
+    // without double counting. The remainder is reported as unclassified.
+    let total_tags: u64 = counts.values().map(|&c| c as u64).sum();
+    let mass_of = |c: &StrainCall| c.depth * c.n_markers as f64;
+    let sample_fraction_of = |c: &StrainCall| {
+        if total_tags > 0 {
+            mass_of(c) / total_tags as f64
+        } else {
+            0.0
+        }
+    };
+
     // 6) report, grouped by species, most abundant cluster first within each
-    let mut flat: Vec<(&str, &StrainCall, f64)> = per_species
+    let mut flat: Vec<(&str, &StrainCall, f64, f64)> = per_species
         .iter()
         .flat_map(|r| {
             r.calls
                 .iter()
-                .map(move |c| (r.species.as_str(), c, global_of(c)))
+                .map(move |c| (r.species.as_str(), c, global_of(c), sample_fraction_of(c)))
         })
         .collect();
     flat.sort_by(|a, b| {
@@ -670,11 +694,13 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         )
     });
 
-    println!("#species\tcluster\tabundance\tglobal_abundance\tdepth\tcoverage\tsupport");
-    for (species, c, g) in &flat {
+    println!(
+        "#species\tcluster\tabundance\tglobal_abundance\tsample_fraction\tdepth\tcoverage\tsupport"
+    );
+    for (species, c, g, sf) in &flat {
         println!(
-            "  {}\t{}\t{:.6}\t{:.6}\t{:.3}\t{:.2}\t{:.0}",
-            species, c.name, c.rel_abundance, g, c.depth, c.coverage, c.support
+            "  {}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.3}\t{:.2}\t{:.0}",
+            species, c.name, c.rel_abundance, g, sf, c.depth, c.coverage, c.support
         );
     }
 
@@ -713,20 +739,33 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         n_detected,
         loaded.len() - n_resolved - n_detected
     );
+    // How much of the sequencing the strain calls actually account for. The remainder is
+    // unresolved species, organisms with no reference in the panel, host DNA and sequencing
+    // error — real signal that `global_abundance`'s denominator silently omits.
+    let classified: f64 = flat.iter().map(|(_, c, _, _)| mass_of(c)).sum();
+    if total_tags > 0 {
+        let pct = 100.0 * classified / total_tags as f64;
+        println!(
+            "coverage of sample: strain calls account for {:.1}% of {} tag observations ({:.1}% unclassified — unresolved species, no reference, host, error)",
+            pct.min(100.0),
+            total_tags,
+            (100.0 - pct).max(0.0)
+        );
+    }
 
     if let Some(out) = opts.get("out") {
         use std::io::Write;
         let mut w = std::fs::File::create(out).map_err(|e| e.to_string())?;
         writeln!(
             w,
-            "#species\tcluster\tabundance\tglobal_abundance\tdepth\tcoverage\tsupport"
+            "#species\tcluster\tabundance\tglobal_abundance\tsample_fraction\tdepth\tcoverage\tsupport"
         )
         .map_err(|e| e.to_string())?;
-        for (species, c, g) in &flat {
+        for (species, c, g, sf) in &flat {
             writeln!(
                 w,
-                "{}\t{}\t{:.6}\t{:.6}\t{:.4}\t{:.4}\t{:.0}",
-                species, c.name, c.rel_abundance, g, c.depth, c.coverage, c.support
+                "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.4}\t{:.4}\t{:.0}",
+                species, c.name, c.rel_abundance, g, sf, c.depth, c.coverage, c.support
             )
             .map_err(|e| e.to_string())?;
         }

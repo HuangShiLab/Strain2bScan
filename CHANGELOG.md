@@ -7,6 +7,27 @@ All notable changes to Strain2bScan are documented here.
 Accuracy first, then speed. Existing databases remain readable — marker values are still
 FNV-1a of the canonical tag, and the on-disk format is unchanged.
 
+### Added — `sample_fraction`, a cross-sample-comparable abundance
+- `multi-profile` gains a `sample_fraction` column: the cluster's share of **all** tag
+  observations in the sample, `depth × n_markers / Σ counts`. `global_abundance`'s denominator
+  is whatever that run resolved, so it is not comparable between samples — change the depth,
+  the reference panel, or how much of the community has no reference, and the denominator
+  moves. In a defined mock that is harmless; in a real sample, where most of the community may
+  be unreferenced, it silently rescales everything. `sample_fraction`'s denominator is fixed by
+  the sequencing instead, and the remainder is reported rather than hidden:
+
+      coverage of sample: strain calls account for 34.2% of 1234567 tag observations
+      (65.8% unclassified — unresolved species, no reference, host, error)
+
+- The two columns answer **different biological questions**, and both are now available:
+  `global_abundance ∝ depth` is a **cell** fraction; `sample_fraction ∝ depth × n_markers` is a
+  **DNA/biomass** fraction. They differ by genome size — on a mock where two clusters at equal
+  cell depth had 2.0 Mb and 1.6 Mb genomes, the columns correctly report 0.510/0.490 and
+  0.564/0.436. Match the column to how the ground truth is defined: a mix specified as equal
+  *genomic DNA* should be compared against `sample_fraction`, one specified as equal *genome
+  copies* against `global_abundance`. Using the wrong one imposes a systematic error scaling
+  with the genome-size spread of the panel.
+
 ### Fixed — quantification
 - **`multi-profile` now uses the cross-species evidence for quantification, not just gating.**
   Cluster-uniqueness is only defined *within* one species database, so a tag can be unique to a

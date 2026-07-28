@@ -71,6 +71,10 @@ pub struct StrainCall {
     /// **Absolute** per-tag depth (reads per unique marker), zero-inclusive. Comparable across
     /// species — this is the quantity cross-species composition is built from.
     pub depth: f64,
+    /// Total single-copy tags this cluster carries. `depth * n_markers` estimates the cluster's
+    /// share of the sample's tag observations, which is what lets a caller normalize against
+    /// **all** sequencing output rather than only the part that was resolved.
+    pub n_markers: usize,
     /// Relative abundance, normalized over whatever set the caller passed to
     /// [`normalize_by_depth`] (within one species DB after [`profile`]).
     pub rel_abundance: f64,
@@ -301,6 +305,7 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
             support: support as f64,
             coverage,
             depth: st.depth,
+            n_markers: db.strain_markers[j].len(),
             rel_abundance: 0.0,
         });
     }
