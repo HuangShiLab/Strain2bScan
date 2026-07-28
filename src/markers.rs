@@ -508,7 +508,7 @@ mod tests {
                     .map(|i| {
                         let x = seed
                             .wrapping_mul(6364136223846793005)
-                            .wrapping_add(i as u64 * 1442695040888963407);
+                            .wrapping_add((i as u64).wrapping_mul(1442695040888963407));
                         alphabet[((x >> 33) % alphabet.len() as u64) as usize]
                     })
                     .collect();
