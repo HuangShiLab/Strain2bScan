@@ -39,10 +39,12 @@ while clustering and Layer-2 logic are preserved.
   | `global_abundance` | what this run resolved | composition of the resolved part — fine for a defined mock, **not comparable between samples** |
   | `sample_fraction` | all tag observations | share of the sequencing; denominator fixed by the data, so it **is** comparable between samples |
 
-  `global_abundance ∝ depth` is a **cell** fraction; `sample_fraction ∝ depth × n_markers` is a
-  **DNA** fraction. They differ by genome size, so match the column to how your ground truth is
-  defined — a mix specified as equal genomic DNA against `sample_fraction`, equal genome copies
-  against `global_abundance`. The unclassified remainder is printed rather than hidden.
+  `global_abundance ∝ depth` is a **cell** fraction (what CAMI and the ATCC standards call
+  *taxonomic abundance*) — unique markers are single-copy, so reads-per-tag cancels genome size
+  out. `sample_fraction ∝ depth × n_markers` puts it back in and is a **DNA** fraction (*sequence
+  / genomic abundance*). Match the column to how your ground truth is stated: ATCC MSA mixes give
+  taxonomic abundance, so benchmark against `global_abundance`. The unclassified remainder is
+  printed rather than hidden.
 - **Depth-adaptive gating:** the singleton filter and the species-marker floor scale with the
   estimated per-tag depth (`1 − e^(−λ)`), so low-input and high-host samples are not gated out
   by thresholds unreachable at their depth. The relaxation is bounded, and the coverage floor

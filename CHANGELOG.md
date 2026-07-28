@@ -19,14 +19,22 @@ FNV-1a of the canonical tag, and the on-disk format is unchanged.
       coverage of sample: strain calls account for 34.2% of 1234567 tag observations
       (65.8% unclassified — unresolved species, no reference, host, error)
 
-- The two columns answer **different biological questions**, and both are now available:
-  `global_abundance ∝ depth` is a **cell** fraction; `sample_fraction ∝ depth × n_markers` is a
-  **DNA/biomass** fraction. They differ by genome size — on a mock where two clusters at equal
-  cell depth had 2.0 Mb and 1.6 Mb genomes, the columns correctly report 0.510/0.490 and
-  0.564/0.436. Match the column to how the ground truth is defined: a mix specified as equal
-  *genomic DNA* should be compared against `sample_fraction`, one specified as equal *genome
-  copies* against `global_abundance`. Using the wrong one imposes a systematic error scaling
-  with the genome-size spread of the panel.
+- The two columns answer **different biological questions**, and both are now available. In the
+  standard metagenomics terminology (CAMI, and the ATCC microbiome standards):
+
+  | ground truth is stated as | meaning | compare against |
+  |---|---|---|
+  | **taxonomic abundance**, cell/organism abundance | fraction of *cells* | **`global_abundance`** |
+  | sequence abundance, genomic/DNA abundance | fraction of *DNA* | `sample_fraction` |
+
+  `global_abundance ∝ depth` is a cell fraction because unique markers are **single-copy**: a
+  genome with more tags yields proportionally more reads, so reads-per-tag cancels the genome
+  size out (`depth = reads/G ∝ cells·G/G`). `sample_fraction ∝ depth × n_markers` puts the
+  genome size back in and is therefore a DNA fraction. On a mock with two clusters at equal cell
+  depth but 2.0 Mb and 1.6 Mb genomes, the columns correctly report 0.510/0.490 (cells) and
+  0.564/0.436 (DNA). ATCC MSA-1002 states **taxonomic abundance**, so benchmark it against
+  `global_abundance`; using the wrong column imposes a systematic error scaling with the
+  genome-size spread of the panel (>6× across MSA-1002).
 
 ### Fixed — quantification
 - **`multi-profile` now uses the cross-species evidence for quantification, not just gating.**
