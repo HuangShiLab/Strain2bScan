@@ -2,6 +2,33 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — separate the two adaptive gates
+
+### Fixed — large panels lost specificity
+- **`--no-adaptive-singleton` and `--no-adaptive-floor` split what `--fixed-gate` used to
+  bundle.** Real-data testing on 164-species panels showed the recall fix came with a
+  precision collapse on multi-enzyme WMS samples (MSA1005/1007 precision 1.0 → 0.25–0.30;
+  MSA1003 1.0 → 0.59), degrading with panel size (a 120-species panel held 0.77–0.91).
+
+  The cause is a design flaw in the adaptive floor: it scales the species-marker floor by
+  `1 − e^(−λ)` where λ is estimated from **that species' own** markers. An *absent* species has
+  the lowest λ of all, so it receives the **largest** relaxation — the gate is loosest for
+  exactly the species that should be rejected. An absent species then needs only
+  `MIN_FLOOR_FRACTION × 200 = 50` species-specific markers hit **once** (the singleton
+  admission also applies at λ≈0), where the old gate demanded 200 hit **twice**. On a large
+  panel of dense multi-enzyme markers that is easy to reach by chance, and the more candidate
+  species there are, the more clear it spuriously.
+
+  The two relaxations act at different layers, which is why separating them matters:
+  measured on a 0.3× single-strain sample, `--no-adaptive-singleton` loses the call while
+  `--no-adaptive-floor` keeps it. Singleton admission is what buys low-depth **sensitivity**
+  (it is what took MSA1002 99.9% host from 11/20 to 19/20 strain-resolved); the floor
+  relaxation only moves the Layer-1 species gate, which is where the false positives enter.
+  So `--no-adaptive-floor` is the setting to try first on a large panel: it should cut the
+  false positives while keeping the recall gain.
+
+  `--fixed-gate` still turns both off, for backwards compatibility.
+
 ## [Unreleased] — recalibration after the accuracy rewrite
 
 ### Fixed — recall regression introduced by the depth fix

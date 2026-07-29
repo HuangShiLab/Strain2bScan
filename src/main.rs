@@ -52,7 +52,7 @@ fn main() -> ExitCode {
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--fixed-gate] [--no-cross-species-filter]   (many species, sample digested once)\n  \
+                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
@@ -64,8 +64,12 @@ fn main() -> ExitCode {
                  use only markers specific to their species across the whole panel, so a\n\
                  co-present congener cannot inflate a cluster's depth; disable with\n\
                  --no-cross-species-filter (single-species `profile` cannot do this).\n\
-                 --fixed-gate restores the pre-0.2 fixed singleton filter (count>=2) and unscaled\n\
-                 species floor; by default those scale with the estimated per-tag depth."
+                 --fixed-gate restores the pre-0.2 fixed singleton filter (count>=2) AND the\n\
+                 unscaled species floor. The two can be reverted independently with\n\
+                 --no-adaptive-singleton / --no-adaptive-floor: on a large panel the floor\n\
+                 relaxation costs specificity (an ABSENT species has the lowest estimated depth,\n\
+                 so it receives the largest relaxation), while the singleton admission is what\n\
+                 buys low-depth sensitivity. Calibrate the pair on your own panel."
             );
             return ExitCode::from(2);
         }
@@ -339,8 +343,17 @@ fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
     if let Some(v) = opts.get("min-abundance") {
         p.min_rel_abundance = v.parse().map_err(|_| "bad --min-abundance (want 0..1)")?;
     }
+    // `--fixed-gate` turns both adaptations off (backwards compatible); the two halves can
+    // also be controlled independently, which is what calibrating a large panel needs.
     if opts.contains_key("fixed-gate") {
-        p.adaptive = false;
+        p.adaptive_singleton = false;
+        p.adaptive_floor = false;
+    }
+    if opts.contains_key("no-adaptive-singleton") {
+        p.adaptive_singleton = false;
+    }
+    if opts.contains_key("no-adaptive-floor") {
+        p.adaptive_floor = false;
     }
     Ok(p)
 }
@@ -591,7 +604,7 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         } else {
             0.0
         };
-        let min_count = if params.adaptive {
+        let min_count = if params.adaptive_singleton {
             strain2bscan::identify::min_count_for(lambda)
         } else {
             2
@@ -600,7 +613,7 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
             .iter()
             .filter(|m| counts.get(*m).copied().unwrap_or(0) >= min_count)
             .count();
-        let reachable = if params.adaptive {
+        let reachable = if params.adaptive_floor {
             detectable_fraction(lambda)
         } else {
             1.0

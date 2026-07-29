@@ -43,9 +43,21 @@ pub struct Params {
     /// [`profile`] computes (including under `multi-profile`). **Defaults to 0** — see
     /// [`Params::default`] for why StrainScan's 0.02 is wrong here.
     pub min_rel_abundance: f64,
-    /// Scale the singleton filter to the estimated depth. Turning this off restores the fixed
-    /// `count >= 2` behaviour of earlier versions.
-    pub adaptive: bool,
+    /// Admit `count == 1` markers as evidence when the estimated depth is low enough that
+    /// genuine markers are mostly singletons (see [`min_count_for`]). Off ⇒ always `count >= 2`.
+    ///
+    /// Kept **separate** from [`Params::adaptive_floor`] because the two relaxations trade off
+    /// differently: admitting singletons buys real sensitivity on sparse 2bRAD panels, but on a
+    /// dense multi-enzyme digest against a large species panel it is also the main way an
+    /// absent species accumulates spurious evidence.
+    pub adaptive_singleton: bool,
+    /// Scale the Layer-1 species-marker floor down toward what is reachable at the estimated
+    /// depth. Off ⇒ the configured floor applies at every depth.
+    ///
+    /// ⚠️ This relaxation keys on the species' **own** estimated depth, so an *absent* species —
+    /// whose depth is near zero — receives the largest relaxation of all. That is backwards, and
+    /// it is why large panels lose specificity: see the note on `MIN_FLOOR_FRACTION` in `main`.
+    pub adaptive_floor: bool,
 }
 
 impl Default for Params {
@@ -72,7 +84,8 @@ impl Default for Params {
             // Downstream evaluation applies its own presence threshold, so a second hidden one
             // here is redundant. Pass `--min-abundance 0.02` to restore the old behaviour.
             min_rel_abundance: 0.0,
-            adaptive: true,
+            adaptive_singleton: true,
+            adaptive_floor: true,
         }
     }
 }
@@ -223,7 +236,7 @@ pub fn detect_present(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<(
     let mut out = Vec::new();
     for j in 0..db.n_strains() {
         let st = panel_stats(db, counts, j);
-        let min_count = if p.adaptive { min_count_for(st.depth) } else { 2 };
+        let min_count = if p.adaptive_singleton { min_count_for(st.depth) } else { 2 };
         let detected = if min_count >= 2 {
             st.detected2
         } else {
@@ -293,7 +306,7 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
         if st.panel == 0 {
             continue;
         }
-        let min_count = if p.adaptive { min_count_for(st.depth) } else { 2 };
+        let min_count = if p.adaptive_singleton { min_count_for(st.depth) } else { 2 };
         let support = if min_count >= 2 {
             st.detected2
         } else {
@@ -659,7 +672,8 @@ mod tests {
         }
 
         let fixed = Params {
-            adaptive: false,
+            adaptive_singleton: false,
+            adaptive_floor: false,
             min_rel_abundance: 0.0,
             ..Params::default()
         };
