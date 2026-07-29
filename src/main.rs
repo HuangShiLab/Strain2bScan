@@ -52,7 +52,7 @@ fn main() -> ExitCode {
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
+                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
@@ -64,6 +64,11 @@ fn main() -> ExitCode {
                  use only markers specific to their species across the whole panel, so a\n\
                  co-present congener cannot inflate a cluster's depth; disable with\n\
                  --no-cross-species-filter (single-species `profile` cannot do this).\n\
+                 --min-global-abundance F drops calls below F of the cross-species composition.\n\
+                 It is the only filter that can remove a spurious SPECIES: --min-abundance is\n\
+                 within-species, so a species with one cluster always sits at 1.0 there. Use it\n\
+                 to separate community members from trace cross-contamination between libraries,\n\
+                 which passes every marker-evidence gate because the reads really are present.\n\
                  --fixed-gate restores the pre-0.2 fixed singleton filter (count>=2) AND the\n\
                  unscaled species floor. The two can be reverted independently with\n\
                  --no-adaptive-singleton / --no-adaptive-floor: on a large panel the floor\n\
@@ -589,7 +594,7 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     //    at all is the Layer-1 species gate's decision (step 3), not this filter's.
     let params = parse_params(opts)?;
     let order: Vec<usize> = (0..loaded.len()).collect();
-    let per_species: Vec<SpeciesResult> = par_map(&order, |&i| {
+    let mut per_species: Vec<SpeciesResult> = par_map(&order, |&i| {
         let (species, db) = &loaded[i];
         let specific = &specific_sets[i];
         let total_specific = specific.len();
@@ -661,6 +666,52 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     //    biomass that is NOT in it, so `global_abundance` is a composition of the strain-resolved
     //    fraction of the sample, not of the whole community. The summary line below reports how
     //    many species fell outside it; use `depth` directly if you need absolute quantities.
+    // `--min-global-abundance` — a TRACE filter, and the only one that can remove a spurious
+    // *species*.
+    //
+    // `--min-abundance` is within-species, so a species contributing a single cluster always has
+    // abundance 1.0 there and can never be filtered by it, however little DNA it represents.
+    // Trace cross-contamination between multiplexed libraries (index hopping typically leaves
+    // 0.01–0.1% of one library in another) therefore survives every marker-evidence gate — and
+    // correctly so, since the reads really are present and really do hit that species' specific
+    // markers. The gates answer "is there evidence", which is a different question from "is
+    // there enough of it to call the organism a community member".
+    //
+    // Separating those needs an abundance scale, not a stricter gate: on a defined mock the true
+    // members sit ~3 orders of magnitude above the contaminant trace, so any cut inside that gap
+    // is stable. Default 0 (report everything, let the caller decide).
+    let min_global: f64 = opts
+        .get("min-global-abundance")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    if min_global > 0.0 {
+        let total: f64 = per_species
+            .iter()
+            .flat_map(|r| r.calls.iter())
+            .map(|c| c.depth)
+            .sum();
+        if total > 0.0 {
+            for r in &mut per_species {
+                r.calls.retain(|c| c.depth / total >= min_global);
+            }
+            // A species whose clusters were all trace-level is no longer strain-resolved.
+            for r in &mut per_species {
+                if r.tier == SpeciesTier::Resolved && r.calls.is_empty() {
+                    r.tier = SpeciesTier::DetectedNotResolved;
+                }
+            }
+            // Within-species abundance must be renormalized over the survivors.
+            for r in &mut per_species {
+                let kept: f64 = r.calls.iter().map(|c| c.rel_abundance).sum();
+                if kept > 0.0 {
+                    for c in &mut r.calls {
+                        c.rel_abundance /= kept;
+                    }
+                }
+            }
+        }
+    }
+
     let depth_sum: f64 = per_species
         .iter()
         .flat_map(|r| r.calls.iter())

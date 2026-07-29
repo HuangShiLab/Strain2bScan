@@ -2,6 +2,32 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — separate community members from trace contamination
+
+### Added — `--min-global-abundance`
+- Drops calls below a given share of the cross-species composition, and demotes a species whose
+  clusters were all trace-level to *detected, not strain-resolvable* rather than deleting it.
+
+  This is the **only** filter that can remove a spurious species. `--min-abundance` is
+  within-species, so a species contributing a single cluster always sits at 1.0 there and can
+  never be filtered by it, however little DNA it represents.
+
+  It exists because a gate sweep on a 28-database / MSA-1005 WMS sample moved almost nothing:
+  precision 0.333 at default, 0.353 under `--fixed-gate`, `--no-adaptive-singleton` or
+  `--min-species-marker-frac 0.05`, and `--no-adaptive-floor` alone changed *nothing at all*.
+  The 12 false-positive species turned out to be exactly the roster of a **different** mock in
+  the same series (ATCC MSA-1002, *E. coli* among them), each hitting its own species-specific
+  markers at ~1e-4 of the composition — three orders of magnitude below the true members at
+  ~16%. That is the signature of trace cross-contamination between multiplexed libraries
+  (index hopping typically leaves 0.01–0.1% of one library in another), not of a marker or
+  gating error: the reads really are present and really do belong to those species.
+
+  So no evidence gate can fix it, and tightening one only trades recall away. The gates answer
+  "is there evidence"; whether an organism is a community member is a question about *how much*,
+  and needs an abundance scale. On a defined mock the two populations are separated by ~3 orders
+  of magnitude, so any cut inside the gap is stable — 0.001 to 0.01 is a reasonable starting
+  range. Default is 0, so nothing is filtered unless asked.
+
 ## [Unreleased] — separate the two adaptive gates
 
 ### Fixed — large panels lost specificity
