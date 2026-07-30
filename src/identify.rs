@@ -15,10 +15,48 @@
 //!    not silently thresholded away. See [`min_count_for`] and [`detectable_fraction`].
 //! 4. **Post-filter.** Drop calls below `min_rel_abundance`; renormalize.
 //!
+//! ## Why not a regression, as StrainScan uses
+//!
 //! A non-negative Elastic Net solver ([`nonneg_elastic_net`], StrainScan's
-//! `ElasticNet(positive=True)`) is provided but deliberately **not** on the main path: after
-//! CST clustering the design columns are already ≥5% dissimilar, presence is decided upstream,
-//! and a dense strain×marker matrix does not scale. It is kept for experimentation.
+//! `ElasticNet(positive=True)`) is provided but deliberately **not** on the main path. The
+//! reason is empirical, and it is the opposite of what one would expect.
+//!
+//! A regression fits over the *full* marker space, shared markers included, so it uses data this
+//! module discards — a real statistical-efficiency advantage. The natural assumption is that its
+//! L1 penalty also handles shadow clusters (see [`profile`]) by shrinking a weakly-supported
+//! component to zero. **It does not.** Run on the shadow scenario — a strain carrying all of
+//! cluster A's distinguishing loci and 30% of cluster B's, at 20x — the solver returns:
+//!
+//! ```text
+//!   alpha = 0      w_A = 18.36   w_B = 4.36    (w_B/w_A = 0.238)
+//!   alpha = 0.01   w_A = 18.20   w_B = 4.38    (0.241)
+//!   alpha = 0.10   w_A = 16.87   w_B = 4.48    (0.266)   <- stronger penalty is WORSE
+//! ```
+//!
+//! The shadow survives at every penalty, and raising alpha makes it worse: shrinking the
+//! dominant coefficient leaves residual on the shared core that the minor one absorbs. On the
+//! genuine counterpart (B truly present at 0.4x) the same penalty inflates `w_B` from 0.35 to
+//! 0.86 — so alpha degrades both cases at once.
+//!
+//! The structural reason: 300 markers at count 20 *is* strong evidence in a least-squares sense,
+//! and no penalty small enough to leave the real strains alone can remove it. More fundamentally,
+//! a least-squares objective sees only the mean — "300 markers at 20x" and "1000 markers at 6x"
+//! are the same number to it. What separates them is the **breadth** of the evidence, which the
+//! objective discards. That is exactly the quantity the depth–breadth consistency test in
+//! [`profile`] reads, and why it succeeds where the penalty cannot: on the same scenario it takes
+//! the shadow's share of the species from 28% (this module's estimator alone) or ~20% (the
+//! regression) to 0%.
+//!
+//! Abundance accuracy is otherwise a wash — on ATCC MSA-1002 the L1 error to truth is 0.434 here
+//! against 0.425 for StrainScan — so the regression's efficiency edge is offset by this module's
+//! robustness to outliers (winsorization), its absolute and cross-comparable units, and its
+//! immunity to cross-species cross-talk.
+//!
+//! One case would still favour a regression: a sample strain that is a genuine *mixture* of two
+//! references, which should be apportioned rather than called as one or both. If that turns up,
+//! the right scope is a **per-species** fit over the species-specific marker space — which does
+//! scale (20 clusters × 20 000 markers is ~3 MB), contrary to an earlier note here that judged
+//! it by a global matrix.
 
 use crate::db::StrainDb;
 use crate::markers::MarkerCounts;
