@@ -2,6 +2,44 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — reject shadow clusters (depth–breadth consistency)
+
+### Fixed — the dominant same-species false positive
+- **`--min-consistency` (default 0.5)** rejects a cluster whose observed markers are too *deep*
+  for how *few* of them were seen: `coverage / (1 − e^(−depth))`.
+
+  Breaking the per-sample false positives down by species showed two unrelated populations, and
+  only one of them was trace contamination. The other — the dominant one — is a **shadow**: the
+  strain in the sample is not exactly any reference, so it carries all of cluster A's
+  distinguishing loci plus a fraction `f` of cluster B's, and B gets called on genuine reads at
+  the sample strain's full depth but across only `f` of its panel. These appeared at real
+  abundance (1.3–34%, e.g. `S_epidermidis__GCF_006094375.1` in 11 of the mock runs), and
+  identically in the 120- and 164-species panels, so neither an abundance threshold nor a
+  smaller panel touches them.
+
+  Nor can any coverage floor: measured on a shadow scenario the spurious cluster showed breadth
+  0.350, while a genuinely present cluster at 0.4x showed 0.392 — indistinguishable. The two
+  differ in **depth**, 7.68x versus 0.44x. Under Poisson sampling a real cluster at depth λ must
+  show breadth `1 − e^(−λ)`, so the ratio is ~1 for a real cluster at any depth and ~`f` for a
+  shadow. Swept synthetically: genuine clusters scored **0.949–1.018** across 0.3x–20x, shadows
+  **0.200/0.300/0.495/0.691/0.897** at f = 0.2/0.3/0.5/0.7/0.9.
+
+  Removing a shadow also repairs the true strain's abundance, which the shadow was taking a
+  share of — 0.717 → 1.000 on the test scenario. So this improves composition as well as
+  precision.
+
+  Note that StrainScan's iterative "remove explained markers" step cannot be ported directly:
+  cluster-unique marker sets are disjoint by construction here, so removing one cluster's
+  markers leaves another's panel untouched and the iteration is a no-op. StrainScan gets its
+  discrimination from scoring over the *full* k-mer set, where co-present clusters do share
+  markers. The consistency test reaches the same end from the sparse-marker side, and needs no
+  ordering between clusters.
+
+  Two honest limits: the test is inert below ~0.5x depth, where `coverage ≈ 1 − e^(−depth)`
+  holds for anything (so a rare strain is never penalized, but a low-depth shadow is not caught
+  either); and it degrades gracefully as `f` → 1, which is correct, since a strain carrying all
+  of B's distinguishing loci really is evidence for B. Set `--min-consistency 0` to disable.
+
 ## [Unreleased] — separate community members from trace contamination
 
 ### Added — `--min-global-abundance`

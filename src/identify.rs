@@ -51,6 +51,10 @@ pub struct Params {
     /// dense multi-enzyme digest against a large species panel it is also the main way an
     /// absent species accumulates spurious evidence.
     pub adaptive_singleton: bool,
+    /// Minimum `coverage / (1 − e^(−depth))`. Rejects "shadow" clusters whose observed markers
+    /// are far deeper than their breadth allows — see the note in [`profile`]. Set to 0 to
+    /// disable. A genuinely present cluster scores ~1 at any depth.
+    pub min_consistency: f64,
     /// Scale the Layer-1 species-marker floor down toward what is reachable at the estimated
     /// depth. Off ⇒ the configured floor applies at every depth.
     ///
@@ -84,6 +88,11 @@ impl Default for Params {
             // Downstream evaluation applies its own presence threshold, so a second hidden one
             // here is redundant. Pass `--min-abundance 0.02` to restore the old behaviour.
             min_rel_abundance: 0.0,
+            // 0.5 sits in the middle of a measured gap: synthetic shadows scored <= 0.897 (and
+            // real ones far lower), genuine clusters >= 0.949 across depths 0.3x-20x. Left low
+            // enough to tolerate the coverage non-uniformity of real 2bRAD, which the synthetic
+            // sweep does not model.
+            min_consistency: 0.5,
             adaptive_singleton: true,
             adaptive_floor: true,
         }
@@ -329,6 +338,34 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
         if coverage < p.min_coverage {
             continue;
         }
+        // Depth–breadth consistency: reject a cluster whose markers are too DEEP for how FEW of
+        // them were seen.
+        //
+        // This is the test that removes "shadow" clusters — the dominant false positive on real
+        // panels. When the strain in the sample is not exactly any reference but sits between two
+        // clusters, it carries all of cluster A's distinguishing loci and a fraction `f` of
+        // cluster B's. Cluster B is then called on real reads at the *sample strain's* full
+        // depth, but on only `f` of its panel. No coverage floor can catch this: measured on a
+        // shadow scenario, B showed coverage 0.350 while a genuinely present B at 0.4x showed
+        // 0.392 — indistinguishable. What differs is depth, 7.68x versus 0.44x.
+        //
+        // Under Poisson sampling a genuinely present cluster at depth λ must show breadth
+        // `1 − e^(−λ)`. So `coverage / (1 − e^(−depth))` is ~1 for a real cluster at any depth,
+        // and ~`f` for a shadow (its depth is `f × D`, large enough that the expected breadth is
+        // ~1, while the observed breadth is only `f`). Swept on synthetic data: real clusters
+        // scored 0.949–1.018 across depths 0.3x–20x, shadows scored 0.200/0.300/0.495/0.691/0.897
+        // at f = 0.2/0.3/0.5/0.7/0.9. Real shadows carry small `f` — the S. epidermidis shadow in
+        // MSA-1005 sat at ~7% of its true strain's abundance — so the default leaves wide margin
+        // on both sides.
+        //
+        // Note the graceful degradation: as `f` → 1 a shadow becomes indistinguishable from a
+        // genuine call, which is correct, because a strain carrying all of B's distinguishing
+        // loci *is* evidence for B. The test is also inert below ~0.5x depth, where
+        // `coverage ≈ 1 − e^(−depth)` holds for any cluster; a rare strain is never penalized.
+        let expected_breadth = detectable_fraction(st.depth);
+        if expected_breadth > 0.0 && coverage / expected_breadth < p.min_consistency {
+            continue;
+        }
         calls.push(StrainCall {
             strain_index: j,
             name: db.strain_names[j].clone(),
@@ -526,6 +563,68 @@ mod tests {
             .map(|c| c.name.clone())
             .collect();
         assert_eq!(strict_names, vec!["dominant".to_string()]);
+    }
+
+    /// A shadow cluster and a genuinely present rare cluster have the **same breadth** and differ
+    /// only in depth, so only the depth–breadth consistency test can separate them.
+    ///
+    /// Shadow: the sample strain carries 30% of cluster B's distinguishing loci, so those markers
+    /// appear at the sample strain's full 20x while the other 70% are absent — depth 6.0, breadth
+    /// 0.30, and an expected breadth at that depth of ~1.0.
+    /// Genuine: cluster B present at 0.33x — depth 0.33, breadth 0.33, expected breadth 0.28.
+    #[test]
+    fn shadow_clusters_are_rejected_but_genuine_rare_ones_are_kept() {
+        let a: Vec<Marker> = (10_000..11_000).collect();
+        let b: Vec<Marker> = (20_000..21_000).collect();
+        let db = StrainDb::build(vec![("A".into(), a.clone()), ("B".into(), b.clone())]);
+
+        let names = |p: &Params, counts: &MarkerCounts| -> Vec<String> {
+            profile(&db, counts, p).iter().map(|c| c.name.clone()).collect()
+        };
+        let loose = Params {
+            min_rel_abundance: 0.0,
+            min_consistency: 0.0,
+            ..Params::default()
+        };
+        let default = Params {
+            min_rel_abundance: 0.0,
+            ..Params::default()
+        };
+
+        // --- shadow: 30% of B's panel at the true strain's depth
+        let mut shadow = MarkerCounts::default();
+        for &m in &a {
+            shadow.insert(m, 20);
+        }
+        for &m in b.iter().take(300) {
+            shadow.insert(m, 20);
+        }
+        assert_eq!(names(&loose, &shadow), vec!["A", "B"], "filter off: both called");
+        assert_eq!(
+            names(&default, &shadow),
+            vec!["A"],
+            "default must reject the shadow"
+        );
+        // Removing the shadow also repairs the true strain's abundance, which the shadow was
+        // taking a 28% share of.
+        let calls = profile(&db, &shadow, &default);
+        assert!((calls[0].rel_abundance - 1.0).abs() < 1e-9);
+
+        // --- genuine: B present at ~0.33x, i.e. the SAME breadth as the shadow
+        let mut genuine = MarkerCounts::default();
+        for &m in &a {
+            genuine.insert(m, 20);
+        }
+        for &m in b.iter().take(330) {
+            genuine.insert(m, 1);
+        }
+        let mut got = names(&default, &genuine);
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["A".to_string(), "B".to_string()],
+            "a genuinely rare cluster with the same breadth must survive"
+        );
     }
 
     #[test]

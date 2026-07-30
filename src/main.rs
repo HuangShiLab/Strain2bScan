@@ -51,8 +51,8 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
+                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--min-consistency F] [--fixed-gate]\n  \
+                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
@@ -64,6 +64,13 @@ fn main() -> ExitCode {
                  use only markers specific to their species across the whole panel, so a\n\
                  co-present congener cannot inflate a cluster's depth; disable with\n\
                  --no-cross-species-filter (single-species `profile` cannot do this).\n\
+                 --min-consistency F (default 0.5) rejects a cluster whose markers are too DEEP\n\
+                 for how FEW of them were seen: coverage/(1-e^-depth) is ~1 for a genuinely\n\
+                 present cluster at any depth, but ~f for a shadow cluster -- one called because\n\
+                 the sample strain happens to carry a fraction f of its distinguishing loci. Set\n\
+                 0 to disable. This is the main same-species false-positive source; no coverage\n\
+                 floor can catch it, since a shadow and a genuine rare strain have the same\n\
+                 breadth and differ only in depth.\n\
                  --min-global-abundance F drops calls below F of the cross-species composition.\n\
                  It is the only filter that can remove a spurious SPECIES: --min-abundance is\n\
                  within-species, so a species with one cluster always sits at 1.0 there. Use it\n\
@@ -350,6 +357,9 @@ fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
     }
     // `--fixed-gate` turns both adaptations off (backwards compatible); the two halves can
     // also be controlled independently, which is what calibrating a large panel needs.
+    if let Some(v) = opts.get("min-consistency") {
+        p.min_consistency = v.parse().map_err(|_| "bad --min-consistency (want 0..1)")?;
+    }
     if opts.contains_key("fixed-gate") {
         p.adaptive_singleton = false;
         p.adaptive_floor = false;
