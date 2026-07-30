@@ -56,7 +56,10 @@ fn main() -> ExitCode {
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
-                 <set> = all | BcgI | BcgI,CspCI  (use BcgI for 2bRAD data; all for conventional metagenomes)\n\
+                 <set> = all | recommended | BcgI | BcgI,CspCI  (BcgI for 2bRAD data; recommended\n\
+                 or all for conventional metagenomes. `recommended` is the 14 non-degenerate\n\
+                 enzymes: it drops HaeIV/Hin4I, whose loose IUPAC sites contribute 35% of the tags\n\
+                 in `all` and are the easiest for a sequencing error to create or destroy.)\n\
                  reads/genomes may be gzipped (.fq.gz, .fna.gz).\n\
                  multi-profile reports two scopes: `abundance` sums to 1.0 WITHIN each species\n\
                  (the primary number), `global_abundance` sums to 1.0 over the strain-resolved\n\

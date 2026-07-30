@@ -2,6 +2,34 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — expose the recommended enzyme set
+
+### Added — `--enzyme recommended`
+- The 14 non-degenerate enzymes: everything in the table except **HaeIV** and **Hin4I**.
+
+  `enzymes.rs` has always documented these two as "highly degenerate and excluded from the
+  recommended multi-enzyme set (noisy)", but that set was never selectable, so multi-enzyme runs
+  had to use `all` and take them along. Measured on a 1.8 Mb genome:
+
+  | set | tags | 1 per | cluster-unique |
+  |---|---|---|---|
+  | `BcgI` | 984 | 1 829 bp | 14.5% |
+  | `recommended` (14) | 16 016 | 1 116 bp | 13.9% |
+  | `all` (16) | 23 815 | 1 76 bp | 14.0% |
+
+  HaeIV and Hin4I yield ~4 150 tags each — comparable to the most productive specified enzymes —
+  because their IUPAC-degenerate sites match far more often. Together they are 35% of `all`'s
+  panel. That looseness is also what makes their sites the easiest for a sequencing error to
+  create or destroy, which adds noise to the depth estimate and to the between-strain
+  discrimination that depends on it. The unique-marker *fraction* is flat (~14%) across all three
+  sets, so dropping them costs a third of the panel without changing its composition.
+
+  Whether that trade is net-positive is an empirical question per dataset, and now it is one flag
+  to test rather than 14 enzyme names to type. Note that marker count is unlikely to be the
+  binding constraint on the current mock precision: a shadow cluster's overlap fraction `f` is a
+  property of the genomes, not of how densely they are sampled, so denser digestion does not
+  shrink it.
+
 ## [Unreleased] — reject shadow clusters (depth–breadth consistency)
 
 ### Fixed — the dominant same-species false positive

@@ -264,9 +264,30 @@ pub fn parse_enzyme(site: &str) -> Option<&'static Enzyme> {
 }
 
 /// Parse an enzyme *set* spec: `all` (all 16), or a comma list of names/ids ("BcgI,CspCI").
+/// The 14 enzymes recommended for multi-enzyme digestion: everything except **HaeIV** and
+/// **Hin4I**.
+///
+/// Those two are the highly IUPAC-degenerate members of the table (see the module docs). A
+/// degenerate recognition site matches far more often — on a 1.8 Mb genome each yields ~4 150
+/// tags against ~250–1 000 for a fully specified enzyme, and together they contribute 8 300 of
+/// the 23 815 tags that `all` produces, i.e. 35% of the panel. Because their sites are less
+/// constrained, they are also correspondingly easier for a sequencing error to create or destroy,
+/// which adds noise to both the depth estimate and the between-strain discrimination that
+/// depends on it.
+///
+/// `recommended` keeps ~15 500 tags (1 per ~116 bp), still a ~16× enrichment over BcgI alone.
+/// Use `all` only when panel size is the binding constraint and the extra noise is acceptable.
+pub static RECOMMENDED_ENZYMES: &[&Enzyme] = &[
+    &CSPCI, &ALOI, &BSAXI, &BAEI, &BCGI, &CJEI, &PPII, &PSRI, &BPLI, &FALI, &BSP24I, &CJEPI,
+    &ALFI, &BSLFI,
+];
+
 pub fn parse_enzyme_set(spec: &str) -> Option<Vec<&'static Enzyme>> {
     if spec.eq_ignore_ascii_case("all") {
         return Some(ALL_ENZYMES.to_vec());
+    }
+    if spec.eq_ignore_ascii_case("recommended") {
+        return Some(RECOMMENDED_ENZYMES.to_vec());
     }
     let mut out = Vec::new();
     for tok in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -282,6 +303,23 @@ pub fn parse_enzyme_set(spec: &str) -> Option<Vec<&'static Enzyme>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recommended set must be exactly the table minus the two highly degenerate enzymes.
+    #[test]
+    fn recommended_set_excludes_only_the_degenerate_pair() {
+        assert_eq!(RECOMMENDED_ENZYMES.len(), 14);
+        let rec: Vec<&str> = RECOMMENDED_ENZYMES.iter().map(|e| e.name).collect();
+        assert!(!rec.contains(&"HaeIV") && !rec.contains(&"Hin4I"));
+        for e in RECOMMENDED_ENZYMES {
+            assert!(
+                ALL_ENZYMES.iter().any(|x| x.id == e.id),
+                "{} not in the table",
+                e.name
+            );
+        }
+        assert_eq!(parse_enzyme_set("recommended").unwrap().len(), 14);
+        assert_eq!(parse_enzyme_set("RECOMMENDED").unwrap().len(), 14);
+    }
 
     #[test]
     fn all_sixteen_present_with_unique_ids() {
