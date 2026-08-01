@@ -24,7 +24,9 @@ use strain2bscan::cst::{SpeciesCst, DEFAULT_SIMILARITY, MINHASH_ABOVE};
 use strain2bscan::db::StrainDb;
 use strain2bscan::enzymes::{parse_enzyme_set, Enzyme};
 use strain2bscan::fxhash::{FxHashMap, FxHashSet};
-use strain2bscan::identify::{detectable_fraction, naive_profile, profile, Params, StrainCall};
+use strain2bscan::identify::{
+    detectable_fraction, naive_profile, profile, Layer1, Layer2, Params, StrainCall,
+};
 use strain2bscan::markers::{
     fastx_stem, genome_marker_counts_multi, is_fasta_path, read_fastx, sample_marker_counts_stream,
     single_copy_markers, Marker, MarkerCounts,
@@ -52,7 +54,7 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--min-consistency F] [--fixed-gate]\n  \
+                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--min-consistency F] [--layer1 unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95]   (can a Cluster Search Tree work on this panel?)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
@@ -76,6 +78,15 @@ fn main() -> ExitCode {
                  0 to disable. This is the main same-species false-positive source; no coverage\n\
                  floor can catch it, since a shadow and a genuine rare strain have the same\n\
                  breadth and differ only in depth.\n\
+                 --layer1 cst descends the Cluster Search Tree instead of scoring each cluster on\n\
+                 its own unique markers, pooling an ancestor's group-specific markers into a leaf\n\
+                 whose sibling branch was never entered -- which lets a leaf with too few markers\n\
+                 of its own be called at all. Needs a DB built by `cluster` (the tree is stored\n\
+                 there); falls back to the flat path otherwise.\n\
+                 --layer2 enet replaces the per-cluster mean depth with StrainScan's joint fit:\n\
+                 a residual pre-scan then a non-negative ElasticNet over the SHARED-marker design\n\
+                 matrix, which can apportion a cluster that has no unique markers at all.\n\
+                 Both default to the flat path, so results are unchanged unless asked for.\n\
                  --min-global-abundance F drops calls below F of the cross-species composition.\n\
                  It is the only filter that can remove a spurious SPECIES: --min-abundance is\n\
                  within-species, so a species with one cluster always sits at 1.0 there. Use it\n\
@@ -285,6 +296,9 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
     // Resolvability check: a cluster needs enough cluster-specific markers to be detectable.
     let mut db = cst.cluster_db();
     db.enzymes = enzyme_names(&set);
+    // Persist the Cluster Search Tree so `profile --layer1 cst` can descend it. The internal
+    // nodes' marker sets cannot be recovered from the cluster rows alone.
+    db.tree = Some(cst.build_tree());
     let min_markers = Params::default().min_support_markers;
     let mut resolvable = 0usize;
     for cid in 0..db.n_strains() {
@@ -443,6 +457,19 @@ fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
     }
     // `--fixed-gate` turns both adaptations off (backwards compatible); the two halves can
     // also be controlled independently, which is what calibrating a large panel needs.
+    match opts.get("layer1").map(String::as_str) {
+        None | Some("unique") => {}
+        Some("cst") => p.layer1 = Layer1::Cst,
+        Some(x) => return Err(format!("bad --layer1 {x} (want unique|cst)")),
+    }
+    match opts.get("layer2").map(String::as_str) {
+        None | Some("depth") => {}
+        Some("enet") => p.layer2 = Layer2::Enet,
+        Some(x) => return Err(format!("bad --layer2 {x} (want depth|enet)")),
+    }
+    if let Some(v) = opts.get("enet-alpha") {
+        p.enet_alpha = v.parse().map_err(|_| "bad --enet-alpha")?;
+    }
     if let Some(v) = opts.get("min-consistency") {
         p.min_consistency = v.parse().map_err(|_| "bad --min-consistency (want 0..1)")?;
     }

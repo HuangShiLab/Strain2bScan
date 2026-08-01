@@ -69,6 +69,27 @@ pub const SINGLETON_SAFE_DEPTH: f64 = 3.0;
 /// collapsed repeats and contamination from inflating the depth estimate (top 1%).
 const TRIM_FRACTION: usize = 100;
 
+/// Which Layer-1 (presence detection) to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer1 {
+    /// Score each cluster independently on its own cluster-unique markers (the default, and
+    /// what every benchmark in this repo was measured with).
+    Unique,
+    /// Descend the Cluster Search Tree, pooling ancestor markers along the unique path
+    /// ([`descend_tree`]). Requires a database built by `cluster` with the tree persisted.
+    Cst,
+}
+
+/// Which Layer-2 (abundance) to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer2 {
+    /// Zero-inclusive winsorized mean depth over each cluster's own unique markers.
+    Depth,
+    /// StrainScan-style joint fit: residual pre-scan then non-negative ElasticNet over the
+    /// shared-marker design matrix ([`build_l2_design`]).
+    Enet,
+}
+
 #[derive(Debug, Clone)]
 pub struct Params {
     /// Min number of a strain's unique markers (passing the singleton policy) to call it
@@ -100,6 +121,14 @@ pub struct Params {
     /// whose depth is near zero — receives the largest relaxation of all. That is backwards, and
     /// it is why large panels lose specificity: see the note on `MIN_FLOOR_FRACTION` in `main`.
     pub adaptive_floor: bool,
+    /// Presence detection to use. Defaults to [`Layer1::Unique`].
+    pub layer1: Layer1,
+    /// Abundance estimator to use. Defaults to [`Layer2::Depth`].
+    pub layer2: Layer2,
+    /// ElasticNet penalty for [`Layer2::Enet`]. 0 = pure non-negative least squares, which the
+    /// shadow experiment in the module docs found strictly better than any positive value.
+    pub enet_alpha: f64,
+    pub enet_l1_ratio: f64,
 }
 
 impl Default for Params {
@@ -133,6 +162,10 @@ impl Default for Params {
             min_consistency: 0.5,
             adaptive_singleton: true,
             adaptive_floor: true,
+            layer1: Layer1::Unique,
+            layer2: Layer2::Depth,
+            enet_alpha: 0.0,
+            enet_l1_ratio: 0.5,
         }
     }
 }
@@ -347,6 +380,57 @@ pub fn filter_by_abundance(calls: &mut Vec<StrainCall>, min_rel: f64) {
 /// one. Pool the calls and renormalize on the absolute [`StrainCall::depth`] instead, via
 /// [`normalize_by_depth`] (which is what `multi-profile`'s `global_abundance` column reports).
 pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCall> {
+    // Layer-1 selects the candidate clusters; Layer-2 quantifies them. The two are independent
+    // so each can be A/B'd against the flat path on its own.
+    let mut calls: Vec<StrainCall> = match p.layer1 {
+        Layer1::Unique => profile_unique(db, counts, p),
+        Layer1::Cst => match &db.tree {
+            Some(tree) => descend_tree(tree, counts, p)
+                .into_iter()
+                .filter(|c| c.leaf < db.n_strains())
+                .map(|c| StrainCall {
+                    strain_index: c.leaf,
+                    name: db.strain_names[c.leaf].clone(),
+                    support: c.detected as f64,
+                    coverage: c.coverage,
+                    depth: c.depth,
+                    n_markers: db.strain_markers[c.leaf].len(),
+                    rel_abundance: 0.0,
+                })
+                .collect(),
+            // A database built before the tree existed, or by `build` rather than `cluster`.
+            // Degrade to the flat path rather than silently returning nothing.
+            None => profile_unique(db, counts, p),
+        },
+    };
+
+    if p.layer2 == Layer2::Enet && calls.len() > 1 {
+        let idx: Vec<usize> = calls.iter().map(|c| c.strain_index).collect();
+        let design = build_l2_design(db, &idx, counts);
+        let selected = pre_scan(&design, 15, p.min_support_markers);
+        if !selected.is_empty() {
+            let w = l2_abundance(&design, &selected, p.enet_alpha, p.enet_l1_ratio);
+            // Clusters the pre-scan dropped explained nothing beyond what the winners already
+            // account for; keep only the selected ones, at their fitted depths.
+            let keep: crate::fxhash::FxHashMap<usize, f64> = selected
+                .iter()
+                .zip(w.iter())
+                .map(|(&col, &depth)| (design.clusters[col], depth))
+                .collect();
+            calls.retain(|c| keep.contains_key(&c.strain_index));
+            for c in calls.iter_mut() {
+                c.depth = keep[&c.strain_index];
+            }
+        }
+    }
+
+    normalize_by_depth(&mut calls);
+    filter_by_abundance(&mut calls, p.min_rel_abundance);
+    calls
+}
+
+/// The flat Layer-1: score each cluster independently on its own unique markers.
+fn profile_unique(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCall> {
     let mut calls: Vec<StrainCall> = Vec::new();
     for j in 0..db.n_strains() {
         let st = panel_stats(db, counts, j);
@@ -414,8 +498,6 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
             rel_abundance: 0.0,
         });
     }
-    normalize_by_depth(&mut calls);
-    filter_by_abundance(&mut calls, p.min_rel_abundance);
     calls
 }
 
@@ -1327,8 +1409,8 @@ pub fn pre_scan(design: &L2Design, max_iter: usize, min_new_markers: usize) -> V
 
     for _ in 0..max_iter.min(n_cols) {
         let mut best = (0usize, 0usize); // (residual support, column)
-        for j in 0..n_cols {
-            if taken[j] {
+        for (j, is_taken) in taken.iter().enumerate() {
+            if *is_taken {
                 continue;
             }
             // Score by how many *residual* markers this cluster explains at count >= 1.
@@ -1348,9 +1430,9 @@ pub fn pre_scan(design: &L2Design, max_iter: usize, min_new_markers: usize) -> V
         // Consume this cluster's markers unconditionally — this is what makes the loop
         // terminate and what stops a near-duplicate cluster being selected on the same
         // evidence as the winner.
-        for i in 0..n_rows {
+        for (i, u) in used.iter_mut().enumerate() {
             if design.cols[j][i] > 0.0 {
-                used[i] = true;
+                *u = true;
             }
         }
     }

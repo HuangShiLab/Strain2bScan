@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+use crate::cst::Cst;
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::markers::Marker;
 
@@ -39,6 +40,13 @@ pub struct StrainDb {
     /// error, not a rare accident. Runtime-only — never serialized, and `None` for a DB loaded on
     /// its own, since a single DB carries no cross-species information.
     pub quant_mask: Option<FxHashSet<Marker>>,
+    /// The Cluster Search Tree, when the database was built by `cluster`.
+    ///
+    /// Layer-1's tree descent tests the *internal* nodes' marker sets, and those cannot be
+    /// recovered from `strain_markers`, which holds only the leaves. Persisting the tree is
+    /// therefore what makes `--layer1 cst` usable at profile time. Databases written before this
+    /// existed have `None` and fall back to the flat path, so old databases stay readable.
+    pub tree: Option<Cst>,
 }
 
 impl StrainDb {
@@ -131,6 +139,26 @@ impl StrainDb {
                 .join(",");
             writeln!(w, "#unique\t{joined}")?;
         }
+        if let Some(t) = &self.tree {
+            writeln!(w, "#tree\t{}\t{}\t{}", t.n_leaves(), t.n_nodes(), t.root)?;
+            for v in 0..t.n_nodes() {
+                let (ca, cb) = match t.children[v] {
+                    Some((a, b)) => (a as i64, b as i64),
+                    None => (-1, -1),
+                };
+                let par = t.parent[v].map(|x| x as i64).unwrap_or(-1);
+                let joined = t.node_markers[v]
+                    .iter()
+                    .map(|m| format!("{m:x}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                writeln!(w, "#node\t{v}\t{par}\t{ca}\t{cb}\t{:.6}\t{joined}", t.merge_similarity[v])?;
+            }
+            for (l, gs) in t.leaves.iter().enumerate() {
+                let joined = gs.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",");
+                writeln!(w, "#leaf\t{l}\t{joined}")?;
+            }
+        }
         for (name, markers) in self.strain_names.iter().zip(&self.strain_markers) {
             let joined = markers
                 .iter()
@@ -147,6 +175,12 @@ impl StrainDb {
         let mut strains = Vec::new();
         let mut enzymes: Vec<String> = Vec::new();
         let mut unique_set: FxHashSet<Marker> = FxHashSet::default();
+        let (mut have_tree, mut tree_root) = (false, 0usize);
+        let mut tree_parent: Vec<Option<usize>> = Vec::new();
+        let mut tree_children: Vec<Option<(usize, usize)>> = Vec::new();
+        let mut tree_markers: Vec<FxHashSet<Marker>> = Vec::new();
+        let mut tree_sim: Vec<f64> = Vec::new();
+        let mut tree_leaves: Vec<Vec<usize>> = Vec::new();
         let hexset = |csv: &str| {
             csv.split(',')
                 .filter(|s| !s.is_empty())
@@ -163,6 +197,47 @@ impl StrainDb {
                 } else if line.starts_with("#unique") {
                     if let Some(csv) = line.split('\t').nth(1) {
                         unique_set = hexset(csv);
+                    }
+                } else if line.starts_with("#tree\t") {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    if f.len() >= 4 {
+                        let n_nodes: usize = f[2].parse().unwrap_or(0);
+                        tree_root = f[3].parse().unwrap_or(0);
+                        tree_parent = vec![None; n_nodes];
+                        tree_children = vec![None; n_nodes];
+                        tree_markers = vec![FxHashSet::default(); n_nodes];
+                        tree_sim = vec![1.0; n_nodes];
+                        tree_leaves = vec![Vec::new(); f[1].parse().unwrap_or(0)];
+                        have_tree = true;
+                    }
+                } else if line.starts_with("#node\t") {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    if f.len() >= 7 {
+                        if let Ok(v) = f[1].parse::<usize>() {
+                            if v < tree_parent.len() {
+                                let par: i64 = f[2].parse().unwrap_or(-1);
+                                let ca: i64 = f[3].parse().unwrap_or(-1);
+                                let cb: i64 = f[4].parse().unwrap_or(-1);
+                                tree_parent[v] = (par >= 0).then_some(par as usize);
+                                tree_children[v] =
+                                    (ca >= 0 && cb >= 0).then_some((ca as usize, cb as usize));
+                                tree_sim[v] = f[5].parse().unwrap_or(1.0);
+                                tree_markers[v] = hexset(f[6]);
+                            }
+                        }
+                    }
+                } else if line.starts_with("#leaf\t") {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    if f.len() >= 3 {
+                        if let Ok(l) = f[1].parse::<usize>() {
+                            if l < tree_leaves.len() {
+                                tree_leaves[l] = f[2]
+                                    .split(',')
+                                    .filter(|x| !x.is_empty())
+                                    .filter_map(|x| x.parse::<usize>().ok())
+                                    .collect();
+                            }
+                        }
                     }
                 }
                 continue;
@@ -184,6 +259,33 @@ impl StrainDb {
         let mut db = StrainDb::build(strains);
         db.enzymes = enzymes;
         db.unique_set = unique_set;
+        if have_tree {
+            // `desc_leaves` is derivable from the topology, so it is not serialized.
+            let n = tree_parent.len();
+            let mut desc: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for (l, _) in tree_leaves.iter().enumerate() {
+                if l < n {
+                    desc[l] = vec![l];
+                }
+            }
+            for v in tree_leaves.len()..n {
+                if let Some((a, b)) = tree_children[v] {
+                    let mut d = desc[a].clone();
+                    d.extend_from_slice(&desc[b]);
+                    d.sort_unstable();
+                    desc[v] = d;
+                }
+            }
+            db.tree = Some(Cst {
+                leaves: tree_leaves,
+                parent: tree_parent,
+                children: tree_children,
+                desc_leaves: desc,
+                node_markers: tree_markers,
+                merge_similarity: tree_sim,
+                root: tree_root,
+            });
+        }
         Ok(db)
     }
 
@@ -264,6 +366,50 @@ mod tests {
         assert!(db.is_quantifiable(10) && !db.is_quantifiable(99));
         // Unrestricted DBs (e.g. single-species `profile`) are unaffected.
         assert!(db_unrestricted.is_quantifiable(99));
+    }
+
+    /// The tree must survive a save/load round trip, or `--layer1 cst` silently degrades to the
+    /// flat path at profile time with no error.
+    #[test]
+    fn tree_survives_roundtrip() {
+        use crate::cst::{SpeciesCst, DEFAULT_SIMILARITY};
+        let core: Vec<Marker> = (0..200).collect();
+        let mk = |uniq: std::ops::Range<Marker>| -> Vec<Marker> {
+            let mut v = core.clone();
+            v.extend(uniq);
+            v
+        };
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = (0..4u64)
+            .map(|i| {
+                let g = mk(1000 + i * 100..1100 + i * 100);
+                (format!("g{i}"), g.clone(), g)
+            })
+            .collect();
+        let cst = SpeciesCst::build(genomes, DEFAULT_SIMILARITY, false);
+        let mut db = cst.cluster_db();
+        db.tree = Some(cst.build_tree());
+        let before = db.tree.clone().unwrap();
+
+        let path = std::env::temp_dir().join("s2bs_tree_roundtrip.tsv");
+        db.save(&path).unwrap();
+        let back = StrainDb::load(&path).unwrap();
+        let after = back.tree.expect("tree must survive the round trip");
+
+        assert_eq!(after.n_nodes(), before.n_nodes());
+        assert_eq!(after.n_leaves(), before.n_leaves());
+        assert_eq!(after.root, before.root);
+        assert_eq!(after.parent, before.parent);
+        assert_eq!(after.children, before.children);
+        assert_eq!(after.leaves, before.leaves);
+        for v in 0..before.n_nodes() {
+            assert_eq!(
+                after.node_markers[v], before.node_markers[v],
+                "node {v} marker set changed"
+            );
+        }
+        // desc_leaves is derived on load rather than stored; it must still match.
+        assert_eq!(after.desc_leaves, before.desc_leaves);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
