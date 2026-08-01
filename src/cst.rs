@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::db::StrainDb;
-use crate::fxhash::FxHashSet;
+use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::markers::Marker;
 use crate::parallel::par_map;
 
@@ -489,6 +489,49 @@ mod tests {
         assert_eq!(s["strain_specific"], 12); // 4 genomes × 3 private
     }
 
+    /// The hierarchy diagnostic must find the group-specific markers a Cluster Search Tree
+    /// would store at each internal node. On the two-cluster fixture the node joining g0+g1 is
+    /// core-to-that-pair and absent from g2/g3, so it should hold exactly the 40 cluster-A
+    /// markers; the root holds the 200 species-core markers.
+    #[test]
+    fn hierarchy_stats_find_group_specific_markers() {
+        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY, false);
+        let stats = cst.hierarchy_stats();
+        assert_eq!(stats.len(), 3, "4 genomes -> 3 internal nodes");
+
+        let pair = |s: &NodeStat| -> Vec<usize> { s.member_genomes.clone() };
+        let cherry_a = stats.iter().find(|s| pair(s) == vec![0, 1]).expect("g0+g1 node");
+        let cherry_b = stats.iter().find(|s| pair(s) == vec![2, 3]).expect("g2+g3 node");
+        assert_eq!(cherry_a.group_specific, 40, "cluster-A shared block");
+        assert_eq!(cherry_b.group_specific, 40, "cluster-B shared block");
+
+        let root = stats.iter().max_by_key(|s| s.n_members).unwrap();
+        assert_eq!(root.n_members, 4);
+        assert_eq!(root.group_specific, 200, "root holds the species core");
+    }
+
+    /// A star topology — every genome equidistant, no nested structure — must report zero
+    /// group-specific markers at every node but the root. This is the case where a tree carries
+    /// no signal, and the diagnostic exists to tell them apart.
+    #[test]
+    fn hierarchy_stats_report_zero_on_a_star_topology() {
+        let core: Vec<Marker> = (0..200).collect();
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = (0..4)
+            .map(|i| {
+                let mut v = core.clone();
+                v.extend((0..50).map(|k| 1000 + i * 100 + k));
+                (format!("g{i}"), v.clone(), v)
+            })
+            .collect();
+        let cst = SpeciesCst::build(genomes, DEFAULT_SIMILARITY, false);
+        let stats = cst.hierarchy_stats();
+        for s in &stats {
+            if s.n_members < 4 {
+                assert_eq!(s.group_specific, 0, "no nesting -> no group-specific markers");
+            }
+        }
+    }
+
     #[test]
     fn cluster_db_marks_cluster_specific_as_unique() {
         let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY, false);
@@ -498,5 +541,112 @@ mod tests {
         assert!(db.is_unique(200));
         // ...but the species-core marker is shared across both clusters.
         assert!(!db.is_unique(0));
+    }
+}
+
+// ===== Hierarchy feasibility diagnostic ====================================
+//
+// Before porting StrainScan's Cluster Search Tree we need to know whether a hierarchy carries
+// any signal on 2bRAD markers. StrainScan works on the full k-mer set, where an internal node's
+// "group-specific" k-mers number in the tens of thousands; 2bRAD tags are ~76-116x sparser, so
+// the same nodes could be empty and the descent would degenerate into enumerating every leaf.
+//
+// This measures it directly rather than arguing from the mechanism. It builds the agglomerative
+// hierarchy above the existing clusters and reports, per internal node, the set StrainScan would
+// store there:
+//
+//     K(v) = (intersection of v's descendant genomes) \ (union of all genomes outside v)
+//
+// which is exactly "core to this subtree and found nowhere else".
+
+/// One internal node of the candidate hierarchy.
+#[derive(Debug, Clone)]
+pub struct NodeStat {
+    pub node_id: usize,
+    pub n_members: usize,
+    /// Similarity at which the two children merged (max-linkage Jaccard).
+    pub merge_similarity: f64,
+    /// |intersection of member genomes' markers|.
+    pub core: usize,
+    /// |K(v)| — the markers StrainScan would store at this node.
+    pub group_specific: usize,
+    pub member_genomes: Vec<usize>,
+}
+
+impl SpeciesCst {
+    /// Build the agglomerative hierarchy over this species' genomes and report, for every
+    /// internal node, how many group-specific markers it would carry.
+    ///
+    /// Merging is by **max-linkage** Jaccard between member genomes, matching
+    /// `Build_tree.py::hierarchy`'s single-linkage merge on a similarity matrix.
+    pub fn hierarchy_stats(&self) -> Vec<NodeStat> {
+        let n = self.genome_markers.len();
+        if n < 2 {
+            return Vec::new();
+        }
+        // Active nodes: each holds the genome indices beneath it.
+        let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+        let mut active: Vec<usize> = (0..n).collect();
+        let mut next_id = n;
+        let mut out = Vec::new();
+
+        // Pairwise genome similarity, computed once.
+        let sim = |a: usize, b: usize| jaccard(&self.genome_markers[a], &self.genome_markers[b]);
+        let mut cache: FxHashMap<(usize, usize), f64> = FxHashMap::default();
+        let mut sim_of = |a: usize, b: usize| -> f64 {
+            let k = if a < b { (a, b) } else { (b, a) };
+            *cache.entry(k).or_insert_with(|| sim(k.0, k.1))
+        };
+
+        while active.len() > 1 {
+            // Max-linkage: similarity between two nodes is the max over member pairs.
+            let (mut best, mut bi, mut bj) = (f64::NEG_INFINITY, 0usize, 1usize);
+            for i in 0..active.len() {
+                for j in (i + 1)..active.len() {
+                    let (a, b) = (active[i], active[j]);
+                    let mut s = f64::NEG_INFINITY;
+                    for &x in &members[a] {
+                        for &y in &members[b] {
+                            s = s.max(sim_of(x, y));
+                        }
+                    }
+                    if s > best {
+                        best = s;
+                        bi = i;
+                        bj = j;
+                    }
+                }
+            }
+            let (a, b) = (active[bi], active[bj]);
+            let mut merged = members[a].clone();
+            merged.extend_from_slice(&members[b]);
+            merged.sort_unstable();
+
+            // K(v): core to the subtree, absent from every genome outside it.
+            let mut core: FxHashSet<Marker> = self.genome_markers[merged[0]].clone();
+            for &g in &merged[1..] {
+                core.retain(|m| self.genome_markers[g].contains(m));
+            }
+            let core_n = core.len();
+            for g in 0..n {
+                if merged.binary_search(&g).is_err() {
+                    core.retain(|m| !self.genome_markers[g].contains(m));
+                }
+            }
+            out.push(NodeStat {
+                node_id: next_id,
+                n_members: merged.len(),
+                merge_similarity: best,
+                core: core_n,
+                group_specific: core.len(),
+                member_genomes: merged.clone(),
+            });
+
+            members.push(merged);
+            active.retain(|&x| x != a && x != b);
+            active.push(next_id);
+            next_id += 1;
+        }
+        out
     }
 }

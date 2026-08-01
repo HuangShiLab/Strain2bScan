@@ -40,6 +40,7 @@ fn main() -> ExitCode {
     let result = match cmd {
         "build" => cmd_build(&opts),
         "cluster" => cmd_cluster(&opts),
+        "diagnose-tree" => cmd_diagnose_tree(&opts),
         "profile" => cmd_profile(&opts),
         "multi-profile" => cmd_multi_profile(&opts),
         "info" => cmd_info(&opts),
@@ -53,6 +54,7 @@ fn main() -> ExitCode {
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--min-consistency F] [--fixed-gate]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
+                 strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95]   (can a Cluster Search Tree work on this panel?)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
@@ -326,6 +328,87 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
         resolvable,
         members_path.display()
     );
+    Ok(())
+}
+
+/// Measure whether a hierarchical Cluster Search Tree could carry signal on this panel.
+///
+/// StrainScan stores, at every internal node, the markers core to that subtree and found nowhere
+/// else, and descends the tree by testing those sets. It uses full k-mer sets, where such a node
+/// holds tens of thousands of k-mers; 2bRAD tags are ~76-116x sparser, so the same nodes might be
+/// empty and the descent would degenerate into enumerating every leaf. Rather than argue from the
+/// mechanism, measure it: run this on a real panel before committing to the port.
+fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
+    let set = enzyme_set(opts)?;
+    let genomes = PathBuf::from(req(opts, "genomes")?);
+    let similarity = opts
+        .get("similarity")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SIMILARITY);
+
+    let recs = digest_and_filter(&genomes, &set, opts)?;
+    let n = recs.len();
+    if n < 2 {
+        return Err("need at least 2 genomes to form a hierarchy".into());
+    }
+    let cst = SpeciesCst::build(
+        recs.into_iter().map(|r| (r.name, r.markers, r.full_markers)).collect(),
+        similarity,
+        opts.contains_key("containment"),
+    );
+    println!(
+        "panel: {} genomes -> {} clusters @ similarity {similarity} (enzymes: {})",
+        n,
+        cst.n_clusters(),
+        enzyme_names(&set).join("+")
+    );
+
+    let stats = cst.hierarchy_stats();
+    println!("\n#node\tmembers\tmerge_similarity\tcore\tgroup_specific");
+    for s in &stats {
+        println!(
+            "N{}\t{}\t{:.4}\t{}\t{}",
+            s.node_id, s.n_members, s.merge_similarity, s.core, s.group_specific
+        );
+    }
+
+    // Verdict. The interesting nodes are the ones the tree would actually have to resolve —
+    // those whose children merged BELOW the clustering threshold, i.e. genuinely distinct
+    // clusters. Nodes above it would already have been collapsed into one leaf.
+    let mut resolving: Vec<usize> = stats
+        .iter()
+        .filter(|s| s.merge_similarity < similarity)
+        .map(|s| s.group_specific)
+        .collect();
+    resolving.sort_unstable();
+    println!("\n--- verdict ---");
+    if resolving.is_empty() {
+        println!("no internal node merges below the clustering threshold: the panel is a single cluster,");
+        println!("so a tree has nothing to resolve here. Try a more diverse panel.");
+        return Ok(());
+    }
+    let med = resolving[resolving.len() / 2];
+    let min = resolving[0];
+    println!(
+        "{} internal node(s) below the clustering threshold; group-specific markers: min={} median={} max={}",
+        resolving.len(),
+        min,
+        med,
+        resolving[resolving.len() - 1]
+    );
+    // StrainScan's default minimum is 1000 k-mers per node, but it stores both strands as
+    // separate ids, so that is 500 canonical k-mers; rescaled by ~76-116x sparsity the 2bRAD
+    // equivalent is single digits. 25 is a stricter, statistically motivated floor: it is the
+    // smallest panel at which a coverage fraction can distinguish 0.1 from 0.3.
+    const MINK: usize = 25;
+    if med >= 4 * MINK {
+        println!("VERDICT: tree is viable here (median {med} >= {}). Node sets carry real signal.", 4 * MINK);
+    } else if med >= MINK {
+        println!("VERDICT: marginal (median {med} in [{MINK}, {})). Viable but with little headroom.", 4 * MINK);
+    } else {
+        println!("VERDICT: NOT viable (median {med} < {MINK}). Internal nodes are too sparse to");
+        println!("descend on; invest in the shared-marker regression instead of the tree.");
+    }
     Ok(())
 }
 
