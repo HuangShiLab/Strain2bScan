@@ -2,6 +2,76 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — fix three silent failures in the Cluster Search Tree descent
+
+Measured on the first real panel the port has seen: 543 *Cutibacterium acnes* genomes
+(`MockMetagenomes4Benchmark/Cutibacterium_acnes_0.01`, 5 samples, 100 k read pairs, 2–5
+genomes each), `--enzyme all`. Ground truth is stated per genome and remapped through
+`<out>.members.tsv`. Because the 14 truth genomes merge at Jaccard 0.9825–0.9961 they all
+land in one cluster at the default 0.95, so accuracy is reported at `--similarity 0.997`,
+where they resolve to 13 clusters.
+
+`--layer1 cst` scored **below** the flat path it is supposed to extend — precision 0.800,
+recall 0.600, AUPR 0.600 against the flat path's 1.000 / 0.800 / 0.800. Three separate
+causes, each fixed here. Afterwards CST matches the flat path exactly on every sample and at
+every support floor; clustering is unchanged and all 53 tests still pass.
+
+### Fixed — a node with exactly `MIN_NODE_MARKERS` markers silently pruned a present subtree
+
+`MIN_NODE_MARKERS` was 10, deliberately set equal to `min_support_markers` "so the two gates
+stay on one scale". That is the bug. A node is allowed to veto its whole subtree once it is
+*informative*, but it only fires when `support >= min_support_markers` — so a node holding
+exactly 10 markers was trusted to prune while being unable to fire unless all 10 were seen at
+count ≥ 2. One Poisson dropout cut a present subtree, with no escape hatch, because
+`informative` was true and the "cannot be tested, descend anyway" branch did not apply.
+
+Observed on sample 1: node N831 held 10 markers, 9 detected, coverage 0.90 at depth 4.7× —
+overwhelming evidence of presence — and failed by one marker, cutting the 331-leaf subtree
+that held the answer. The descent then reported a clade spanning 332 of 419 clusters.
+
+`MIN_NODE_MARKERS` is now 30, and documented as needing to sit well **above** the support
+floor rather than on it: at a floor of 10 a 30-marker node still clears it with a third of its
+panel missing. Nodes below 30 are treated as untestable and entered, which costs work but
+cannot lose a true subtree.
+
+### Fixed — a leaf's tree panel was the intersection while the flat path scores the union
+
+`cluster_db` gives a cluster the **union** of its members' markers; `build_tree` gave the same
+cluster the **intersection**. So `--layer1 cst` scored every multi-genome cluster on a strictly
+smaller panel than the flat path uses, and for a cluster whose members disagree enough the
+intersection empties out and the cluster becomes uncallable at any threshold — C247 (5
+members) had 0 markers by intersection against 115 by union, and was missed on sample 4 while
+the flat path found it without difficulty.
+
+Leaves now use the union, so the tree is a strict extension of the flat path rather than a
+weaker competitor. Internal nodes keep the intersection: a marker is diagnostic of a clade
+only if every genome under it carries it. **Databases must be rebuilt** — the leaf marker sets
+are serialized.
+
+### Fixed — the clade fallback climbed to the root
+
+Nothing bounded the upward walk, so when a region of the tree was rejected it climbed to a
+near-root node whose panel is the species core — fully covered in any sample of that species,
+so it passes every gate — and reported that. New `MAX_FALLBACK_CLADE` (8) stops the climb once
+the clade is too broad to be an answer; above it, report nothing and let the species layer say
+"present, not resolvable", which is the truth. Inert once the first fix is in, kept as a guard.
+
+### Note — the tree still does not beat the flat path on this panel, and `diagnose-tree` said so
+
+After all three fixes CST equals the flat path and never exceeds it, at support floors 10, 8,
+6 and 4 alike. `diagnose-tree` predicted this before the benchmark ran: of 542 internal nodes,
+373 carry **zero** group-specific markers, and the verdict is `NOT viable (median 0 < 25)`.
+The nodes that do carry markers merge at similarity ≈ 1.0 — near-duplicates that collapse into
+one cluster anyway — so the tree has signal only where it is not needed. Relaxing the clade
+definition does not rescue it: redefining an internal node's markers as a prevalence core
+(present in ≥ 90 % of descendants rather than all) moves the median from 0 to 2, against a
+floor of 25. With genomes this similar a clade-shared marker is almost always carried outside
+the clade too, and the "minus everything outside" subtraction empties the node.
+
+`--layer2 enet` never changed a detection — it only runs when Layer-1 returns more than one
+candidate and only refits depths — and it made abundance worse (Bray–Curtis 0.058 → 0.101;
+sample 4 0.100 → 0.296). It is left alone here.
+
 ## [Unreleased] — expose the recommended enzyme set
 
 ### Added — `--enzyme recommended`

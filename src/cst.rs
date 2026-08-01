@@ -771,15 +771,32 @@ impl SpeciesCst {
         // K(v) for every node.
         let n_genomes = self.genome_markers.len();
         let mut node_markers: Vec<FxHashSet<Marker>> = Vec::with_capacity(n_nodes);
-        for dl in desc_leaves.iter().take(n_nodes) {
+        let n_leaves = self.clusters.len();
+        for (v, dl) in desc_leaves.iter().take(n_nodes).enumerate() {
             let gs = genomes_of(dl, &self.clusters);
             if gs.is_empty() {
                 node_markers.push(FxHashSet::default());
                 continue;
             }
             let mut set: FxHashSet<Marker> = self.genome_markers[gs[0]].clone();
-            for &g in &gs[1..] {
-                set.retain(|m| self.genome_markers[g].contains(m));
+            if v < n_leaves {
+                // A LEAF is a cluster, and `cluster_db` gives a cluster the UNION of its
+                // members' markers. Intersecting here instead gives the tree a strictly smaller
+                // panel than the flat path scores the same cluster on, so `--layer1 cst` can
+                // lose calls the flat path makes — and for a cluster whose members disagree
+                // enough, the intersection empties out and the cluster becomes uncallable at
+                // any threshold (C. acnes C247: 5 members, 0 markers by intersection versus 115
+                // by union). Union at the leaves keeps the tree a strict extension of the flat
+                // path rather than a competing, weaker one.
+                for &g in &gs[1..] {
+                    set.extend(self.genome_markers[g].iter().copied());
+                }
+            } else {
+                // INTERNAL nodes keep the intersection: a marker is diagnostic of a clade only
+                // if every genome under it carries the marker.
+                for &g in &gs[1..] {
+                    set.retain(|m| self.genome_markers[g].contains(m));
+                }
             }
             let inside: FxHashSet<usize> = gs.iter().copied().collect();
             for g in 0..n_genomes {

@@ -1231,11 +1231,28 @@ mod tests {
 
 use crate::cst::Cst;
 
-/// Minimum markers for a node's own set to be worth testing. StrainScan uses 1000 k-mers, but it
-/// stores both strands as separate ids (so 500 canonical) and works on a ~76-116x denser marker
-/// space; the scale-equivalent here is single digits. 10 is that floor rounded up to the value
-/// already used for cluster support, so the two gates stay on one scale.
-pub const MIN_NODE_MARKERS: usize = 10;
+/// Minimum markers for a node's own set to be worth testing — and, crucially, to be trusted to
+/// rule its whole subtree OUT.
+///
+/// This must sit well ABOVE `min_support_markers`, not on the same scale as it. A node is
+/// allowed to veto its subtree when it is "informative", but it only fires when
+/// `support >= min_support_markers`. Set the two equal and a node holding exactly that many
+/// markers is trusted to prune while being unable to fire unless every single marker is seen at
+/// count >= 2 — one Poisson dropout and a present subtree is silently cut, with no escape
+/// hatch, because `informative` is true so the "cannot be tested, descend anyway" branch does
+/// not apply. Measured on the C. acnes panel: a node with 10 markers, 9 detected, coverage 0.90
+/// at depth 4.7x — overwhelming evidence of presence — failed by one marker and cut the 331-leaf
+/// subtree holding the answer.
+///
+/// 3x the support floor leaves room for dropout: at the floor of 10 a 30-marker node still
+/// clears it with a third of its panel missing. Nodes below this are treated as untestable and
+/// the descent enters them, which costs work but cannot lose a true subtree.
+pub const MIN_NODE_MARKERS: usize = 30;
+
+/// Widest clade the internal-node fallback may report. Beyond this the call names so many
+/// clusters that it carries no strain-level information; reporting nothing is more honest and
+/// costs a false positive less.
+pub const MAX_FALLBACK_CLADE: usize = 8;
 
 /// One leaf accepted by the tree descent.
 #[derive(Debug, Clone)]
@@ -1448,6 +1465,20 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
             let mut v = r;
             while let Some(par) = cst.parent[v] {
                 if accepted_under(par, &out) || added.contains(&par) {
+                    break;
+                }
+                // Stop climbing once the clade is too broad to be an answer.
+                //
+                // The fallback exists for a strain sitting BETWEEN two clusters, so the honest
+                // resolution is a clade of a few leaves. Nothing bounded the climb, so when a
+                // whole region of the tree was rejected it walked up to a near-root node whose
+                // panel is the species core — fully covered in any sample of that species, so it
+                // passes every gate — and reported it. On the C. acnes panel that produced a
+                // single call spanning 332 of 419 clusters: no strain resolution at all, and it
+                // counts as a false positive while masking the true clusters underneath. Above
+                // this width, report nothing and let the species layer say "present, not
+                // resolvable" — which is the truth.
+                if cst.desc_leaves[par].len() > MAX_FALLBACK_CLADE {
                     break;
                 }
                 let ms: Vec<Marker> = cst.node_markers[par].iter().copied().collect();
