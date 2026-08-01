@@ -386,6 +386,45 @@ fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
         );
     }
 
+    // Second measurement, and the one that decides whether the tree has anything to DO.
+    //
+    // A tree can only rescue a cluster whose own unique markers fall below the support floor —
+    // that is the single case where pooling an ancestor's markers changes the outcome. Node sets
+    // being non-empty (above) is necessary but not sufficient: if every cluster already clears
+    // the floor on its own markers, the descent will reach the same leaves the flat path does and
+    // the whole port is inert on this panel.
+    //
+    // There is a structural reason to expect exactly that. Clustering at similarity tau
+    // guarantees every surviving cluster differs from its nearest neighbour by more than
+    // (1-tau) of the marker union — at 0.95 and ~11 000 markers that is ~550 markers, two orders
+    // of magnitude above a floor of 10. Genomes similar enough to have few unique markers are
+    // merged into one cluster before they can become separate leaves.
+    let cdb = cst.cluster_db();
+    let floor = Params::default().min_support_markers;
+    let mut uniq_counts: Vec<usize> = (0..cdb.n_strains()).map(|j| cdb.unique_marker_count(j)).collect();
+    uniq_counts.sort_unstable();
+    let below = uniq_counts.iter().filter(|&&u| u < floor).count();
+    println!("\n#cluster_unique_markers");
+    println!(
+        "min={} median={} max={}   below the support floor of {}: {}/{}",
+        uniq_counts.first().copied().unwrap_or(0),
+        uniq_counts.get(uniq_counts.len() / 2).copied().unwrap_or(0),
+        uniq_counts.last().copied().unwrap_or(0),
+        floor,
+        below,
+        uniq_counts.len()
+    );
+    if below == 0 {
+        println!(
+            "  -> every cluster already clears the floor on its own markers, so tree pooling"
+        );
+        println!("     has nothing to rescue here and --layer1 cst will reach the same leaves.");
+    } else {
+        println!(
+            "  -> {below} cluster(s) are invisible to the flat path and only reachable by pooling."
+        );
+    }
+
     // Verdict. The interesting nodes are the ones the tree would actually have to resolve —
     // those whose children merged BELOW the clustering threshold, i.e. genuinely distinct
     // clusters. Nodes above it would already have been collapsed into one leaf.

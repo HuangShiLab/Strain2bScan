@@ -387,15 +387,33 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
         Layer1::Cst => match &db.tree {
             Some(tree) => descend_tree(tree, counts, p)
                 .into_iter()
-                .filter(|c| c.leaf < db.n_strains())
-                .map(|c| StrainCall {
-                    strain_index: c.leaf,
-                    name: db.strain_names[c.leaf].clone(),
-                    support: c.detected as f64,
-                    coverage: c.coverage,
-                    depth: c.depth,
-                    n_markers: db.strain_markers[c.leaf].len(),
-                    rel_abundance: 0.0,
+                .filter(|c| c.desc_leaves.iter().all(|&l| l < db.n_strains()))
+                .map(|c| {
+                    // An internal node is reported under the names of the leaves it spans, so a
+                    // strain resolved only to a clade reads as `C1|C3` rather than being silently
+                    // attributed to one of them.
+                    let name = c
+                        .desc_leaves
+                        .iter()
+                        .map(|&l| db.strain_names[l].as_str())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    let first = c.desc_leaves[0];
+                    let n_markers = c
+                        .desc_leaves
+                        .iter()
+                        .map(|&l| db.strain_markers[l].len())
+                        .max()
+                        .unwrap_or(0);
+                    StrainCall {
+                        strain_index: first,
+                        name,
+                        support: c.detected as f64,
+                        coverage: c.coverage,
+                        depth: c.depth,
+                        n_markers,
+                        rel_abundance: 0.0,
+                    }
                 })
                 .collect(),
             // A database built before the tree existed, or by `build` rather than `cluster`.
@@ -799,7 +817,7 @@ mod tests {
         assert_eq!(calls.len(), 1, "tree should call exactly the present leaf: {calls:?}");
         let call = &calls[0];
         assert_eq!(
-            tree.leaves[call.leaf], vec![0],
+            tree.leaves[call.node], vec![0],
             "the called leaf must be A (genome 0)"
         );
         assert_eq!(call.panel, 305, "pooled 5 own + 100 A/B-group + 200 root-core");
@@ -915,6 +933,81 @@ mod tests {
             "the 99%-duplicate has almost nothing left to explain once A's markers are consumed"
         );
         assert!(!chosen.contains(&2), "the absent cluster explains nothing");
+    }
+
+    /// A strain sitting BETWEEN two clusters must resolve to their shared ancestor, not vanish
+    /// and not be attributed to one of them.
+    ///
+    /// The sample strain carries the whole A/B clade's group-specific markers but only a third of
+    /// either leaf's distinguishing set, so neither child fires. Before internal-node reporting
+    /// the descent dropped the subtree and returned nothing at all — losing a real organism.
+    #[test]
+    fn intermediate_strain_resolves_to_the_clade_not_to_nothing() {
+        use crate::cst::SpeciesCst;
+        let core: Vec<Marker> = (0..200).collect();
+        let ab: Vec<Marker> = (300..500).collect();
+        let cd: Vec<Marker> = (500..700).collect();
+        let mk = |extra: &[Marker], uniq: std::ops::Range<Marker>| -> Vec<Marker> {
+            let mut v = core.clone();
+            v.extend_from_slice(extra);
+            v.extend(uniq);
+            v
+        };
+        let ga = mk(&ab, 1000..1300);
+        let gb = mk(&ab, 1300..1600);
+        let gc = mk(&cd, 1600..1900);
+        let gd = mk(&cd, 1900..2200);
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> =
+            [("A", &ga), ("B", &gb), ("C", &gc), ("D", &gd)]
+                .into_iter()
+                .map(|(n, g)| (n.to_string(), g.clone(), g.clone()))
+                .collect();
+        let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
+        let tree = cst.build_tree();
+
+        // A strain between A and B: all of the clade's markers, a third of each leaf's.
+        let mut counts = MarkerCounts::default();
+        for &m in core.iter().chain(ab.iter()) {
+            counts.insert(m, 20);
+        }
+        for m in (1000..1100).chain(1300..1400) {
+            counts.insert(m, 20);
+        }
+
+        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        let calls = descend_tree(&tree, &counts, &p);
+        assert_eq!(calls.len(), 1, "one organism, one call: {calls:?}");
+        let c = &calls[0];
+        assert!(
+            !tree.is_leaf(c.node),
+            "must resolve to the clade, not to a leaf: node {} is a leaf",
+            c.node
+        );
+        let mut spanned: Vec<usize> = c
+            .desc_leaves
+            .iter()
+            .flat_map(|&l| tree.leaves[l].clone())
+            .collect();
+        spanned.sort_unstable();
+        assert_eq!(spanned, vec![0, 1], "the clade spanned must be exactly A and B");
+
+        // And it surfaces through profile() under both leaf names rather than one of them.
+        let mut db = cst.cluster_db();
+        db.tree = Some(tree);
+        let named: Vec<String> = profile(
+            &db,
+            &counts,
+            &Params { layer1: Layer1::Cst, min_rel_abundance: 0.0, ..Params::default() },
+        )
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+        assert_eq!(named.len(), 1);
+        assert!(
+            named[0].contains('|'),
+            "a clade-level call must name every leaf it spans, got {}",
+            named[0]
+        );
     }
 
     #[test]
@@ -1147,7 +1240,11 @@ pub const MIN_NODE_MARKERS: usize = 10;
 /// One leaf accepted by the tree descent.
 #[derive(Debug, Clone)]
 pub struct TreeCall {
-    pub leaf: usize,
+    /// The node the descent resolved to. Usually a leaf, but an **internal** node when the
+    /// strain in the sample sits between two clusters: see [`descend_tree`].
+    pub node: usize,
+    /// Leaf ids beneath `node` — one element when `node` is itself a leaf.
+    pub desc_leaves: Vec<usize>,
     /// Markers pooled along the unique path (the leaf's own plus attributable ancestors').
     pub panel: usize,
     pub detected: usize,
@@ -1204,7 +1301,15 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
         if panel > 0 && detected >= p.min_support_markers {
             let coverage = detected as f64 / panel as f64;
             if coverage >= p.min_coverage {
-                return vec![TreeCall { leaf: 0, panel, detected, coverage, depth, path: vec![0] }];
+                return vec![TreeCall {
+                    node: 0,
+                    desc_leaves: vec![0],
+                    panel,
+                    detected,
+                    coverage,
+                    depth,
+                    path: vec![0],
+                }];
             }
         }
         return Vec::new();
@@ -1244,6 +1349,7 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
             continue;
         }
         let (a, b) = cst.children[v].expect("internal node has children");
+        let mut descended = false;
         for c in [a, b] {
             // Enter a child if it has its own evidence, or if it cannot be tested at all.
             // An uninformative child is not evidence of absence, so we descend and let a
@@ -1251,16 +1357,23 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
             if !informative(c) || fires(c) {
                 entered[c] = true;
                 stack.push(c);
+                descended = true;
             }
+        }
+        if !descended {
+            // `v` fired but neither child does: a strain between the two clusters, carrying
+            // `v`'s group-specific markers and too little of either child's.
+            reached.push(v);
         }
     }
 
-    // Accept reached leaves on pooled evidence along the unique path.
-    let mut out = Vec::new();
-    for &leaf in &reached {
-        let mut path = vec![leaf];
-        let mut pooled: Vec<Marker> = cst.node_markers[leaf].iter().copied().collect();
-        let mut v = leaf;
+    // Accept reached nodes on pooled evidence along the unique path.
+    let mut out: Vec<TreeCall> = Vec::new();
+    let mut rejected: Vec<usize> = Vec::new();
+    for &node in &reached {
+        let mut path = vec![node];
+        let mut pooled: Vec<Marker> = cst.node_markers[node].iter().copied().collect();
+        let mut v = node;
         while let Some(par) = cst.parent[v] {
             match cst.sibling(v) {
                 // The sibling branch was never entered, so this ancestor's group-specific
@@ -1289,17 +1402,78 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
             detected
         };
         if support < p.min_support_markers {
+            rejected.push(node);
             continue;
         }
         let coverage = detected as f64 / panel as f64;
         if coverage < p.min_coverage {
+            rejected.push(node);
             continue;
         }
         let expected = detectable_fraction(depth);
         if expected > 0.0 && coverage / expected < p.min_consistency {
+            rejected.push(node);
             continue;
         }
-        out.push(TreeCall { leaf, panel, detected, coverage, depth, path });
+        out.push(TreeCall {
+            node,
+            desc_leaves: cst.desc_leaves[node].clone(),
+            panel,
+            detected,
+            coverage,
+            depth,
+            path,
+        });
+    }
+
+    // Fall back to the clade when an entire subtree was rejected.
+    //
+    // A strain that sits between two clusters fires both of them on the fraction of each one's
+    // distinguishing markers it happens to carry — and the depth-breadth consistency test then
+    // correctly rejects both as shadows, because the markers seen are far deeper than their
+    // breadth allows. Correct, but on its own it loses a real organism: the reads exist and the
+    // ancestor's group-specific markers are fully covered.
+    //
+    // So for each rejected node, walk up to the deepest ancestor that (a) has an informative
+    // marker set of its own, (b) passes the gates on it, and (c) has no accepted descendant, and
+    // report that instead. This is the resolution the data actually supports — StrainScan reports
+    // the internal node for the same reason — and it is strictly better than the two
+    // alternatives, which are to invent two strains or to report nothing.
+    if !rejected.is_empty() {
+        let accepted_under = |v: usize, out: &[TreeCall]| -> bool {
+            out.iter().any(|c| cst.desc_leaves[v].contains(&cst.desc_leaves[c.node][0]))
+        };
+        let mut added: Vec<usize> = Vec::new();
+        for &r in &rejected {
+            let mut v = r;
+            while let Some(par) = cst.parent[v] {
+                if accepted_under(par, &out) || added.contains(&par) {
+                    break;
+                }
+                let ms: Vec<Marker> = cst.node_markers[par].iter().copied().collect();
+                if ms.len() >= MIN_NODE_MARKERS {
+                    let (panel, detected, depth) = set_evidence(&ms, counts);
+                    let coverage = detected as f64 / panel as f64;
+                    let expected = detectable_fraction(depth);
+                    let consistent = expected <= 0.0 || coverage / expected >= p.min_consistency;
+                    if detected >= p.min_support_markers && coverage >= p.min_coverage && consistent
+                    {
+                        out.push(TreeCall {
+                            node: par,
+                            desc_leaves: cst.desc_leaves[par].clone(),
+                            panel,
+                            detected,
+                            coverage,
+                            depth,
+                            path: vec![par],
+                        });
+                        added.push(par);
+                        break;
+                    }
+                }
+                v = par;
+            }
+        }
     }
     out
 }
