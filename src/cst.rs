@@ -771,8 +771,8 @@ impl SpeciesCst {
         // K(v) for every node.
         let n_genomes = self.genome_markers.len();
         let mut node_markers: Vec<FxHashSet<Marker>> = Vec::with_capacity(n_nodes);
-        for v in 0..n_nodes {
-            let gs = genomes_of(&desc_leaves[v], &self.clusters);
+        for dl in desc_leaves.iter().take(n_nodes) {
+            let gs = genomes_of(dl, &self.clusters);
             if gs.is_empty() {
                 node_markers.push(FxHashSet::default());
                 continue;

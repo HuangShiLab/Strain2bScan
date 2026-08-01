@@ -770,6 +770,71 @@ mod tests {
         }
     }
 
+    /// **The reason Layer-2 exists.** A cluster that is a strict subset of another has NO unique
+    /// markers, so the flat algorithm cannot see it at all — `panel == 0` and it is skipped.
+    /// The joint fit over shared markers recovers it exactly: the markers A and B share observe
+    /// `w_A + w_B`, the ones only A carries observe `w_A`, and the two together give `w_B`.
+    ///
+    /// Sample: A at 10x and B at 5x, B's marker set a strict subset of A's.
+    #[test]
+    fn joint_fit_recovers_a_subset_cluster_the_flat_path_cannot_see() {
+        let a: Vec<Marker> = (10_000..11_000).collect();
+        let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
+        let db = StrainDb::build(vec![("A".into(), a.clone()), ("B_subset".into(), b.clone())]);
+        assert_eq!(db.unique_marker_count(1), 0, "B has no unique markers by construction");
+
+        let mut counts = MarkerCounts::default();
+        for &m in &a {
+            // shared rows see both strains; A-only rows see A alone
+            counts.insert(m, if b.contains(&m) { 15 } else { 10 });
+        }
+
+        // Flat path: B is invisible.
+        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        let flat: Vec<String> = profile(&db, &counts, &p).iter().map(|c| c.name.clone()).collect();
+        assert_eq!(flat, vec!["A".to_string()], "flat path cannot see the subset cluster");
+
+        // Joint fit: both recovered, at the right depths.
+        let design = build_l2_design(&db, &[0, 1], &counts);
+        assert!(
+            design.shared_fraction() > 0.4,
+            "half the rows should be shared, got {}",
+            design.shared_fraction()
+        );
+        let w = l2_abundance(&design, &[0, 1], 0.0, 0.5);
+        assert!((w[0] - 10.0).abs() < 0.05, "w_A = {} should be 10", w[0]);
+        assert!((w[1] - 5.0).abs() < 0.05, "w_B = {} should be 5", w[1]);
+    }
+
+    /// The pre-scan must consume the winner's markers so a near-duplicate cluster is not selected
+    /// on the same evidence. With unique-only markers this loop is a no-op — the sets are
+    /// disjoint, so consuming one leaves the others untouched — which is why it only becomes
+    /// meaningful once shared markers are in the matrix.
+    #[test]
+    fn pre_scan_consumes_the_winners_markers() {
+        let a: Vec<Marker> = (10_000..11_000).collect();
+        let dup: Vec<Marker> = (10_000..10_990).collect(); // 99% the same as A
+        let far: Vec<Marker> = (20_000..21_000).collect();
+        let db = StrainDb::build(vec![
+            ("A".into(), a.clone()),
+            ("A_dup".into(), dup),
+            ("Far".into(), far.clone()),
+        ]);
+        let mut counts = MarkerCounts::default();
+        for &m in &a {
+            counts.insert(m, 20); // only A is present
+        }
+
+        let design = build_l2_design(&db, &[0, 1, 2], &counts);
+        let chosen = pre_scan(&design, 15, 10);
+        assert_eq!(chosen.first(), Some(&0), "A explains the most, picked first");
+        assert!(
+            !chosen.contains(&1),
+            "the 99%-duplicate has almost nothing left to explain once A's markers are consumed"
+        );
+        assert!(!chosen.contains(&2), "the absent cluster explains nothing");
+    }
+
     #[test]
     fn singleton_errors_do_not_create_calls() {
         let (db, _) = conspecific_db(3, 100, 40);
@@ -1155,4 +1220,155 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
         out.push(TreeCall { leaf, panel, detected, coverage, depth, path });
     }
     out
+}
+
+// ===== Layer-2: shared-marker deconvolution (StrainScan port) ==============
+//
+// The flat algorithm scores each cluster on markers **no other cluster carries**, which on a
+// low-diversity species is a small minority of the panel. StrainScan instead fits all co-present
+// clusters jointly over the *shared* markers too: a marker carried by clusters {A,C} constrains
+// `w_A + w_C` against its observed count, which is information the unique-only path throws away.
+//
+// Three pieces, in StrainScan's order:
+//   1. `L2Design`      — the marker × cluster incidence matrix, shared markers included.
+//   2. `pre_scan`      — greedy selection by *residually* covered markers, consuming each
+//                        winner's markers so the next candidate is judged on what is left.
+//   3. `nonneg_elastic_net` — joint abundance over the selected columns.
+
+/// Marker × cluster incidence for one species' co-detected clusters.
+#[derive(Debug, Clone)]
+pub struct L2Design {
+    /// Row order: the markers used, each carried by 1..n of the candidate clusters.
+    pub markers: Vec<Marker>,
+    /// Column order: indices into the `StrainDb`.
+    pub clusters: Vec<usize>,
+    /// `cols[j][i] == 1.0` iff cluster `clusters[j]` carries `markers[i]`.
+    pub cols: Vec<Vec<f64>>,
+    /// Observed count per row.
+    pub y: Vec<f64>,
+}
+
+impl L2Design {
+    pub fn n_rows(&self) -> usize {
+        self.markers.len()
+    }
+    /// Fraction of rows carried by more than one candidate — the data the unique-only path
+    /// discards. If this is ~0 the clusters share nothing and a joint fit cannot beat
+    /// per-cluster means.
+    pub fn shared_fraction(&self) -> f64 {
+        if self.markers.is_empty() {
+            return 0.0;
+        }
+        let shared = (0..self.markers.len())
+            .filter(|&i| self.cols.iter().filter(|c| c[i] > 0.0).count() > 1)
+            .count();
+        shared as f64 / self.markers.len() as f64
+    }
+}
+
+/// Build the design matrix over `candidates` within one species database.
+///
+/// A marker enters as a row when at least one candidate carries it — **including** markers all
+/// of them carry.
+///
+/// This is a deliberate deviation from StrainScan, which drops the all-carried rows. It is right
+/// there and wrong here, because the two setups differ in what is already known. StrainScan's
+/// Layer-2 candidates are strains *within one cluster* whose total depth Layer-1 has already
+/// pinned down, so a row carried by every candidate adds no information about the split. Our
+/// candidates are co-detected *clusters* with no separately determined total, so those rows are
+/// the only thing constraining the sum: with A ⊃ B, the markers they share observe `w_A + w_B`
+/// and the ones only A carries observe `w_A`, and it takes both to recover `w_B`. Dropping them
+/// would break exactly the case this matrix exists for.
+pub fn build_l2_design(db: &StrainDb, candidates: &[usize], counts: &MarkerCounts) -> L2Design {
+    let mut markers: Vec<Marker> = Vec::new();
+    let mut seen: crate::fxhash::FxHashSet<Marker> = crate::fxhash::FxHashSet::default();
+    for &j in candidates {
+        for &m in &db.strain_markers[j] {
+            if seen.insert(m) {
+                markers.push(m);
+            }
+        }
+    }
+    markers.sort_unstable();
+
+    let cols: Vec<Vec<f64>> = candidates
+        .iter()
+        .map(|&j| {
+            markers
+                .iter()
+                .map(|m| if db.strain_markers[j].contains(m) { 1.0 } else { 0.0 })
+                .collect()
+        })
+        .collect();
+    let y: Vec<f64> = markers
+        .iter()
+        .map(|m| counts.get(m).copied().unwrap_or(0) as f64)
+        .collect();
+    L2Design { markers, clusters: candidates.to_vec(), cols, y }
+}
+
+/// StrainScan's iterative pre-scan: greedily pick the cluster explaining the most **not yet
+/// explained** markers, then consume its markers so later candidates are judged on the residual.
+///
+/// This is the step the unique-only path cannot have: cluster-unique sets are disjoint by
+/// construction, so consuming one leaves the others untouched and the iteration is a no-op. It
+/// only bites once shared markers are in the matrix.
+///
+/// Returns column indices into `design.clusters`, in selection order.
+pub fn pre_scan(design: &L2Design, max_iter: usize, min_new_markers: usize) -> Vec<usize> {
+    let n_rows = design.n_rows();
+    let n_cols = design.cols.len();
+    if n_rows == 0 || n_cols == 0 {
+        return Vec::new();
+    }
+    let mut used = vec![false; n_rows];
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut taken = vec![false; n_cols];
+
+    for _ in 0..max_iter.min(n_cols) {
+        let mut best = (0usize, 0usize); // (residual support, column)
+        for j in 0..n_cols {
+            if taken[j] {
+                continue;
+            }
+            // Score by how many *residual* markers this cluster explains at count >= 1.
+            let score = (0..n_rows)
+                .filter(|&i| !used[i] && design.cols[j][i] > 0.0 && design.y[i] >= 1.0)
+                .count();
+            if score > best.0 {
+                best = (score, j);
+            }
+        }
+        if best.0 < min_new_markers {
+            break;
+        }
+        let j = best.1;
+        chosen.push(j);
+        taken[j] = true;
+        // Consume this cluster's markers unconditionally — this is what makes the loop
+        // terminate and what stops a near-duplicate cluster being selected on the same
+        // evidence as the winner.
+        for i in 0..n_rows {
+            if design.cols[j][i] > 0.0 {
+                used[i] = true;
+            }
+        }
+    }
+    chosen
+}
+
+/// Joint abundance for the selected clusters, via the non-negative Elastic Net.
+///
+/// Returns one depth per entry of `selected` (indices into `design.clusters`), in the same order.
+pub fn l2_abundance(
+    design: &L2Design,
+    selected: &[usize],
+    alpha: f64,
+    l1_ratio: f64,
+) -> Vec<f64> {
+    if selected.is_empty() || design.n_rows() == 0 {
+        return vec![0.0; selected.len()];
+    }
+    let cols: Vec<Vec<f64>> = selected.iter().map(|&j| design.cols[j].clone()).collect();
+    nonneg_elastic_net(&cols, &design.y, alpha, l1_ratio, 2000, 1e-8)
 }
