@@ -136,7 +136,18 @@ impl Default for Params {
         Params {
             // Recalibrated for sparse 2bRAD markers (full-k-mer StrainScan uses msn*k≈1240
             // k-mers; tag markers are ~50-100x sparser, so the floor is in *tag* units).
-            min_support_markers: 10,
+            //
+            // 8, not 10, on measurement rather than on the round number. This gate is what sets
+            // the detection limit, because support tracks `panel * (1 - e^-lambda)` almost
+            // exactly and both factors are small here: the discriminating panel is a few dozen
+            // tags (median 53 over a 419-cluster C. acnes panel), and a strain at 5% of a
+            // sample sequenced to ~5x per tag sits at lambda ~= 0.27, where only ~24% of any
+            // panel is observable at all. ~35 markers x 24% ~= 8 observed against a floor of 10
+            // loses strains that are plainly present. Swept on that panel, 10 -> 8 lifts AUPR
+            // from 0.800 to 0.950 with precision unchanged at 1.000; below 8 precision starts
+            // to go (0.900 at 6, 0.780 at 4), so 8 is the last free step rather than a
+            // sensitivity/specificity trade.
+            min_support_markers: 8,
             min_coverage: 0.1,
             // 0, NOT StrainScan's 0.02 — and this must stay tied to the depth estimator.
             //
@@ -1244,9 +1255,10 @@ use crate::cst::Cst;
 /// at depth 4.7x — overwhelming evidence of presence — failed by one marker and cut the 331-leaf
 /// subtree holding the answer.
 ///
-/// 3x the support floor leaves room for dropout: at the floor of 10 a 30-marker node still
-/// clears it with a third of its panel missing. Nodes below this are treated as untestable and
-/// the descent enters them, which costs work but cannot lose a true subtree.
+/// Several times the support floor leaves room for dropout: against a floor of 8 a 30-marker
+/// node still clears it with nearly three quarters of its panel missing. Nodes below this are
+/// treated as untestable and the descent enters them, which costs work but cannot lose a true
+/// subtree. Keep this comfortably above `min_support_markers` if that floor is ever retuned.
 pub const MIN_NODE_MARKERS: usize = 30;
 
 /// Widest clade the internal-node fallback may report. Beyond this the call names so many

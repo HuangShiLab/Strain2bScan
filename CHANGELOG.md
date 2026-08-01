@@ -2,6 +2,48 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — lower the support floor to 8
+
+### Changed — `min_support_markers` 10 → 8
+
+This gate sets the detection limit, and 10 was a round number rather than a measured one.
+Support tracks `panel × (1 − e^(−λ))` almost exactly, and on 2bRAD markers both factors are
+small: the discriminating panel is a few dozen tags (median 53 across a 419-cluster
+*C. acnes* panel, 13–115 for the clusters actually present), and a strain at 5 % of a sample
+sequenced to ~5× per tag sits at λ ≈ 0.27, where only ~24 % of any panel is observable. So
+~35 markers × 24 % ≈ 8 observed — and a floor of 10 discards strains that are plainly there.
+
+Measured on that panel, three of 15 truth clusters were lost on this gate alone, all of them
+at 2.7–6.3 % relative abundance, and none of them rejected by coverage or consistency:
+
+| cluster | truth | panel | depth | coverage | support |
+|---|---|---|---|---|---|
+| C249 | 2.7 % | 40 | 0.200× | 20.0 % | 8 |
+| C229 | 6.3 % | 34 | 0.294× | 23.5 % | 8 |
+| C202 | 5.1 % | 28 | 0.143× | 14.3 % | 4 |
+
+Sweeping the floor on the flat path:
+
+| floor | precision | recall | AUPR |
+|---|---|---|---|
+| 10 | 1.000 | 0.800 | 0.800 |
+| **8** | **1.000** | **0.950** | **0.950** |
+| 6 | 0.900 | 0.950 | 0.950 |
+| 4 | 0.780 | 1.000 | 0.983 |
+
+8 is the last free step: it recovers C249 and C229 with precision unchanged at 1.000, while 6
+and 4 start trading precision away. C202, at support 4, needs a floor of 4 and is where this
+panel and depth genuinely run out of signal. Bray–Curtis improves 0.058 → 0.042.
+
+Calibrate this on your own panel — the argument above is arithmetic, but the number 8 comes
+from one species at one depth. `--min-support N` overrides it per run.
+
+Worth noting what this floor does at the other end: C204, the *dominant* strain of sample 5 at
+83.8 % abundance, 92.3 % coverage and 4.2× depth, cleared the old floor with exactly 10
+markers because its panel is only 13 — one dropout from being lost — while a cluster with
+8 000 markers needs the same 10, which is 0.1 % of its panel. A floor that scales with panel
+size would separate those two regimes; that is a larger change and is not made here.
+
 ## [Unreleased] — fix three silent failures in the Cluster Search Tree descent
 
 Measured on the first real panel the port has seen: 543 *Cutibacterium acnes* genomes
