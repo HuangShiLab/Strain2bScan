@@ -59,7 +59,7 @@
 //! it by a global matrix.
 
 use crate::db::StrainDb;
-use crate::markers::MarkerCounts;
+use crate::markers::{Marker, MarkerCounts};
 
 /// Depth at or above which a genuine marker is essentially never observed exactly once, so
 /// `count == 1` can safely be attributed to sequencing error (StrainScan's singleton rule).
@@ -496,7 +496,7 @@ pub fn naive_profile(db: &StrainDb, counts: &MarkerCounts, min_score: f64) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markers::Marker;
+
 
     /// Build a conspecific DB: `core` shared by all strains, plus private markers each.
     fn conspecific_db(n_strains: usize, core: usize, private: usize) -> (StrainDb, Vec<Vec<Marker>>) {
@@ -663,6 +663,111 @@ mod tests {
             vec!["A".to_string(), "B".to_string()],
             "a genuinely rare cluster with the same breadth must survive"
         );
+    }
+
+    /// **The reason the tree exists.** A leaf with too few markers of its own is invisible to the
+    /// flat unique-marker algorithm, but the tree can accept it by pooling the markers of every
+    /// ancestor whose sibling branch was never entered.
+    ///
+    /// Layout: 4 genomes forming ((A,B),(C,D)). A carries only 5 markers no one else has — below
+    /// `min_support_markers` — but the A/B ancestor has 100 group-specific markers, and the root
+    /// has 200 species-core markers. The sample contains A alone.
+    ///
+    /// Flat algorithm: A's own panel is 5 < 10, so A is never called.
+    /// Tree: B and C/D are ruled out on their own sets, so nothing was entered on either sibling
+    /// branch and A pools 5 + 100 + 200 = 305 markers, all observed.
+    #[test]
+    fn tree_pooling_recovers_a_leaf_the_flat_algorithm_misses() {
+        use crate::cst::SpeciesCst;
+        let core: Vec<Marker> = (0..200).collect();
+        let ab: Vec<Marker> = (300..400).collect();
+        let cd: Vec<Marker> = (400..500).collect();
+        let mk = |extra: &[Marker], uniq: std::ops::Range<Marker>| -> Vec<Marker> {
+            let mut v = core.clone();
+            v.extend_from_slice(extra);
+            v.extend(uniq);
+            v
+        };
+        let ga = mk(&ab, 1000..1005); // only 5 exclusive markers
+        let gb = mk(&ab, 1100..1200);
+        let gc = mk(&cd, 1200..1300);
+        let gd = mk(&cd, 1300..1400);
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = [("A", &ga), ("B", &gb), ("C", &gc), ("D", &gd)]
+            .into_iter()
+            .map(|(n, g)| (n.to_string(), g.clone(), g.clone()))
+            .collect();
+        let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
+        assert_eq!(cst.n_clusters(), 4, "each genome should be its own cluster");
+
+        // Sample: strain A only, at 20x.
+        let mut counts = MarkerCounts::default();
+        for &m in &ga {
+            counts.insert(m, 20);
+        }
+
+        // --- flat algorithm: A has 5 unique markers, below the support floor -> missed
+        let db = cst.cluster_db();
+        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        let flat: Vec<String> = profile(&db, &counts, &p).iter().map(|c| c.name.clone()).collect();
+        assert!(flat.is_empty(), "flat algorithm should miss the sparse leaf, got {flat:?}");
+
+        // --- tree: pools ancestors whose siblings were never entered
+        let tree = cst.build_tree();
+        let calls = descend_tree(&tree, &counts, &p);
+        assert_eq!(calls.len(), 1, "tree should call exactly the present leaf: {calls:?}");
+        let call = &calls[0];
+        assert_eq!(
+            tree.leaves[call.leaf], vec![0],
+            "the called leaf must be A (genome 0)"
+        );
+        assert_eq!(call.panel, 305, "pooled 5 own + 100 A/B-group + 200 root-core");
+        assert!(call.path.len() == 3, "pooled leaf + 2 ancestors, got {:?}", call.path);
+        assert!((call.coverage - 1.0).abs() < 1e-9);
+        assert!((call.depth - 20.0).abs() < 0.5, "depth {}", call.depth);
+    }
+
+    /// Pooling must STOP once a sibling branch is entered: at that point the ancestor's markers
+    /// are shared between both branches and attributing them to one would double-count.
+    #[test]
+    fn tree_pooling_stops_when_the_sibling_branch_is_entered() {
+        use crate::cst::SpeciesCst;
+        let core: Vec<Marker> = (0..200).collect();
+        let ab: Vec<Marker> = (300..400).collect();
+        let cd: Vec<Marker> = (400..500).collect();
+        let mk = |extra: &[Marker], uniq: std::ops::Range<Marker>| -> Vec<Marker> {
+            let mut v = core.clone();
+            v.extend_from_slice(extra);
+            v.extend(uniq);
+            v
+        };
+        let ga = mk(&ab, 1000..1100);
+        let gb = mk(&ab, 1100..1200);
+        let gc = mk(&cd, 1200..1300);
+        let gd = mk(&cd, 1300..1400);
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = [("A", &ga), ("B", &gb), ("C", &gc), ("D", &gd)]
+            .into_iter()
+            .map(|(n, g)| (n.to_string(), g.clone(), g.clone()))
+            .collect();
+        let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
+        let tree = cst.build_tree();
+
+        // BOTH A and B present -> the A/B ancestor is entered from both sides.
+        let mut counts = MarkerCounts::default();
+        for &m in ga.iter().chain(gb.iter()) {
+            counts.insert(m, 20);
+        }
+        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        let calls = descend_tree(&tree, &counts, &p);
+        assert_eq!(calls.len(), 2, "both leaves present: {calls:?}");
+        for c in &calls {
+            assert_eq!(
+                c.path.len(),
+                1,
+                "sibling entered -> no ancestor pooling, got path {:?}",
+                c.path
+            );
+            assert_eq!(c.panel, 100, "only the leaf's own 100 exclusive markers");
+        }
     }
 
     #[test]
@@ -880,4 +985,174 @@ mod tests {
         let w = nonneg_elastic_net(&cols, &y, 0.0, 0.5, 5000, 1e-10);
         assert!((w[0] - 2.0).abs() < 1e-3 && (w[1] - 3.0).abs() < 1e-3, "w={w:?}");
     }
+}
+
+// ===== Layer-1: Cluster Search Tree descent (StrainScan port) ==============
+
+use crate::cst::Cst;
+
+/// Minimum markers for a node's own set to be worth testing. StrainScan uses 1000 k-mers, but it
+/// stores both strands as separate ids (so 500 canonical) and works on a ~76-116x denser marker
+/// space; the scale-equivalent here is single digits. 10 is that floor rounded up to the value
+/// already used for cluster support, so the two gates stay on one scale.
+pub const MIN_NODE_MARKERS: usize = 10;
+
+/// One leaf accepted by the tree descent.
+#[derive(Debug, Clone)]
+pub struct TreeCall {
+    pub leaf: usize,
+    /// Markers pooled along the unique path (the leaf's own plus attributable ancestors').
+    pub panel: usize,
+    pub detected: usize,
+    pub coverage: f64,
+    pub depth: f64,
+    /// Nodes whose markers were pooled — leaf first, then ancestors.
+    pub path: Vec<usize>,
+}
+
+/// Evidence for one marker set.
+fn set_evidence(markers: &[Marker], counts: &MarkerCounts) -> (usize, usize, f64) {
+    let panel = markers.len();
+    if panel == 0 {
+        return (0, 0, 0.0);
+    }
+    let mut obs: Vec<u32> = markers
+        .iter()
+        .map(|m| counts.get(m).copied().unwrap_or(0))
+        .collect();
+    obs.sort_unstable();
+    let detected = panel - obs.partition_point(|&c| c < 1);
+    let depth = if detected == 0 {
+        0.0
+    } else {
+        let cap_idx = panel.saturating_sub(1 + detected / TRIM_FRACTION);
+        let cap = obs[cap_idx] as u64;
+        obs.iter().map(|&c| (c as u64).min(cap)).sum::<u64>() as f64 / panel as f64
+    };
+    (panel, detected, depth)
+}
+
+/// Descend the Cluster Search Tree, returning the leaves it accepts.
+///
+/// Two mechanisms matter, and they are the entire reason to build a tree:
+///
+/// **Pruning.** A node whose own marker set is informative but unobserved rules out its whole
+/// subtree in one test, instead of scoring every leaf independently.
+///
+/// **Unique-path pooling.** A leaf is accepted on the union of its own markers *and* those of
+/// every ancestor whose sibling branch was never entered. If the descent went left at a node and
+/// never right, that node's group-specific markers are attributable to the left subtree, so a
+/// leaf with too few markers of its own can borrow them. This is what the flat unique-marker
+/// algorithm has no way to do: it sees only the leaf's own set and calls the leaf undetectable.
+/// Once a sibling *is* entered, the ancestor's markers become ambiguous between the two branches
+/// and pooling stops there.
+pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCall> {
+    if cst.n_leaves() == 0 {
+        return Vec::new();
+    }
+    if cst.n_leaves() == 1 {
+        // Degenerate tree: the single leaf is the root; test it directly.
+        let ms: Vec<Marker> = cst.node_markers[0].iter().copied().collect();
+        let (panel, detected, depth) = set_evidence(&ms, counts);
+        if panel > 0 && detected >= p.min_support_markers {
+            let coverage = detected as f64 / panel as f64;
+            if coverage >= p.min_coverage {
+                return vec![TreeCall { leaf: 0, panel, detected, coverage, depth, path: vec![0] }];
+            }
+        }
+        return Vec::new();
+    }
+
+    // A node "fires" when its own marker set is informative AND observed.
+    let fires = |v: usize| -> bool {
+        let ms: Vec<Marker> = cst.node_markers[v].iter().copied().collect();
+        if ms.len() < MIN_NODE_MARKERS {
+            return false; // uninformative: cannot rule the subtree in or out
+        }
+        let (panel, detected, depth) = set_evidence(&ms, counts);
+        let min_count = if p.adaptive_singleton { min_count_for(depth) } else { 2 };
+        let support = if min_count >= 2 {
+            let mut n = 0;
+            for m in &ms {
+                if counts.get(m).copied().unwrap_or(0) >= 2 {
+                    n += 1;
+                }
+            }
+            n
+        } else {
+            detected
+        };
+        support >= p.min_support_markers && (detected as f64 / panel as f64) >= p.min_coverage
+    };
+    let informative = |v: usize| cst.node_markers[v].len() >= MIN_NODE_MARKERS;
+
+    // Descend, recording which nodes were entered.
+    let mut entered: Vec<bool> = vec![false; cst.n_nodes()];
+    let mut reached: Vec<usize> = Vec::new();
+    let mut stack = vec![cst.root];
+    entered[cst.root] = true;
+    while let Some(v) = stack.pop() {
+        if cst.is_leaf(v) {
+            reached.push(v);
+            continue;
+        }
+        let (a, b) = cst.children[v].expect("internal node has children");
+        for c in [a, b] {
+            // Enter a child if it has its own evidence, or if it cannot be tested at all.
+            // An uninformative child is not evidence of absence, so we descend and let a
+            // deeper node decide.
+            if !informative(c) || fires(c) {
+                entered[c] = true;
+                stack.push(c);
+            }
+        }
+    }
+
+    // Accept reached leaves on pooled evidence along the unique path.
+    let mut out = Vec::new();
+    for &leaf in &reached {
+        let mut path = vec![leaf];
+        let mut pooled: Vec<Marker> = cst.node_markers[leaf].iter().copied().collect();
+        let mut v = leaf;
+        while let Some(par) = cst.parent[v] {
+            match cst.sibling(v) {
+                // The sibling branch was never entered, so this ancestor's group-specific
+                // markers belong to our side and can be pooled.
+                Some(s) if !entered[s] => {
+                    pooled.extend(cst.node_markers[par].iter().copied());
+                    path.push(par);
+                    v = par;
+                }
+                // Sibling entered: the ancestor's markers are shared between both branches and
+                // attributing them here would double-count. Stop.
+                _ => break,
+            }
+        }
+        let (panel, detected, depth) = set_evidence(&pooled, counts);
+        if panel == 0 {
+            continue;
+        }
+        let min_count = if p.adaptive_singleton { min_count_for(depth) } else { 2 };
+        let support = if min_count >= 2 {
+            pooled
+                .iter()
+                .filter(|m| counts.get(m).copied().unwrap_or(0) >= 2)
+                .count()
+        } else {
+            detected
+        };
+        if support < p.min_support_markers {
+            continue;
+        }
+        let coverage = detected as f64 / panel as f64;
+        if coverage < p.min_coverage {
+            continue;
+        }
+        let expected = detectable_fraction(depth);
+        if expected > 0.0 && coverage / expected < p.min_consistency {
+            continue;
+        }
+        out.push(TreeCall { leaf, panel, detected, coverage, depth, path });
+    }
+    out
 }

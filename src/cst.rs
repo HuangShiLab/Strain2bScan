@@ -650,3 +650,154 @@ impl SpeciesCst {
         out
     }
 }
+
+// ===== Cluster Search Tree (StrainScan Layer-1) ============================
+//
+// A real binary hierarchy above the flat clusters, mirroring `Build_tree.py::hierarchy`.
+//
+// The flat single-linkage partition already IS the τ-cut of this dendrogram, so the leaf set is
+// unchanged and the tree is a strict extension: everything the current algorithm does remains
+// available, and the tree adds the internal nodes it currently has no way to use.
+//
+// Each node stores the marker set StrainScan would test there:
+//
+//     K(v) = (∩ markers of v's descendant genomes) \ (∪ markers of every genome outside v)
+//
+// i.e. "core to this subtree and found nowhere else in the species". Leaves get their
+// cluster-unique markers; internal nodes get the group-specific markers the unique-only
+// algorithm discards.
+
+/// A binary hierarchy over a species' clusters, with per-node marker sets.
+#[derive(Debug, Clone)]
+pub struct Cst {
+    /// Leaf id -> member genome indices. Leaves are `0..n_leaves`.
+    pub leaves: Vec<Vec<usize>>,
+    /// Node id -> parent (None for the root). Length `2*n_leaves - 1`.
+    pub parent: Vec<Option<usize>>,
+    /// Node id -> its two children (None for leaves).
+    pub children: Vec<Option<(usize, usize)>>,
+    /// Node id -> the leaf ids beneath it (a leaf's own id for a leaf).
+    pub desc_leaves: Vec<Vec<usize>>,
+    /// Node id -> K(v).
+    pub node_markers: Vec<FxHashSet<Marker>>,
+    /// Node id -> similarity at which its children merged (1.0 for leaves).
+    pub merge_similarity: Vec<f64>,
+    /// Root node id.
+    pub root: usize,
+}
+
+impl Cst {
+    pub fn n_nodes(&self) -> usize {
+        self.parent.len()
+    }
+    pub fn n_leaves(&self) -> usize {
+        self.leaves.len()
+    }
+    #[inline]
+    pub fn is_leaf(&self, v: usize) -> bool {
+        v < self.leaves.len()
+    }
+    /// The sibling of `v`, if it has one.
+    pub fn sibling(&self, v: usize) -> Option<usize> {
+        let p = self.parent[v]?;
+        let (a, b) = self.children[p]?;
+        Some(if a == v { b } else { a })
+    }
+}
+
+impl SpeciesCst {
+    /// Build the Cluster Search Tree over this species' clusters.
+    ///
+    /// Merging is by **max-linkage** Jaccard between member genomes — the similarity of two
+    /// nodes is the best similarity across their members — matching StrainScan's single-linkage
+    /// merge on a similarity matrix. Exactly `n_leaves - 1` internal nodes are created.
+    pub fn build_tree(&self) -> Cst {
+        let n_leaves = self.clusters.len();
+        let n_nodes = if n_leaves == 0 { 0 } else { 2 * n_leaves - 1 };
+        let mut parent: Vec<Option<usize>> = vec![None; n_nodes];
+        let mut children: Vec<Option<(usize, usize)>> = vec![None; n_nodes];
+        let mut desc_leaves: Vec<Vec<usize>> = Vec::with_capacity(n_nodes);
+        let mut merge_similarity: Vec<f64> = vec![1.0; n_nodes];
+        for l in 0..n_leaves {
+            desc_leaves.push(vec![l]);
+        }
+
+        // Genome-level similarity, memoized: node similarity is the max over member pairs.
+        let mut cache: FxHashMap<(usize, usize), f64> = FxHashMap::default();
+        let mut sim_of = |a: usize, b: usize, gm: &[FxHashSet<Marker>]| -> f64 {
+            let k = if a < b { (a, b) } else { (b, a) };
+            *cache.entry(k).or_insert_with(|| jaccard(&gm[k.0], &gm[k.1]))
+        };
+        let genomes_of = |ls: &[usize], leaves: &[Vec<usize>]| -> Vec<usize> {
+            ls.iter().flat_map(|&l| leaves[l].iter().copied()).collect()
+        };
+
+        let mut active: Vec<usize> = (0..n_leaves).collect();
+        let mut next_id = n_leaves;
+        while active.len() > 1 {
+            let (mut best, mut bi, mut bj) = (f64::NEG_INFINITY, 0usize, 1usize);
+            for i in 0..active.len() {
+                for j in (i + 1)..active.len() {
+                    let ga = genomes_of(&desc_leaves[active[i]], &self.clusters);
+                    let gb = genomes_of(&desc_leaves[active[j]], &self.clusters);
+                    let mut s = f64::NEG_INFINITY;
+                    for &x in &ga {
+                        for &y in &gb {
+                            s = s.max(sim_of(x, y, &self.genome_markers));
+                        }
+                    }
+                    if s > best {
+                        best = s;
+                        bi = i;
+                        bj = j;
+                    }
+                }
+            }
+            let (a, b) = (active[bi], active[bj]);
+            let mut d = desc_leaves[a].clone();
+            d.extend_from_slice(&desc_leaves[b]);
+            d.sort_unstable();
+            desc_leaves.push(d);
+            children[next_id] = Some((a, b));
+            parent[a] = Some(next_id);
+            parent[b] = Some(next_id);
+            merge_similarity[next_id] = best;
+            active.retain(|&x| x != a && x != b);
+            active.push(next_id);
+            next_id += 1;
+        }
+        let root = if n_nodes == 0 { 0 } else { n_nodes - 1 };
+
+        // K(v) for every node.
+        let n_genomes = self.genome_markers.len();
+        let mut node_markers: Vec<FxHashSet<Marker>> = Vec::with_capacity(n_nodes);
+        for v in 0..n_nodes {
+            let gs = genomes_of(&desc_leaves[v], &self.clusters);
+            if gs.is_empty() {
+                node_markers.push(FxHashSet::default());
+                continue;
+            }
+            let mut set: FxHashSet<Marker> = self.genome_markers[gs[0]].clone();
+            for &g in &gs[1..] {
+                set.retain(|m| self.genome_markers[g].contains(m));
+            }
+            let inside: FxHashSet<usize> = gs.iter().copied().collect();
+            for g in 0..n_genomes {
+                if !inside.contains(&g) {
+                    set.retain(|m| !self.genome_markers[g].contains(m));
+                }
+            }
+            node_markers.push(set);
+        }
+
+        Cst {
+            leaves: self.clusters.clone(),
+            parent,
+            children,
+            desc_leaves,
+            node_markers,
+            merge_similarity,
+            root,
+        }
+    }
+}
