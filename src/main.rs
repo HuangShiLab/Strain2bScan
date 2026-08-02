@@ -653,6 +653,11 @@ struct SpeciesResult {
     /// Estimated per-tag depth over this species' species-specific markers (zero-inclusive).
     lambda: f64,
     tier: SpeciesTier,
+    /// Which Layer-1 ran for this species, and what the database said. `multi-profile` makes
+    /// this decision per species, so a single global line cannot report it — without this the
+    /// only way to tell which species `auto` sent down the tree was to diff whole runs.
+    layer1: Layer1,
+    tree: Option<strain2bscan::identify::TreeUtility>,
     calls: Vec<StrainCall>,
 }
 
@@ -823,11 +828,15 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         } else {
             Vec::new()
         };
+        let layer1 = resolve_layer1(db, &params);
+        let tree = tree_utility(db, params.min_support_markers);
         SpeciesResult {
             species: species.clone(),
             present_specific,
             total_specific,
             lambda,
+            layer1,
+            tree,
             tier,
             calls,
         }
@@ -970,6 +979,24 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         match r.tier {
             SpeciesTier::Resolved => {
                 n_resolved += 1;
+                // Per-species, because the decision is per-species. Printed for every resolved
+                // species whether or not the tree was taken, so a run where `auto` declined can
+                // be told apart from one where there was no tree to take.
+                if params.layer1 == Layer1::Auto {
+                    match r.tree {
+                        Some(u) => println!(
+                            "  {}\tlayer1={} (auto — {} cluster(s) below the support floor, {} informative internal node(s))",
+                            r.species,
+                            if r.layer1 == Layer1::Cst { "cst" } else { "unique" },
+                            u.rescuable,
+                            u.informative_nodes
+                        ),
+                        None => println!(
+                            "  {}\tlayer1=unique (auto — this DB carries no tree)",
+                            r.species
+                        ),
+                    }
+                }
                 if r.calls.is_empty() {
                     println!(
                         "  {}\t[strain-resolved, no cluster above threshold]\tmarkers={}/{} (depth {:.2}x)",

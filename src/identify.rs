@@ -397,7 +397,7 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
     let mut calls: Vec<StrainCall> = match resolve_layer1(db, p) {
         Layer1::Auto | Layer1::Unique => profile_unique(db, counts, p),
         Layer1::Cst => match &db.tree {
-            Some(tree) => descend_tree(tree, counts, p)
+            Some(tree) => descend_tree_masked(tree, counts, p, db.quant_mask.as_ref())
                 .into_iter()
                 .filter(|c| c.desc_leaves.iter().all(|&l| l < db.n_strains()))
                 .map(|c| {
@@ -1409,8 +1409,19 @@ pub fn tree_utility(db: &StrainDb, support_floor: usize) -> Option<TreeUtility> 
     let rescuable = (0..db.n_strains())
         .filter(|&j| db.unique_marker_count(j) < support_floor)
         .count();
+    // Count against the SAME marker set the descent will score on. Under `multi-profile` the
+    // database carries a cross-species mask, and a node whose markers are mostly shared with a
+    // congener has far less usable evidence than its raw set suggests — deciding on the raw
+    // count would enable the tree on nodes that cannot actually be tested.
     let informative_nodes = (0..tree.n_nodes())
-        .filter(|&v| !tree.is_leaf(v) && tree.node_markers[v].len() >= MIN_NODE_MARKERS)
+        .filter(|&v| {
+            !tree.is_leaf(v)
+                && tree.node_markers[v]
+                    .iter()
+                    .filter(|&&m| db.is_quantifiable(m))
+                    .count()
+                    >= MIN_NODE_MARKERS
+        })
         .count();
     Some(TreeUtility { rescuable, informative_nodes })
 }
@@ -1479,13 +1490,50 @@ fn set_evidence(markers: &[Marker], counts: &MarkerCounts) -> (usize, usize, f64
 /// algorithm has no way to do: it sees only the leaf's own set and calls the leaf undetectable.
 /// Once a sibling *is* entered, the ancestor's markers become ambiguous between the two branches
 /// and pooling stops there.
+/// Descend the tree with no cross-species restriction. See [`descend_tree_masked`].
 pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCall> {
+    descend_tree_masked(cst, counts, p, None)
+}
+
+/// The tree descent, honouring `multi-profile`'s cross-species marker restriction.
+///
+/// `mask` is the DB's `quant_mask`: the markers specific to this species across the whole
+/// panel being profiled together. It has to be applied HERE, not just to the cluster rows.
+/// `restrict_to` records the restriction as a mask on the database, and `unique_markers`
+/// consults it — but the tree's node sets are reached through `Cst` directly, which the mask
+/// never touched, so the descent was scoring internal nodes on markers this species shares
+/// with a congener in the panel. That is precisely the cross-talk the filter exists to stop:
+/// a co-present relative's reads land on those tags and manufacture evidence for a node.
+/// The flat path was filtered and the tree path was not, so `--layer1 cst` and `--layer1
+/// unique` were not scoring the same sample.
+pub fn descend_tree_masked(
+    cst: &Cst,
+    counts: &MarkerCounts,
+    p: &Params,
+    mask: Option<&crate::fxhash::FxHashSet<Marker>>,
+) -> Vec<TreeCall> {
+    let ms_of = |v: usize| -> Vec<Marker> {
+        match mask {
+            Some(allow) => cst.node_markers[v]
+                .iter()
+                .copied()
+                .filter(|m| allow.contains(m))
+                .collect(),
+            None => cst.node_markers[v].iter().copied().collect(),
+        }
+    };
+    let n_ms = |v: usize| -> usize {
+        match mask {
+            Some(allow) => cst.node_markers[v].iter().filter(|m| allow.contains(m)).count(),
+            None => cst.node_markers[v].len(),
+        }
+    };
     if cst.n_leaves() == 0 {
         return Vec::new();
     }
     if cst.n_leaves() == 1 {
         // Degenerate tree: the single leaf is the root; test it directly.
-        let ms: Vec<Marker> = cst.node_markers[0].iter().copied().collect();
+        let ms = ms_of(0);
         let (panel, detected, depth) = set_evidence(&ms, counts);
         if panel > 0 && detected >= p.min_support_markers {
             let coverage = detected as f64 / panel as f64;
@@ -1506,7 +1554,7 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
 
     // A node "fires" when its own marker set is informative AND observed.
     let fires = |v: usize| -> bool {
-        let ms: Vec<Marker> = cst.node_markers[v].iter().copied().collect();
+        let ms = ms_of(v);
         if ms.len() < MIN_NODE_MARKERS {
             return false; // uninformative: cannot rule the subtree in or out
         }
@@ -1525,7 +1573,7 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
         };
         support >= p.min_support_markers && (detected as f64 / panel as f64) >= p.min_coverage
     };
-    let informative = |v: usize| cst.node_markers[v].len() >= MIN_NODE_MARKERS;
+    let informative = |v: usize| n_ms(v) >= MIN_NODE_MARKERS;
 
     // Descend, recording which nodes were entered.
     let mut entered: Vec<bool> = vec![false; cst.n_nodes()];
@@ -1561,14 +1609,14 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
     let mut rejected: Vec<usize> = Vec::new();
     for &node in &reached {
         let mut path = vec![node];
-        let mut pooled: Vec<Marker> = cst.node_markers[node].iter().copied().collect();
+        let mut pooled: Vec<Marker> = ms_of(node);
         let mut v = node;
         while let Some(par) = cst.parent[v] {
             match cst.sibling(v) {
                 // The sibling branch was never entered, so this ancestor's group-specific
                 // markers belong to our side and can be pooled.
                 Some(s) if !entered[s] => {
-                    pooled.extend(cst.node_markers[par].iter().copied());
+                    pooled.extend(ms_of(par));
                     path.push(par);
                     v = par;
                 }
@@ -1653,7 +1701,7 @@ pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCal
                 if cst.desc_leaves[par].len() > MAX_FALLBACK_CLADE {
                     break;
                 }
-                let ms: Vec<Marker> = cst.node_markers[par].iter().copied().collect();
+                let ms = ms_of(par);
                 if ms.len() >= MIN_NODE_MARKERS {
                     let (panel, detected, depth) = set_evidence(&ms, counts);
                     let coverage = detected as f64 / panel as f64;

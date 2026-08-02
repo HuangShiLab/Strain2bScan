@@ -2,6 +2,35 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — the tree descent was bypassing the cross-species filter
+
+### Fixed — `--layer1 cst` scored unfiltered markers under `multi-profile`
+
+`multi-profile` restricts detection and quantification to the markers specific to each
+species across the whole panel, so a co-present congener's reads cannot land on a tag that
+merely looks cluster-specific inside one database. `restrict_to` records that as a
+`quant_mask` on the database and `unique_markers` consults it — but the tree's node sets are
+reached through `Cst`, which the mask never touched. `descend_tree` does not even receive the
+database. So the flat path was filtered and the tree path was not, and the two were not
+scoring the same sample: every internal node was tested on markers this species shares with
+its congeners, which is exactly the cross-talk the filter exists to stop.
+
+`descend_tree_masked` takes the mask and applies it to every node set it reads — the fire
+test, the informativeness test, the pooled panel, and the clade fallback. `tree_utility`
+counts informative nodes the same way, so `auto` decides on the panel the descent will
+actually score rather than on a larger one.
+
+Single-species `profile` carries no mask and is byte-identical on all five C. acnes samples
+across `auto`, `unique` and `cst`. Only `multi-profile` changes — and any measurement of
+`--layer1 cst` under `multi-profile` taken before this needs re-running, because the tree had
+access to evidence the flat path was denied.
+
+### Added — `multi-profile` reports the Layer-1 decision per species
+
+`auto` decides per species, so one global line could not report it; the only way to tell
+which species took the tree was to diff whole runs. Each resolved species now prints its
+decision and the two counts behind it.
+
 ## [Unreleased] — make Layer-2 reachable, choose Layer-1 from the database
 
 ### Fixed — `--layer2 enet` could never reach the case it was written for
