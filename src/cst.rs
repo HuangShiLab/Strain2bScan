@@ -722,30 +722,37 @@ impl SpeciesCst {
             desc_leaves.push(vec![l]);
         }
 
-        // Genome-level similarity, memoized: node similarity is the max over member pairs.
-        let mut cache: FxHashMap<(usize, usize), f64> = FxHashMap::default();
-        let mut sim_of = |a: usize, b: usize, gm: &[FxHashSet<Marker>]| -> f64 {
-            let k = if a < b { (a, b) } else { (b, a) };
-            *cache.entry(k).or_insert_with(|| jaccard(&gm[k.0], &gm[k.1]))
-        };
         let genomes_of = |ls: &[usize], leaves: &[Vec<usize>]| -> Vec<usize> {
             ls.iter().flat_map(|&l| leaves[l].iter().copied()).collect()
         };
 
+        // Cluster-level similarity, computed once. Under single linkage a merged node's
+        // similarity to any other is the max of its two children's, so the matrix updates in
+        // O(L) per merge — no need to re-derive max-linkage from the member genomes every round,
+        // which is what made the build scale as ~O(n^3.6): 0.01 s at 24 genomes but 0.12 s at 48.
+        let mut sim = vec![vec![f64::NEG_INFINITY; n_leaves]; n_leaves];
+        for i in 0..n_leaves {
+            for j in (i + 1)..n_leaves {
+                let mut best = f64::NEG_INFINITY;
+                for &x in &self.clusters[i] {
+                    for &y in &self.clusters[j] {
+                        best = best.max(jaccard(&self.genome_markers[x], &self.genome_markers[y]));
+                    }
+                }
+                let (lo, hi) = sim.split_at_mut(j);
+                lo[i][j] = best;
+                hi[0][i] = best;
+            }
+        }
+        // A merged node reuses its left child's row.
+        let mut row_of: Vec<usize> = (0..n_leaves).collect();
         let mut active: Vec<usize> = (0..n_leaves).collect();
         let mut next_id = n_leaves;
         while active.len() > 1 {
             let (mut best, mut bi, mut bj) = (f64::NEG_INFINITY, 0usize, 1usize);
             for i in 0..active.len() {
                 for j in (i + 1)..active.len() {
-                    let ga = genomes_of(&desc_leaves[active[i]], &self.clusters);
-                    let gb = genomes_of(&desc_leaves[active[j]], &self.clusters);
-                    let mut s = f64::NEG_INFINITY;
-                    for &x in &ga {
-                        for &y in &gb {
-                            s = s.max(sim_of(x, y, &self.genome_markers));
-                        }
-                    }
+                    let s = sim[row_of[active[i]]][row_of[active[j]]];
                     if s > best {
                         best = s;
                         bi = i;
@@ -754,6 +761,7 @@ impl SpeciesCst {
                 }
             }
             let (a, b) = (active[bi], active[bj]);
+            let (ra, rb) = (row_of[a], row_of[b]);
             let mut d = desc_leaves[a].clone();
             d.extend_from_slice(&desc_leaves[b]);
             d.sort_unstable();
@@ -762,49 +770,66 @@ impl SpeciesCst {
             parent[a] = Some(next_id);
             parent[b] = Some(next_id);
             merge_similarity[next_id] = best;
+            for &k in &active {
+                if k == a || k == b {
+                    continue;
+                }
+                let rk = row_of[k];
+                let v = sim[ra][rk].max(sim[rb][rk]);
+                sim[ra][rk] = v;
+                sim[rk][ra] = v;
+            }
+            row_of.push(ra);
             active.retain(|&x| x != a && x != b);
             active.push(next_id);
             next_id += 1;
         }
         let root = if n_nodes == 0 { 0 } else { n_nodes - 1 };
 
-        // K(v) for every node.
+        // --- K(v) for every node, by carrier-set identity.
+        //
+        // Both cases below ask a question about a marker's CARRIER SET — the genomes that hold
+        // it — so indexing markers by that set once answers every node in a single pass, instead
+        // of intersecting members and subtracting every outside genome per node
+        // (O(nodes x genomes x markers), an L-fold waste).
+        //
+        //   internal: K(v) = (∩ members) \ (∪ outside)  ⟺  carriers(m) == genomes under v
+        //   leaf:     K(v) = (∪ members) \ (∪ outside)  ⟺  carriers(m) ⊆ members(leaf)
+        //
+        // The leaf case is the union deliberately, not an oversight: `cluster_db` gives a
+        // cluster the union of its members' markers, and a tree scoring the same cluster on the
+        // intersection would be a weaker competitor to the flat path rather than an extension of
+        // it — for a cluster whose members disagree enough the intersection empties and the
+        // cluster becomes uncallable at any threshold. Internal nodes keep the intersection,
+        // since a marker is diagnostic of a clade only if every genome under it carries it.
+        //
+        // Because leaves partition the genomes, "carriers ⊆ members(leaf)" is simply "every
+        // carrier maps to the same leaf", which needs no set comparison at all.
         let n_genomes = self.genome_markers.len();
-        let mut node_markers: Vec<FxHashSet<Marker>> = Vec::with_capacity(n_nodes);
-        let n_leaves = self.clusters.len();
-        for (v, dl) in desc_leaves.iter().take(n_nodes).enumerate() {
-            let gs = genomes_of(dl, &self.clusters);
-            if gs.is_empty() {
-                node_markers.push(FxHashSet::default());
-                continue;
+        let mut carriers: FxHashMap<Marker, Vec<usize>> = FxHashMap::default();
+        for (g, ms) in self.genome_markers.iter().enumerate().take(n_genomes) {
+            for &m in ms {
+                carriers.entry(m).or_default().push(g);
             }
-            let mut set: FxHashSet<Marker> = self.genome_markers[gs[0]].clone();
-            if v < n_leaves {
-                // A LEAF is a cluster, and `cluster_db` gives a cluster the UNION of its
-                // members' markers. Intersecting here instead gives the tree a strictly smaller
-                // panel than the flat path scores the same cluster on, so `--layer1 cst` can
-                // lose calls the flat path makes — and for a cluster whose members disagree
-                // enough, the intersection empties out and the cluster becomes uncallable at
-                // any threshold (C. acnes C247: 5 members, 0 markers by intersection versus 115
-                // by union). Union at the leaves keeps the tree a strict extension of the flat
-                // path rather than a competing, weaker one.
-                for &g in &gs[1..] {
-                    set.extend(self.genome_markers[g].iter().copied());
-                }
-            } else {
-                // INTERNAL nodes keep the intersection: a marker is diagnostic of a clade only
-                // if every genome under it carries the marker.
-                for &g in &gs[1..] {
-                    set.retain(|m| self.genome_markers[g].contains(m));
-                }
+        }
+        let mut node_markers: Vec<FxHashSet<Marker>> = vec![FxHashSet::default(); n_nodes];
+        let mut by_exact: FxHashMap<Vec<usize>, FxHashSet<Marker>> = FxHashMap::default();
+        for (m, mut gs) in carriers {
+            gs.sort_unstable();
+            // Leaf: every carrier in one cluster.
+            let l0 = self.genome_cluster[gs[0]];
+            if gs.iter().all(|&g| self.genome_cluster[g] == l0) {
+                node_markers[l0].insert(m);
             }
-            let inside: FxHashSet<usize> = gs.iter().copied().collect();
-            for g in 0..n_genomes {
-                if !inside.contains(&g) {
-                    set.retain(|m| !self.genome_markers[g].contains(m));
-                }
+            // Internal: carrier set exactly equals some node's genome set.
+            by_exact.entry(gs).or_default().insert(m);
+        }
+        for v in n_leaves..n_nodes {
+            let mut gs = genomes_of(&desc_leaves[v], &self.clusters);
+            gs.sort_unstable();
+            if let Some(ms) = by_exact.get(&gs) {
+                node_markers[v] = ms.clone();
             }
-            node_markers.push(set);
         }
 
         Cst {

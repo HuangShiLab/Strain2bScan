@@ -1400,6 +1400,7 @@ impl TreeUtility {
     /// 1. Unique-path pooling can rescue clusters with too few unique markers of their own.
     /// 2. A clade fallback can resolve an intermediate strain when both child branches are
     ///    informative enough to be tested but neither fires on its own.
+    ///
     /// On a dense panel the informative-node count can fail while fallback still helps, because
     /// the parent's markers are group-specific even when the children's unique cores are small.
     pub fn worth_descending(&self) -> bool {
