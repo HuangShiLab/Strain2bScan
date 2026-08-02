@@ -24,8 +24,13 @@ while clustering and Layer-2 logic are preserved.
 - **Within-species clustering (CST):** single-linkage at 0.95; exact Jaccard for small panels,
   **MinHash sketches** for large ones (identical partitions on real data, near-linear build).
 - **Layer-2 profiling:** present-cluster detection from unique markers + **absolute** per-tag
-  depth from a zero-inclusive trimmed mean over the unique-marker panel (non-negative Elastic
-  Net solver also included, but not on the main path).
+  depth from a zero-inclusive trimmed mean over the unique-marker panel.
+- **Both of StrainScan's layers ported and selectable** (`--layer1`, `--layer2`): a Cluster
+  Search Tree descent with unique-path pooling, and a joint non-negative ElasticNet over the
+  shared-marker matrix. `--layer1` defaults to **`auto`**, which reads off the database whether
+  a tree can help here at all and says which path it took — the answer is panel-dependent, and
+  on a dense conspecific panel it is *no*. `diagnose-tree` reports the same measurement for a
+  genome directory before any database is built.
 - **Multi-species mode (`multi-profile`):** digest a sample **once**, match all per-species DBs
   in parallel. A Layer-1 **species gate** suppresses absent species, and detection/quantification
   are automatically restricted to markers specific to their species *across the whole panel* —
@@ -90,6 +95,9 @@ strain2bscan evaluate     --pred pred.tsv --truth truth.clusters.tsv --present 0
 # many species at once: one DB per species in a dir; sample digested once, matched in parallel
 strain2bscan multi-profile --dbs species_dbs/ --reads sample.fq --enzyme all --min-species-markers 200
 
+# will a Cluster Search Tree carry any signal on this panel? (answer before profiling)
+strain2bscan diagnose-tree --genomes acnes_genomes/ --enzyme all
+
 # self-contained demos (no data needed)
 strain2bscan demo          # conspecific 70/30 mixture resolved by Layer-2
 strain2bscan cst-demo      # 4 genomes → 2 clusters; marker classes; cluster profiling
@@ -98,6 +106,57 @@ STRAIN2BSCAN_THREADS=8 strain2bscan cluster ...   # control threads (default: al
 ```
 
 `cluster` also writes `<out>.members.tsv` (genome→cluster) for remapping ground truth.
+
+## The two ported layers (`--layer1`, `--layer2`)
+
+StrainScan's resolution framework has two stages, and both are ported here. Each can be
+selected independently, so either can be A/B'd against the flat path on its own.
+
+| flag | values | default |
+|---|---|---|
+| `--layer1` | `auto` \| `unique` \| `cst` | **`auto`** |
+| `--layer2` | `depth` \| `enet` | `depth` |
+
+**Layer-1 — which clusters are present.** `unique` scores each cluster on its own
+cluster-unique markers. `cst` descends the Cluster Search Tree instead, pooling an ancestor's
+group-specific markers into a leaf whose sibling branch was never entered, which lets a leaf
+with too few markers of its own be called at all.
+
+`auto` decides per database, because **whether a tree helps is a property of the panel, not
+of the software.** It descends only if some cluster falls below the support floor — the only
+case pooling can change an outcome — *and* some internal node carries enough markers to pool.
+The decision and both counts are printed on every run:
+
+```
+layer1: cst (auto — 23 cluster(s) below the support floor, 48 informative internal node(s))
+```
+
+On a dense panel the second condition fails: of 542 internal nodes over 543 *C. acnes*
+genomes, 373 carry zero group-specific markers, because clustering at τ already merges
+anything similar enough for a clade to have a distinct core. Run `diagnose-tree` to see this
+for your own panel before committing to a mode.
+
+⚠️ `cst` needs the tree, which lives **only in a database written by `cluster`**. A database
+from `build`, or one written before trees were persisted, has none — `cst` then falls back to
+the flat path silently, and `auto` resolves to `unique`. Rebuild the database after any change
+to how leaf marker sets are formed; a stale one will not error, it will quietly profile
+against the old panels.
+
+**Layer-2 — how much of each.** `depth` is the zero-inclusive trimmed mean over the unique
+markers (see below). `enet` replaces it with a non-negative ElasticNet over the **shared**
+marker design matrix, which can apportion a cluster that has no unique markers at all — one
+whose tag set is contained in a co-present relative's. Layer-1 is blind to those by
+construction, so `enet` is additionally given the contained clusters Layer-1 skipped, not
+merely the ones it called.
+
+`depth` is the default, and on a within-species panel it should stay that way. Measured on
+543 *C. acnes* genomes with identical detections, `enet` scored Bray–Curtis 0.127 against
+`depth`'s 0.035. The cause is collinearity and it is structural rather than a tuning problem:
+each cluster there carries ~33 100 markers of which only 29–115 are unique, so the design
+columns are ~99.7 % identical and the shared rows constrain the *sum* of two near-identical
+clusters while saying almost nothing about the split. Penalising does not help — sweeping
+`--enet-alpha` upward makes it monotonically worse. The few unique markers carry the split
+directly; the many shared ones do not.
 
 ## Abundance: exact definitions
 
@@ -223,8 +282,8 @@ detection) and are orthogonal to within-species strain structure.
 | `enzymes.rs` | type-IIB digestion (all 16 enzymes) + enzyme-set parsing |
 | `markers.rs` | canonical tag → `u64` marker; single-copy filter; (parallel) FASTA/FASTQ digest |
 | `db.rs` | sparse strain×marker DB with unique-marker index |
-| `cst.rs` | within-species clustering (exact + MinHash) and marker classification |
-| `identify.rs` | Layer-2: unique-marker detection + unique-marker-depth abundance (+ NNLS) |
+| `cst.rs` | within-species clustering (exact + MinHash), marker classification, Cluster Search Tree |
+| `identify.rs` | Layer-1 (unique-marker scoring / tree descent) + Layer-2 (unique-marker depth / joint ElasticNet) |
 | `parallel.rs` | dependency-free parallel map (`std::thread::scope`) |
 | `quality.rs` | assembly-quality filter (contig count + tag-count completeness proxy) |
 | `bench.rs` | precision/recall/F1, L1, Bray–Curtis metrics |
