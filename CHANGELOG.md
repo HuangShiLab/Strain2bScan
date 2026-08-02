@@ -2,6 +2,74 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — make Layer-2 reachable, choose Layer-1 from the database
+
+### Fixed — `--layer2 enet` could never reach the case it was written for
+
+The joint fit exists to resolve a cluster whose tag set is contained in a co-present
+relative's: it has no unique markers, so the flat path cannot see it, but the shared rows
+observe `w_A + w_B` while the A-only rows observe `w_A`, and the two together give `w_B`.
+That capability was unreachable from the CLI. `profile()` handed the fit only the clusters
+Layer-1 had already called, and `profile_unique` skips any cluster with an empty unique panel
+(`panel == 0`) — precisely the clusters in question. With one column, `calls.len() > 1` was
+false and the layer did not even run.
+
+The layer's own test passed because it hands `build_l2_design` the candidate list `[0, 1]`
+directly, stepping over the wiring it was meant to exercise. A second test now runs the same
+scenario through `profile()`, which is what the CLI calls.
+
+Two changes make it reachable. `subset_candidates` collects the clusters Layer-1 structurally
+cannot see and offers them to the fit alongside the called ones. And those columns bypass the
+pre-scan: it ranks by *residual markers explained* and consumes the winner's markers, so a
+cluster contained in one already chosen scores zero on the next iteration and can never be
+selected at any threshold — breadth is the wrong instrument for a candidate distinguished by
+depth. The non-negative solve is free to give them zero weight instead.
+
+Admission is deliberately narrow, since a cluster with no unique evidence is one whose every
+supporting read is also a relative's:
+
+- it must have too few unique markers to have been judged on its own, so this can never
+  overturn a Layer-1 rejection made on unambiguous evidence;
+- it must sit inside a **single** called cluster to within fewer markers than the support
+  floor. A *fractional* containment cannot express this on a within-species panel — two
+  conspecific genomes already share well over 95 % of their tags, so a 0.95 threshold is met
+  by ordinary relatedness. Measured here, the fractional form admitted the same spurious
+  cluster in 4 of 5 samples (precision 1.000 → 0.793); the absolute form admits none;
+- the fit must give it at least `MIN_SUBSET_SHARE` of the total depth.
+
+### Changed — `--layer1` defaults to `auto`, decided per database
+
+Whether a Cluster Search Tree helps is a property of the panel, not of the software, so a
+global flag is the wrong shape for it. `auto` reads the answer off the database: descend only
+if some cluster falls below the support floor — the only case pooling can change an outcome —
+**and** some internal node carries enough markers to pool. Both halves are necessary, and on a
+dense panel the second fails: of 542 internal nodes on 543 *C. acnes* genomes, 373 carry zero
+group-specific markers, because clustering at τ already merges anything similar enough for a
+clade to have a distinct core.
+
+The decision and the two counts behind it are printed on every run; an automatically chosen
+algorithm must not be a silent one. `--layer1 unique|cst` still forces either path. A database
+with no tree resolves to `unique`, so nothing changes for databases built by `build`.
+
+### Note — with Layer-2 reachable, it is measurably harmful here
+
+Previously `--layer2 enet` looked inert because detection metrics cannot see it — it never
+changes *which* clusters are called. Scored on abundance accuracy over the clusters both
+agree on, it is not inert but wrong: Bray–Curtis 0.035 → 0.127 and mean absolute relative
+error 0.183 → 0.794 against the default estimator, on identical detections.
+
+The cause is collinearity, and it is structural rather than a tuning problem. On this panel
+each cluster carries ~33 100 markers of which only 29–115 are unique, so the design columns
+are ~99.7 % identical; the shared rows constrain the *sum* of two near-identical clusters and
+say almost nothing about the split. Penalising does not help — sweeping `--enet-alpha` makes
+it monotonically worse (BC 0.127 at 0, 0.145 at 0.001, 0.223 at 0.01, 0.330 at 0.1, 0.360 at
+1.0), which agrees with the earlier finding that 0 is the best setting. The few unique markers
+carry the split directly and the many shared ones do not, so the unique-marker mean wins
+despite using 0.3 % of the data.
+
+`depth` therefore remains the default. The layer is now reachable and honestly measured rather
+than unreachable and assumed fine.
+
 ## [Unreleased] — lower the support floor to 8
 
 ### Changed — `min_support_markers` 10 → 8

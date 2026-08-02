@@ -25,7 +25,8 @@ use strain2bscan::db::StrainDb;
 use strain2bscan::enzymes::{parse_enzyme_set, Enzyme};
 use strain2bscan::fxhash::{FxHashMap, FxHashSet};
 use strain2bscan::identify::{
-    detectable_fraction, naive_profile, profile, Layer1, Layer2, Params, StrainCall,
+    detectable_fraction, naive_profile, profile, resolve_layer1, tree_utility, Layer1, Layer2,
+    Params, StrainCall,
 };
 use strain2bscan::markers::{
     fastx_stem, genome_marker_counts_multi, is_fasta_path, read_fastx, sample_marker_counts_stream,
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--min-consistency F] [--layer1 unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
+                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--min-consistency F] [--layer1 auto|unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95]   (can a Cluster Search Tree work on this panel?)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
@@ -83,10 +84,19 @@ fn main() -> ExitCode {
                  whose sibling branch was never entered -- which lets a leaf with too few markers\n\
                  of its own be called at all. Needs a DB built by `cluster` (the tree is stored\n\
                  there); falls back to the flat path otherwise.\n\
+                 --layer1 defaults to `auto`, which reads the answer off the DB: descend only if\n\
+                 some cluster falls below the support floor (the only case pooling can change an\n\
+                 outcome) AND some internal node carries enough markers to pool. Whether a tree\n\
+                 helps is a property of the panel, not of the software, and on a dense one it\n\
+                 does not -- so the choice belongs per database rather than in a global flag.\n\
+                 The decision and the two counts behind it are printed. Force either path with\n\
+                 --layer1 unique|cst.\n\
                  --layer2 enet replaces the per-cluster mean depth with StrainScan's joint fit:\n\
-                 a residual pre-scan then a non-negative ElasticNet over the SHARED-marker design\n\
-                 matrix, which can apportion a cluster that has no unique markers at all.\n\
-                 Both default to the flat path, so results are unchanged unless asked for.\n\
+                 a non-negative ElasticNet over the SHARED-marker design matrix, which can\n\
+                 apportion a cluster that has no unique markers at all -- one whose tag set is\n\
+                 contained in a co-present relative's. Layer-1 is blind to those by construction,\n\
+                 so enet is also given the contained clusters Layer-1 skipped, not merely the\n\
+                 ones it called; without that the layer cannot reach the case it exists for.\n\
                  --min-global-abundance F drops calls below F of the cross-species composition.\n\
                  It is the only filter that can remove a spurious SPECIES: --min-abundance is\n\
                  within-species, so a species with one cluster always sits at 1.0 there. Use it\n\
@@ -497,9 +507,10 @@ fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
     // `--fixed-gate` turns both adaptations off (backwards compatible); the two halves can
     // also be controlled independently, which is what calibrating a large panel needs.
     match opts.get("layer1").map(String::as_str) {
-        None | Some("unique") => {}
+        None | Some("auto") => {}
+        Some("unique") => p.layer1 = Layer1::Unique,
         Some("cst") => p.layer1 = Layer1::Cst,
-        Some(x) => return Err(format!("bad --layer1 {x} (want unique|cst)")),
+        Some(x) => return Err(format!("bad --layer1 {x} (want auto|unique|cst)")),
     }
     match opts.get("layer2").map(String::as_str) {
         None | Some("depth") => {}
@@ -545,6 +556,20 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     );
 
     let params = parse_params(opts)?;
+    // Never choose a path silently: a run that auto-enabled the tree and one that did not are
+    // different algorithms, and the output has to say which was used.
+    let chosen = resolve_layer1(&db, &params);
+    if params.layer1 == Layer1::Auto {
+        match tree_utility(&db, params.min_support_markers) {
+            Some(u) => println!(
+                "layer1: {} (auto — {} cluster(s) below the support floor, {} informative internal node(s))",
+                if chosen == Layer1::Cst { "cst" } else { "unique" },
+                u.rescuable,
+                u.informative_nodes
+            ),
+            None => println!("layer1: unique (auto — this DB carries no tree)"),
+        }
+    }
     let calls = profile(&db, &counts, &params);
 
     if calls.is_empty() {

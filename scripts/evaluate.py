@@ -4,7 +4,11 @@
 Truth is stated per *genome*; predictions are per *cluster*, so the truth is first
 remapped through the cluster membership sidecar and summed within a cluster. A run is
 scored on presence (precision/recall/F1 at a threshold, plus AUPR over the ranked
-prediction) and on composition (L1, Bray-Curtis over the label union).
+prediction) and on composition, the latter twice: L1/Bray-Curtis over the label union,
+which is the end-to-end score and is dominated by detection, and BC_tp/MARE_tp over the
+clusters both agree on, which isolates abundance accuracy. A change that only touches
+abundance estimation -- Layer-2 -- moves the second pair and nothing else, so reporting
+only the first pair makes it look inert.
 
 AUPR is average precision over the predicted list ranked by abundance: sweep the
 presence threshold down through the predictions and take sum_k (R_k - R_{k-1}) * P_k.
@@ -97,6 +101,13 @@ def remap_truth(truth_genomes, members):
     return dict(out), unmapped
 
 
+def _mean(vals):
+    """Mean over the non-NaN entries — NaN marks a sample with nothing to score, which is
+    not the same as a sample scoring zero and must not be averaged in as one."""
+    v = [x for x in vals if x == x]
+    return sum(v) / len(v) if v else float("nan")
+
+
 def prf(pred, truth, thresh):
     p = {k for k, v in pred.items() if v >= thresh}
     t = set(truth)  # truth entries are all > 0 by construction
@@ -128,6 +139,20 @@ def aupr(pred, truth):
 
 
 def composition(pred, truth):
+    """Abundance error, over the label union AND over the detected set alone.
+
+    Both are needed, and for different questions. The union metrics (l1, bray_curtis) are
+    the honest end-to-end score: a missed cluster contributes its full truth abundance as
+    error, so detection failures show up here. But that also means they are dominated by
+    detection, which makes them useless for judging a change that only touches abundance —
+    Layer-2 never alters *which* clusters are called, so any effect it has is invisible in
+    a metric that detection differences swamp.
+
+    The TP-restricted metrics answer the other question: given the clusters both agree on,
+    how well is the split estimated? Renormalising over that shared set first is what makes
+    the comparison fair — otherwise a run that missed a 30% cluster is scored on a
+    prediction vector that cannot sum to 1 against a truth vector that does.
+    """
     labels = set(pred) | set(truth)
     l1 = num = den = 0.0
     for l in labels:
@@ -135,7 +160,26 @@ def composition(pred, truth):
         l1 += abs(pv - tv)
         num += abs(pv - tv)
         den += pv + tv
-    return dict(l1=l1, bray_curtis=(num / den if den else 0.0))
+    out = dict(l1=l1, bray_curtis=(num / den if den else 0.0))
+
+    shared = sorted(set(pred) & set(truth))
+    if not shared:
+        out.update(l1_tp=float("nan"), bc_tp=float("nan"), mare_tp=float("nan"))
+        return out
+    ps, ts = sum(pred[l] for l in shared), sum(truth[l] for l in shared)
+    l1_tp = num_tp = den_tp = mare = 0.0
+    for l in shared:
+        pv = pred[l] / ps if ps else 0.0
+        tv = truth[l] / ts if ts else 0.0
+        l1_tp += abs(pv - tv)
+        num_tp += abs(pv - tv)
+        den_tp += pv + tv
+        if tv > 0:
+            mare += abs(pv - tv) / tv
+    out.update(l1_tp=l1_tp,
+               bc_tp=(num_tp / den_tp if den_tp else 0.0),
+               mare_tp=mare / len(shared))
+    return out
 
 
 def main():
@@ -197,6 +241,10 @@ def main():
             aupr=sum(r["aupr"] for r in per_sample) / n,
             l1=sum(r["l1"] for r in per_sample) / n,
             bray_curtis=sum(r["bray_curtis"] for r in per_sample) / n,
+            # Abundance-only metrics average over the samples that HAVE a shared label;
+            # a sample where nothing was detected has no abundance error to report.
+            bc_tp=_mean([r["bc_tp"] for r in per_sample]),
+            mare_tp=_mean([r["mare_tp"] for r in per_sample]),
             tp=sum(r["tp"] for r in per_sample),
             fp=sum(r["fp"] for r in per_sample),
             fn=sum(r["fn"] for r in per_sample),
@@ -212,14 +260,16 @@ def main():
     w = 26
     print(f"presence threshold = {args.thresh}   clade calls scored as: {args.clade_mode}\n")
     hdr = (f"{'run':<{w}}{'P':>7}{'R':>7}{'F1':>7}{'AUPR':>8}"
-           f"{'microP':>8}{'microR':>8}{'TP':>5}{'FP':>5}{'FN':>5}{'L1':>8}{'BC':>7}")
+           f"{'microP':>8}{'microR':>8}{'TP':>5}{'FP':>5}{'FN':>5}"
+           f"{'L1':>8}{'BC':>7}{'BC_tp':>8}{'MARE_tp':>9}")
     print(hdr)
     print("-" * len(hdr))
     for run, r in results.items():
         a = r["aggregate"]
         print(f"{run:<{w}}{a['precision']:>7.3f}{a['recall']:>7.3f}{a['f1']:>7.3f}"
               f"{a['aupr']:>8.3f}{a['micro_precision']:>8.3f}{a['micro_recall']:>8.3f}"
-              f"{a['tp']:>5}{a['fp']:>5}{a['fn']:>5}{a['l1']:>8.3f}{a['bray_curtis']:>7.3f}")
+              f"{a['tp']:>5}{a['fp']:>5}{a['fn']:>5}{a['l1']:>8.3f}{a['bray_curtis']:>7.3f}"
+              f"{a['bc_tp']:>8.3f}{a['mare_tp']:>9.3f}")
 
     print("\nper-sample detail")
     for run, r in results.items():

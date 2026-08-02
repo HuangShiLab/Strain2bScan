@@ -72,8 +72,9 @@ const TRIM_FRACTION: usize = 100;
 /// Which Layer-1 (presence detection) to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer1 {
-    /// Score each cluster independently on its own cluster-unique markers (the default, and
-    /// what every benchmark in this repo was measured with).
+    /// Let the database decide — see [`tree_utility`]. The default.
+    Auto,
+    /// Score each cluster independently on its own cluster-unique markers.
     Unique,
     /// Descend the Cluster Search Tree, pooling ancestor markers along the unique path
     /// ([`descend_tree`]). Requires a database built by `cluster` with the tree persisted.
@@ -173,7 +174,7 @@ impl Default for Params {
             min_consistency: 0.5,
             adaptive_singleton: true,
             adaptive_floor: true,
-            layer1: Layer1::Unique,
+            layer1: Layer1::Auto,
             layer2: Layer2::Depth,
             enet_alpha: 0.0,
             enet_l1_ratio: 0.5,
@@ -393,8 +394,8 @@ pub fn filter_by_abundance(calls: &mut Vec<StrainCall>, min_rel: f64) {
 pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCall> {
     // Layer-1 selects the candidate clusters; Layer-2 quantifies them. The two are independent
     // so each can be A/B'd against the flat path on its own.
-    let mut calls: Vec<StrainCall> = match p.layer1 {
-        Layer1::Unique => profile_unique(db, counts, p),
+    let mut calls: Vec<StrainCall> = match resolve_layer1(db, p) {
+        Layer1::Auto | Layer1::Unique => profile_unique(db, counts, p),
         Layer1::Cst => match &db.tree {
             Some(tree) => descend_tree(tree, counts, p)
                 .into_iter()
@@ -433,22 +434,71 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
         },
     };
 
-    if p.layer2 == Layer2::Enet && calls.len() > 1 {
-        let idx: Vec<usize> = calls.iter().map(|c| c.strain_index).collect();
-        let design = build_l2_design(db, &idx, counts);
-        let selected = pre_scan(&design, 15, p.min_support_markers);
-        if !selected.is_empty() {
-            let w = l2_abundance(&design, &selected, p.enet_alpha, p.enet_l1_ratio);
-            // Clusters the pre-scan dropped explained nothing beyond what the winners already
-            // account for; keep only the selected ones, at their fitted depths.
-            let keep: crate::fxhash::FxHashMap<usize, f64> = selected
-                .iter()
-                .zip(w.iter())
-                .map(|(&col, &depth)| (design.clusters[col], depth))
-                .collect();
-            calls.retain(|c| keep.contains_key(&c.strain_index));
-            for c in calls.iter_mut() {
-                c.depth = keep[&c.strain_index];
+    if p.layer2 == Layer2::Enet {
+        let called: Vec<usize> = calls.iter().map(|c| c.strain_index).collect();
+        // Feed the joint fit the clusters Layer-1 structurally CANNOT see, not just the ones
+        // it already called. Without this the whole layer is unreachable: its candidates came
+        // from Layer-1, which skips any cluster with an empty unique panel — exactly the
+        // clusters the shared-marker matrix exists to resolve. See [`subset_candidates`].
+        let extra = subset_candidates(db, counts, &called, p);
+        let idx: Vec<usize> = called.iter().chain(extra.iter()).copied().collect();
+        if idx.len() > 1 {
+            let design = build_l2_design(db, &idx, counts);
+            let mut selected = pre_scan(&design, 15, p.min_support_markers);
+            // The pre-scan cannot select a subset candidate, and must not be asked to. It ranks
+            // columns by how many *residual* markers they explain — breadth — and consumes the
+            // winner's markers unconditionally. A cluster contained in one already chosen adds
+            // no new markers by definition, so its residual score is 0 on the very next
+            // iteration and it can never be picked, at any threshold. What distinguishes it is
+            // not breadth but DEPTH: the rows it shares with its superset read `w_A + w_B`
+            // while the superset-only rows read `w_A`, and that gap is invisible to a
+            // marker-counting heuristic. So these columns bypass the pre-scan and go straight
+            // into the fit, where the non-negative solve is free to give them zero weight if
+            // the depths do not in fact call for them — which is the test that suits them.
+            for col in called.len()..idx.len() {
+                if !selected.contains(&col) {
+                    selected.push(col);
+                }
+            }
+            if !selected.is_empty() {
+                let w = l2_abundance(&design, &selected, p.enet_alpha, p.enet_l1_ratio);
+                let total: f64 = w.iter().sum();
+                let fitted: crate::fxhash::FxHashMap<usize, f64> = selected
+                    .iter()
+                    .zip(w.iter())
+                    .map(|(&col, &depth)| (design.clusters[col], depth))
+                    .collect();
+                // Clusters the pre-scan dropped explained nothing beyond what the winners
+                // already account for; keep only the selected ones, at their fitted depths.
+                calls.retain(|c| fitted.contains_key(&c.strain_index));
+                for c in calls.iter_mut() {
+                    c.depth = fitted[&c.strain_index];
+                }
+                // Admit a subset candidate only if the fit gives it real mass. It has no
+                // unique evidence of its own by construction, so every marker supporting it is
+                // also a co-present relative's — the fitted weight is the ONLY thing
+                // distinguishing "genuinely there" from "the relative's reads". A relative
+                // floor, because the absolute scale is the sample's depth.
+                for &j in &extra {
+                    let Some(&depth) = fitted.get(&j) else { continue };
+                    if total <= 0.0 || depth / total < MIN_SUBSET_SHARE {
+                        continue;
+                    }
+                    let ms: Vec<Marker> = db.strain_markers[j].iter().copied().collect();
+                    let (panel, detected, _) = set_evidence(&ms, counts);
+                    if panel == 0 {
+                        continue;
+                    }
+                    calls.push(StrainCall {
+                        strain_index: j,
+                        name: db.strain_names[j].clone(),
+                        support: detected as f64,
+                        coverage: detected as f64 / panel as f64,
+                        depth,
+                        n_markers: panel,
+                        rel_abundance: 0.0,
+                    });
+                }
             }
         }
     }
@@ -917,6 +967,67 @@ mod tests {
         assert!((w[1] - 5.0).abs() < 0.05, "w_B = {} should be 5", w[1]);
     }
 
+    /// The same case as above, but through `profile()` — which is what the CLI actually calls.
+    ///
+    /// This is the test that was missing. `joint_fit_recovers_a_subset_cluster_the_flat_path_
+    /// cannot_see` hands `build_l2_design` the candidate list `[0, 1]` directly, so it proves
+    /// the maths while stepping over the wiring. Through `profile()` the list was always just
+    /// the clusters Layer-1 called, and Layer-1 skips an empty unique panel, so B never
+    /// reached the fit and `--layer2 enet` could not do the one thing it exists for.
+    #[test]
+    fn enet_reaches_the_subset_cluster_through_profile() {
+        let a: Vec<Marker> = (10_000..11_000).collect();
+        let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
+        let db = StrainDb::build(vec![("A".into(), a.clone()), ("B_subset".into(), b.clone())]);
+        assert_eq!(db.unique_marker_count(1), 0, "B has no unique markers by construction");
+
+        let mut counts = MarkerCounts::default();
+        for &m in &a {
+            counts.insert(m, if b.contains(&m) { 15 } else { 10 });
+        }
+
+        let flat = Params { min_rel_abundance: 0.0, layer1: Layer1::Unique, ..Params::default() };
+        let got: Vec<String> =
+            profile(&db, &counts, &flat).iter().map(|c| c.name.clone()).collect();
+        assert_eq!(got, vec!["A".to_string()], "flat path still cannot see the subset cluster");
+
+        let enet = Params { layer2: Layer2::Enet, ..flat };
+        let calls = profile(&db, &counts, &enet);
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"B_subset"),
+            "enet must now reach the subset cluster through profile(), got {names:?}"
+        );
+        // w_A = 10, w_B = 5 -> B is a third of the fitted total.
+        let b_call = calls.iter().find(|c| c.name == "B_subset").unwrap();
+        assert!(
+            (b_call.rel_abundance - 1.0 / 3.0).abs() < 0.05,
+            "B should be ~1/3 of the composition, got {}",
+            b_call.rel_abundance
+        );
+    }
+
+    /// A cluster with no unique markers that is NOT contained in what was called must stay out:
+    /// its own distinguishing markers went unobserved, and that is evidence of absence rather
+    /// than ambiguity for the fit to resolve.
+    #[test]
+    fn subset_candidates_reject_an_uncontained_cluster() {
+        let a: Vec<Marker> = (10_000..11_000).collect();
+        let mut c: Vec<Marker> = (10_000..10_400).collect();
+        c.extend(90_000..90_600); // 60% of C lies outside A
+        let db = StrainDb::build(vec![("A".into(), a.clone()), ("C".into(), c)]);
+
+        let mut counts = MarkerCounts::default();
+        for &m in &a {
+            counts.insert(m, 10);
+        }
+        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        assert!(
+            subset_candidates(&db, &counts, &[0], &p).is_empty(),
+            "a cluster with unobserved markers of its own is not a subset candidate"
+        );
+    }
+
     /// The pre-scan must consume the winner's markers so a near-duplicate cluster is not selected
     /// on the same evidence. With unique-only markers this loop is a no-op — the sets are
     /// disjoint, so consuming one leaves the others untouched — which is why it only becomes
@@ -1266,6 +1377,55 @@ pub const MIN_NODE_MARKERS: usize = 30;
 /// costs a false positive less.
 pub const MAX_FALLBACK_CLADE: usize = 8;
 
+/// What the tree stored in a database can actually do for it.
+///
+/// Both numbers are read off the database, so the question `diagnose-tree` answers by hand
+/// before a run is answered automatically at profile time instead.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeUtility {
+    /// Clusters whose own unique markers fall below the support floor. The flat path cannot
+    /// call these at all, so they are the ONLY clusters an ancestor's pooled markers can
+    /// rescue — if this is zero the descent reaches exactly the leaves the flat path does.
+    pub rescuable: usize,
+    /// Internal nodes carrying enough markers to be tested, i.e. to have anything to pool.
+    pub informative_nodes: usize,
+}
+
+impl TreeUtility {
+    /// Whether the tree is worth descending. Both halves are necessary: something to rescue,
+    /// and an ancestor with markers to rescue it with. On a dense panel the second fails —
+    /// measured on 543 *C. acnes* genomes, 373 of 542 internal nodes carry zero
+    /// group-specific markers, because clustering at tau already merges anything similar
+    /// enough for a clade to have a distinct core.
+    pub fn worth_descending(&self) -> bool {
+        self.rescuable > 0 && self.informative_nodes > 0
+    }
+}
+
+/// Measure what the stored tree can do. `None` when the database carries no tree (built by
+/// `build` rather than `cluster`, or written before trees were persisted).
+pub fn tree_utility(db: &StrainDb, support_floor: usize) -> Option<TreeUtility> {
+    let tree = db.tree.as_ref()?;
+    let rescuable = (0..db.n_strains())
+        .filter(|&j| db.unique_marker_count(j) < support_floor)
+        .count();
+    let informative_nodes = (0..tree.n_nodes())
+        .filter(|&v| !tree.is_leaf(v) && tree.node_markers[v].len() >= MIN_NODE_MARKERS)
+        .count();
+    Some(TreeUtility { rescuable, informative_nodes })
+}
+
+/// Resolve [`Layer1::Auto`] against the database. Explicit choices pass through untouched.
+pub fn resolve_layer1(db: &StrainDb, p: &Params) -> Layer1 {
+    match p.layer1 {
+        Layer1::Auto => match tree_utility(db, p.min_support_markers) {
+            Some(u) if u.worth_descending() => Layer1::Cst,
+            _ => Layer1::Unique,
+        },
+        explicit => explicit,
+    }
+}
+
 /// One leaf accepted by the tree descent.
 #[derive(Debug, Clone)]
 pub struct TreeCall {
@@ -1578,6 +1738,101 @@ impl L2Design {
 /// the only thing constraining the sum: with A ⊃ B, the markers they share observe `w_A + w_B`
 /// and the ones only A carries observe `w_A`, and it takes both to recover `w_B`. Dropping them
 /// would break exactly the case this matrix exists for.
+/// Minimum share of the total fitted depth for a cluster with **no unique evidence** to be
+/// reported. Its every marker is also a co-present relative's, so the fitted weight is the only
+/// thing separating "genuinely present" from "the relative's reads leaking in"; a trace weight
+/// is the latter. Relative, because the absolute scale is the sample's depth.
+pub const MIN_SUBSET_SHARE: f64 = 0.02;
+
+/// Clusters that Layer-1 **structurally cannot see**, but that the shared-marker fit can resolve.
+///
+/// This function is what makes Layer-2 reachable at all. `profile_unique` skips any cluster
+/// whose unique panel is empty (`panel == 0`), and the tree descent skips it too — so the one
+/// case the joint fit was built for, a cluster whose markers are a subset of a co-present
+/// relative's, never reached it. The layer's own test proves the maths by handing
+/// `build_l2_design` the candidate list `[A, B]` directly; through `profile()` the list was
+/// always just `[A]`, and with a single column the fit does not even run. The algorithm was
+/// correct and unreachable.
+///
+/// Three conditions, and the first two are what keep this from becoming a way to override
+/// Layer-1:
+///
+/// 1. **Not already called**, and **too few unique markers to have been judged on its own**.
+///    A cluster with a usable unique panel that Layer-1 turned down was rejected on
+///    *unambiguous* evidence — its own markers, carried by nobody else. Re-admitting it here on
+///    *ambiguous* evidence would be second-guessing the stronger test with the weaker one. Only
+///    clusters the flat path was blind to are eligible.
+/// 2. **Contained in a single called cluster**, to within fewer markers than the support
+///    floor. That is the decomposable case: every row supporting it is a row its anchor also
+///    explains, so the fit has to apportion, and the anchor's extra markers are what pin
+///    `w_A` and let the shared rows give up `w_B`. A candidate with markers of its own that
+///    went unobserved is not ambiguous — it is absent.
+/// 3. **Actually observed** at the usual breadth floor, so a candidate with no reads behind it
+///    never enters the matrix.
+pub fn subset_candidates(
+    db: &StrainDb,
+    counts: &MarkerCounts,
+    called: &[usize],
+    p: &Params,
+) -> Vec<usize> {
+    if called.is_empty() {
+        return Vec::new();
+    }
+    let is_called = |j: usize| called.contains(&j);
+
+    let mut out = Vec::new();
+    for j in 0..db.n_strains() {
+        if is_called(j) || db.unique_marker_count(j) >= p.min_support_markers {
+            continue;
+        }
+        let ms = &db.strain_markers[j];
+        if ms.is_empty() {
+            continue;
+        }
+        // Containment must be against ONE called cluster, not the union of them.
+        //
+        // Union containment sounds equivalent and is not: on a dense within-species panel
+        // every cluster shares the species core with every other, so the union of two or
+        // three called clusters already covers almost any cluster in the database and the
+        // test admits nearly everything. Measured on 543 C. acnes genomes, the union form
+        // admitted the same spurious cluster in 4 of 5 samples. The case this layer exists
+        // for is a cluster contained in a *single* co-present relative — that is the
+        // relationship the design matrix can decompose, because the relative's own extra
+        // markers are what pin `w_A` and let the shared rows give up `w_B`. Spread the
+        // containment over several clusters and no such anchor exists.
+        // The test is ABSOLUTE, on the markers the candidate holds that its anchor does not.
+        //
+        // A fractional containment cannot express "subset" on a within-species panel: two
+        // conspecific genomes already share well over 95% of their tags, so a 0.95 threshold
+        // is satisfied by ordinary relatedness and admits nearly every low-unique cluster in
+        // the database — measured here, it admitted the same spurious cluster in 4 of 5
+        // samples. What matters is not the ratio but the count: 5% of a 33 000-tag set is
+        // 1 650 markers the candidate carries and the anchor lacks, and if those went
+        // unobserved that is evidence of absence, not ambiguity for the fit to resolve.
+        // Requiring fewer such markers than the support floor says the candidate has no
+        // testable evidence of its own — which is precisely when the joint fit is the only
+        // instrument left, and the only situation in which it should be trusted.
+        let outside = called
+            .iter()
+            .map(|&k| {
+                let other = &db.strain_markers[k];
+                ms.iter().filter(|m| !other.contains(m)).count()
+            })
+            .min()
+            .unwrap_or(usize::MAX);
+        if outside >= p.min_support_markers {
+            continue;
+        }
+        let v: Vec<Marker> = ms.iter().copied().collect();
+        let (panel, detected, _) = set_evidence(&v, counts);
+        if panel == 0 || (detected as f64 / panel as f64) < p.min_coverage {
+            continue;
+        }
+        out.push(j);
+    }
+    out
+}
+
 pub fn build_l2_design(db: &StrainDb, candidates: &[usize], counts: &MarkerCounts) -> L2Design {
     let mut markers: Vec<Marker> = Vec::new();
     let mut seen: crate::fxhash::FxHashSet<Marker> = crate::fxhash::FxHashSet::default();
