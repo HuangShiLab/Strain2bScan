@@ -1340,6 +1340,97 @@ mod tests {
         );
     }
 
+    /// The `auto` rule's truth table, exhaustively. It is a pure function of three counts, and
+    /// it decides which ALGORITHM runs — the highest-leverage branch in the profiler — so it is
+    /// worth pinning outright rather than inferring from end-to-end runs.
+    ///
+    /// The two disjuncts encode the two distinct ways a tree can change an outcome:
+    ///   - pooling rescues a cluster whose own unique markers fall below the support floor,
+    ///     which needs both something to rescue AND an ancestor with markers to lend; and
+    ///   - a clade fallback catches a strain sitting between two informative children, which
+    ///     needs neither of those.
+    #[test]
+    fn auto_descends_only_when_the_tree_can_change_an_outcome() {
+        let u = |rescuable, informative_nodes, fallback_nodes| TreeUtility {
+            rescuable,
+            informative_nodes,
+            fallback_nodes,
+        };
+        // Pooling: needs a cluster to rescue *and* an ancestor able to lend.
+        assert!(u(1, 1, 0).worth_descending());
+        assert!(!u(1, 0, 0).worth_descending(), "nothing to pool from");
+        assert!(!u(0, 1, 0).worth_descending(), "nothing to rescue");
+        // Clade fallback stands on its own — this is the case the rule originally missed, and
+        // it is why the flat path lost whole species that the tree recovered.
+        assert!(u(0, 0, 1).worth_descending());
+        assert!(u(0, 5, 2).worth_descending());
+        // Nothing at all.
+        assert!(!u(0, 0, 0).worth_descending());
+    }
+
+    /// A database with no tree must resolve to the flat path, not to nothing. Databases written
+    /// by `build`, or before trees were persisted, carry no tree at all.
+    #[test]
+    fn auto_falls_back_to_unique_without_a_tree() {
+        let db = StrainDb::build(vec![
+            ("A".into(), (0..500).collect::<Vec<Marker>>()),
+            ("B".into(), (500..1000).collect::<Vec<Marker>>()),
+        ]);
+        assert!(db.tree.is_none());
+        assert!(tree_utility(&db, 8).is_none());
+        assert_eq!(resolve_layer1(&db, &Params::default()), Layer1::Unique);
+    }
+
+    /// An explicit `--layer1` must survive untouched: `auto` is a default, not an override.
+    #[test]
+    fn explicit_layer1_is_not_second_guessed_by_auto() {
+        let db = StrainDb::build(vec![("A".into(), (0..500).collect::<Vec<Marker>>())]);
+        for want in [Layer1::Unique, Layer1::Cst] {
+            let p = Params { layer1: want, ..Params::default() };
+            assert_eq!(resolve_layer1(&db, &p), want);
+        }
+    }
+
+    /// `rescuable` counts clusters against the support floor it is given, and reads the same
+    /// marker set the descent will score on. Getting this wrong in either direction silently
+    /// mis-routes every sample.
+    #[test]
+    fn tree_utility_counts_rescuable_against_the_support_floor() {
+        use crate::cst::{SpeciesCst, DEFAULT_SIMILARITY};
+        let core: Vec<Marker> = (0..200).collect();
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = (0..4u64)
+            .map(|i| {
+                let mut v = core.clone();
+                // g0 gets 3 private markers, the rest get 100 — so exactly one cluster sits
+                // below a floor between 4 and 100.
+                let n = if i == 0 { 3 } else { 100 };
+                v.extend(1000 + i * 1000..1000 + i * 1000 + n);
+                (format!("g{i}"), v.clone(), v)
+            })
+            .collect();
+        let cst = SpeciesCst::build(genomes, DEFAULT_SIMILARITY, false);
+        let mut db = cst.cluster_db();
+        db.tree = Some(cst.build_tree());
+
+        // Unique-marker counts are 3 (g0) and 100 (g1..g3), one cluster each.
+        assert_eq!(db.n_strains(), 4, "each genome should form its own cluster");
+        assert_eq!(
+            tree_utility(&db, 2).expect("tree present").rescuable,
+            0,
+            "every cluster clears a floor of 2"
+        );
+        assert_eq!(
+            tree_utility(&db, 4).unwrap().rescuable,
+            1,
+            "only g0's cluster (3 unique markers) is below a floor of 4"
+        );
+        assert_eq!(
+            tree_utility(&db, 101).unwrap().rescuable,
+            4,
+            "every cluster is below a floor of 101"
+        );
+    }
+
     #[test]
     fn nnls_recovers_known_coefficients() {
         let cols = vec![vec![1.0, 0.0, 1.0, 2.0], vec![0.0, 1.0, 1.0, 1.0]];

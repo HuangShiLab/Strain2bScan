@@ -542,6 +542,72 @@ mod tests {
         // ...but the species-core marker is shared across both clusters.
         assert!(!db.is_unique(0));
     }
+
+    /// A LEAF's marker set is the UNION of its members', not the intersection.
+    ///
+    /// This has to be pinned rather than left to review, because it has already been broken
+    /// once: the carrier-set rewrite of `build_tree` originally derived every node the same
+    /// way, which silently reimposes the intersection at the leaves. Nothing in the suite
+    /// caught it — reverting the union and re-running left all tests green — so the semantics
+    /// were resting entirely on someone noticing.
+    ///
+    /// It matters because `cluster_db` gives a cluster the union of its members' markers. A
+    /// tree scoring the same cluster on the intersection is a *weaker* competitor to the flat
+    /// path rather than an extension of it, and for a cluster whose members disagree enough
+    /// the intersection empties out and the cluster becomes uncallable at any threshold —
+    /// measured on real data, a 5-genome C. acnes cluster went from 115 markers to 0.
+    #[test]
+    fn leaf_marker_set_is_the_union_of_its_members_not_the_intersection() {
+        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY, false);
+        let tree = cst.build_tree();
+
+        // g0 and g1 are one cluster; marker 1000 is private to g0 and held by no other genome.
+        // Union keeps it (some member carries it, nobody outside does); intersection drops it
+        // (g1 does not carry it).
+        let leaf = cst.genome_cluster[0];
+        assert_eq!(cst.genome_cluster[1], leaf, "g0 and g1 must share a cluster");
+        assert!(
+            tree.node_markers[leaf].contains(&1000),
+            "leaf lost g0's private marker — the intersection has been reimposed at the leaves"
+        );
+        assert!(
+            tree.node_markers[leaf].contains(&1100),
+            "leaf lost g1's private marker"
+        );
+        // The cluster-shared marker is in the union too, so a passing test cannot be explained
+        // by the leaf simply holding everything.
+        assert!(tree.node_markers[leaf].contains(&200));
+        // A marker belonging to the OTHER cluster must not leak in: the leaf is still
+        // "minus everything outside".
+        assert!(!tree.node_markers[leaf].contains(&300));
+        // Nor the species core, which every genome carries.
+        assert!(!tree.node_markers[leaf].contains(&0));
+    }
+
+    /// An INTERNAL node keeps the intersection — a marker is diagnostic of a clade only if
+    /// every genome beneath it carries the marker. This is the other half of the leaf/internal
+    /// split, and pinning only the leaf half would let a rewrite unify them in the other
+    /// direction.
+    #[test]
+    fn internal_node_marker_set_is_the_intersection_minus_everything_outside() {
+        let cst = SpeciesCst::build(two_cluster_species(), DEFAULT_SIMILARITY, false);
+        let tree = cst.build_tree();
+        let leaf_a = cst.genome_cluster[0];
+
+        // The parent of the g0/g1 leaf spans both clusters here (2 clusters -> the root).
+        let parent = tree.parent[leaf_a].expect("leaf must have a parent");
+        assert!(
+            !tree.node_markers[parent].contains(&1000),
+            "internal node took a marker only one descendant carries — intersection violated"
+        );
+        assert!(
+            !tree.node_markers[parent].contains(&200),
+            "internal node took a marker only one child cluster carries"
+        );
+        // Its own genomes are every genome, so "minus everything outside" removes nothing and
+        // the species core survives as the clade's diagnostic set.
+        assert!(tree.node_markers[parent].contains(&0));
+    }
 }
 
 // ===== Hierarchy feasibility diagnostic ====================================
@@ -730,18 +796,36 @@ impl SpeciesCst {
         // similarity to any other is the max of its two children's, so the matrix updates in
         // O(L) per merge — no need to re-derive max-linkage from the member genomes every round,
         // which is what made the build scale as ~O(n^3.6): 0.01 s at 24 genomes but 0.12 s at 48.
+        //
+        // Filling it is the dominant cost of the whole build on a large panel: it is every
+        // genome pair, n(n-1)/2 of them, each an exact Jaccard over tens of thousands of tags,
+        // and the merge loop that follows only touches an L x L array of scalars. Measured on
+        // 543 genomes, `cluster` spends ~23 s digesting and ~17 s here and in clustering, while
+        // dropping from 419 leaves to 61 moves the total by ~3 s — so the row count is not what
+        // costs, the pairwise scan is. Rows are independent, so map over them.
+        let rows: Vec<usize> = (0..n_leaves).collect();
+        let upper: Vec<Vec<f64>> = par_map(&rows, |&i| {
+            (0..n_leaves)
+                .map(|j| {
+                    if j <= i {
+                        return f64::NEG_INFINITY;
+                    }
+                    let mut best = f64::NEG_INFINITY;
+                    for &x in &self.clusters[i] {
+                        for &y in &self.clusters[j] {
+                            best =
+                                best.max(jaccard(&self.genome_markers[x], &self.genome_markers[y]));
+                        }
+                    }
+                    best
+                })
+                .collect()
+        });
         let mut sim = vec![vec![f64::NEG_INFINITY; n_leaves]; n_leaves];
         for i in 0..n_leaves {
             for j in (i + 1)..n_leaves {
-                let mut best = f64::NEG_INFINITY;
-                for &x in &self.clusters[i] {
-                    for &y in &self.clusters[j] {
-                        best = best.max(jaccard(&self.genome_markers[x], &self.genome_markers[y]));
-                    }
-                }
-                let (lo, hi) = sim.split_at_mut(j);
-                lo[i][j] = best;
-                hi[0][i] = best;
+                sim[i][j] = upper[i][j];
+                sim[j][i] = upper[i][j];
             }
         }
         // A merged node reuses its left child's row.

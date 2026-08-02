@@ -2,6 +2,52 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — pin the tree's marker semantics, correct the measured speedup
+
+### Added — tests for the two semantics that had none
+
+**Leaf marker sets are the union of their members', not the intersection.** This had already
+been broken once: the carrier-set rewrite of `build_tree` originally derived every node the
+same way, which silently reimposes the intersection at the leaves, and it was caught by review
+rather than by the suite. Confirmed the gap directly — reverting the union and re-running left
+all 55 tests green. It matters because `cluster_db` gives a cluster the *union* of its
+members' markers, so a tree scoring the same cluster on the intersection is a weaker
+competitor to the flat path rather than an extension of it; on real data a 5-genome
+*C. acnes* cluster went from 115 markers to 0 and became uncallable at any threshold. Both
+halves of the leaf/internal split are now pinned, and the new test fails against the
+reintroduced bug.
+
+**The `auto` rule.** It decides which algorithm runs — the highest-leverage branch in the
+profiler — and was verified only end to end. `worth_descending` now has its truth table
+asserted outright, including the case the rule originally missed (a clade fallback justifies
+descending on its own, with nothing to pool and nothing to rescue), plus a treeless database
+resolving to `unique`, an explicit `--layer1` surviving untouched, and `rescuable` counting
+against the floor it is given.
+
+### Changed — the tree's similarity matrix is built in parallel
+
+Filling it is the dominant cost of a large build: every genome pair, n(n−1)/2 of them, each an
+exact Jaccard over tens of thousands of tags, while the merge loop that follows only touches an
+L×L array of scalars. On 543 genomes `cluster` spends ~23 s digesting and ~17 s in clustering
+and the tree, and dropping from 419 leaves to 61 moves the total by ~3 s — so the row count is
+not what costs, the pairwise scan is. Rows are independent, so they map over the existing
+thread pool. Output is unchanged and deterministic: identical tree sections node for node
+against the serial build on the 543-genome panel, across repeat runs.
+
+Measured interleaved, three runs each on one machine: **71.4 s → 58.4 s** (65.2/73.1/75.9 vs
+53.2/61.6/60.3).
+
+### Fixed — the speedup claimed for the carrier-set rewrite was ~100x too large
+
+`b0f5dc1` reports that the rewrite "extrapolates to ~1.5 s rather than ~6 minutes on a
+500-genome panel". Measured on 543 genomes, two runs each: **45.5 s before, 40.8 s after** —
+about 10% of the total build, not 240x. The exponent was fitted on 24–96 genome panels, where
+the tree is a large share of a small total, and projected 5–10x beyond that range; at 543
+genomes digestion alone is ~23 s and dominates. The rewrite is still worth keeping — it is
+correct (verified node for node at n=543, past the MinHash threshold and 5.6x beyond the
+largest panel it was originally checked on) and it does remove real work — but the figure
+should not be quoted.
+
 ## [Unreleased] — the tree descent was bypassing the cross-species filter
 
 ### Fixed — `--layer1 cst` scored unfiltered markers under `multi-profile`
