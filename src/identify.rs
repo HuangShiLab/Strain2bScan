@@ -1379,7 +1379,7 @@ pub const MAX_FALLBACK_CLADE: usize = 8;
 
 /// What the tree stored in a database can actually do for it.
 ///
-/// Both numbers are read off the database, so the question `diagnose-tree` answers by hand
+/// All numbers are read off the database, so the question `diagnose-tree` answers by hand
 /// before a run is answered automatically at profile time instead.
 #[derive(Debug, Clone, Copy)]
 pub struct TreeUtility {
@@ -1389,16 +1389,21 @@ pub struct TreeUtility {
     pub rescuable: usize,
     /// Internal nodes carrying enough markers to be tested, i.e. to have anything to pool.
     pub informative_nodes: usize,
+    /// Internal nodes where both children are themselves informative. These are the only
+    /// nodes that can produce a clade fallback call: a strain sitting between the two child
+    /// branches carries the parent's group-specific markers but too few of either child's.
+    pub fallback_nodes: usize,
 }
 
 impl TreeUtility {
-    /// Whether the tree is worth descending. Both halves are necessary: something to rescue,
-    /// and an ancestor with markers to rescue it with. On a dense panel the second fails —
-    /// measured on 543 *C. acnes* genomes, 373 of 542 internal nodes carry zero
-    /// group-specific markers, because clustering at tau already merges anything similar
-    /// enough for a clade to have a distinct core.
+    /// Whether the tree is worth descending. Two independent reasons:
+    /// 1. Unique-path pooling can rescue clusters with too few unique markers of their own.
+    /// 2. A clade fallback can resolve an intermediate strain when both child branches are
+    ///    informative enough to be tested but neither fires on its own.
+    /// On a dense panel the informative-node count can fail while fallback still helps, because
+    /// the parent's markers are group-specific even when the children's unique cores are small.
     pub fn worth_descending(&self) -> bool {
-        self.rescuable > 0 && self.informative_nodes > 0
+        (self.rescuable > 0 && self.informative_nodes > 0) || self.fallback_nodes > 0
     }
 }
 
@@ -1413,17 +1418,28 @@ pub fn tree_utility(db: &StrainDb, support_floor: usize) -> Option<TreeUtility> 
     // database carries a cross-species mask, and a node whose markers are mostly shared with a
     // congener has far less usable evidence than its raw set suggests — deciding on the raw
     // count would enable the tree on nodes that cannot actually be tested.
+    let informative = |v: usize| {
+        tree.node_markers[v]
+            .iter()
+            .filter(|&&m| db.is_quantifiable(m))
+            .count()
+            >= MIN_NODE_MARKERS
+    };
     let informative_nodes = (0..tree.n_nodes())
+        .filter(|&v| !tree.is_leaf(v) && informative(v))
+        .count();
+    let fallback_nodes = (0..tree.n_nodes())
         .filter(|&v| {
             !tree.is_leaf(v)
-                && tree.node_markers[v]
-                    .iter()
-                    .filter(|&&m| db.is_quantifiable(m))
-                    .count()
-                    >= MIN_NODE_MARKERS
+                && informative(v)
+                && tree.children[v].is_some_and(|(a, b)| informative(a) && informative(b))
         })
         .count();
-    Some(TreeUtility { rescuable, informative_nodes })
+    Some(TreeUtility {
+        rescuable,
+        informative_nodes,
+        fallback_nodes,
+    })
 }
 
 /// Resolve [`Layer1::Auto`] against the database. Explicit choices pass through untouched.

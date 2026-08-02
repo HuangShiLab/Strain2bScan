@@ -562,10 +562,11 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     if params.layer1 == Layer1::Auto {
         match tree_utility(&db, params.min_support_markers) {
             Some(u) => println!(
-                "layer1: {} (auto — {} cluster(s) below the support floor, {} informative internal node(s))",
+                "layer1: {} (auto — {} cluster(s) below the support floor, {} informative internal node(s), {} fallback node(s))",
                 if chosen == Layer1::Cst { "cst" } else { "unique" },
                 u.rescuable,
-                u.informative_nodes
+                u.informative_nodes,
+                u.fallback_nodes
             ),
             None => println!("layer1: unique (auto — this DB carries no tree)"),
         }
@@ -985,11 +986,12 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
                 if params.layer1 == Layer1::Auto {
                     match r.tree {
                         Some(u) => println!(
-                            "  {}\tlayer1={} (auto — {} cluster(s) below the support floor, {} informative internal node(s))",
+                            "  {}\tlayer1={} (auto — {} cluster(s) below the support floor, {} informative internal node(s), {} fallback node(s))",
                             r.species,
                             if r.layer1 == Layer1::Cst { "cst" } else { "unique" },
                             u.rescuable,
-                            u.informative_nodes
+                            u.informative_nodes,
+                            u.fallback_nodes
                         ),
                         None => println!(
                             "  {}\tlayer1=unique (auto — this DB carries no tree)",
