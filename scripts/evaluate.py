@@ -1,8 +1,27 @@
 #!/usr/bin/env python3
-"""Score strain2bscan predictions against the MockMetagenomes4Benchmark ground truth.
+"""Score strain2bscan predictions against a ground truth.
 
-Truth is stated per *genome*; predictions are per *cluster*, so the truth is first
-remapped through the cluster membership sidecar and summed within a cluster. A run is
+Two truth layouts and two prediction layouts, in any combination:
+
+  --truth-format wide   MockMetagenomes4Benchmark's genome x sample matrix. Truth is per
+                        *genome*, so it is remapped through the cluster membership sidecar
+                        (--members) and summed within a cluster.
+  --truth-format long   one file per sample, carrying its own cluster column. Single-species
+                        files are keyed by cluster; multi-species files (a `species` column)
+                        by species+cluster.
+
+  --pred-format profile        `#cluster abundance ...`
+  --pred-format multi-profile  `#species cluster abundance ... global_abundance ...`
+
+`--abundance-col` must match how the truth is normalised, and nothing will warn you if it
+does not: detection metrics are identical either way. On a three-cluster check where the
+truth is community-scope, scoring the within-species column instead left precision, recall
+and F1 at 1.000 while Bray-Curtis went from 0.010 to 0.333. Single-species sim truth sums to
+1 WITHIN a species -> `abundance`; multi-species sim truth sums to 1 across the community ->
+`global_abundance`; a truth stated as DNA/sequence mass rather than cell counts ->
+`sample_fraction`. The defaults follow --pred-format.
+
+A run is
 scored on presence (precision/recall/F1 at a threshold, plus AUPR over the ranked
 prediction) and on composition, the latter twice: L1/Bray-Curtis over the label union,
 which is the end-to-end score and is dominated by detection, and BC_tp/MARE_tp over the
@@ -54,8 +73,73 @@ def read_truth(path):
     return out
 
 
-def read_pred(path, clade_mode="strict"):
-    """cluster -> abundance (the within-species column).
+def read_truth_long(path):
+    """One sample's truth from a long-format table -> {label: abundance}.
+
+    Two shapes, told apart by the header rather than by a flag:
+
+      single  strain, cluster, relative_abundance, ...   -> label = cluster
+      multi   species, strain, cluster, relative_abundance, ... -> label = "species\\tcluster"
+
+    Truth is stated per *strain* and several strains can share a cluster, so abundances are
+    summed into the cluster — the same remap `read_members` does for the wide format, except
+    the mapping is already in the file.
+
+    The scope differs between the two and the caller must match the prediction column to it:
+    single-species truth is normalised WITHIN a species (the k strains sum to 1), multi-species
+    truth is normalised across the whole community. See `--abundance-col`.
+    """
+    with open(path) as fh:
+        rows = [r for r in csv.reader(fh, delimiter="\t") if r]
+    if not rows:
+        return {}, False
+    header = [h.lstrip("#").strip() for h in rows[0]]
+    idx = {name: i for i, name in enumerate(header)}
+    for need in ("cluster", "relative_abundance"):
+        if need not in idx:
+            sys.exit(f"{path}: long truth needs a '{need}' column, got {header}")
+    multi = "species" in idx
+    out = defaultdict(float)
+    for r in rows[1:]:
+        if not r or not r[0].strip() or r[0].startswith("#"):
+            continue
+        try:
+            v = float(r[idx["relative_abundance"]])
+        except (ValueError, IndexError):
+            continue
+        if v <= 0:
+            continue
+        cluster = r[idx["cluster"]].strip()
+        key = f"{r[idx['species']].strip()}\t{cluster}" if multi else cluster
+        out[key] += v
+    return dict(out), multi
+
+
+def _species_key(raw):
+    """Normalise `multi-profile`'s species column to the truth's species name.
+
+    The column holds the DB file's stem, so a database at `Cutibacterium_acnes.db.tsv` reports
+    `Cutibacterium_acnes.db` while the truth says `Cutibacterium_acnes`. Left alone, every
+    label mismatches and the run scores zero across the board — which looks like a catastrophic
+    result rather than a join failure.
+    """
+    return raw[:-3] if raw.endswith(".db") else raw
+
+
+def read_pred(path, clade_mode="strict", pred_format="profile", abundance_col=None):
+    """label -> abundance, from either subcommand's prediction file.
+
+    The two subcommands write different layouts, and reading one as the other fails silently:
+
+      profile        #cluster abundance coverage support depth n_markers
+      multi-profile  #species cluster abundance coverage support depth global_abundance
+                     sample_fraction n_markers
+
+    Fed a multi-profile file, the single-species reader takes the SPECIES name as the cluster
+    and its second column as the abundance, producing labels that match nothing. Columns are
+    therefore located by header name, not by position, and `abundance_col` picks which of the
+    three scopes to score — they answer different questions and the truth's normalisation
+    decides which one is correct.
 
     --layer1 cst can resolve a strain only to a clade and report it under every leaf it
     spans, as `C1|C3`. Two ways to score that, and they answer different questions:
@@ -74,17 +158,31 @@ def read_pred(path, clade_mode="strict"):
     if not os.path.exists(path):
         return dict(out)
     with open(path) as fh:
-        for line in fh:
-            if line.startswith("#") or not line.strip():
-                continue
-            f = line.rstrip("\n").split("\t")
-            name, ab = f[0], float(f[1])
-            leaves = name.split("|")
-            if clade_mode == "split" and len(leaves) > 1:
-                for leaf in leaves:
-                    out[leaf] += ab / len(leaves)
-            else:
-                out[name] += ab
+        rows = [r for r in csv.reader(fh, delimiter="\t") if r]
+    if not rows:
+        return dict(out)
+    header = [h.lstrip("#").strip() for h in rows[0]]
+    idx = {name: i for i, name in enumerate(header)}
+    col = abundance_col or ("global_abundance" if pred_format == "multi-profile" else "abundance")
+    if col not in idx:
+        sys.exit(f"{path}: no '{col}' column; header is {header}")
+    if pred_format == "multi-profile" and "species" not in idx:
+        sys.exit(f"{path}: --pred-format multi-profile but no 'species' column; header is {header}")
+    for r in rows[1:]:
+        if not r or not r[0].strip() or r[0].startswith("#"):
+            continue
+        try:
+            ab = float(r[idx[col]])
+        except (ValueError, IndexError):
+            continue
+        cluster = r[idx["cluster"]].strip()
+        prefix = f"{_species_key(r[idx['species']].strip())}\t" if pred_format == "multi-profile" else ""
+        leaves = cluster.split("|")
+        if clade_mode == "split" and len(leaves) > 1:
+            for leaf in leaves:
+                out[f"{prefix}{leaf}"] += ab / len(leaves)
+        else:
+            out[f"{prefix}{cluster}"] += ab
     return dict(out)
 
 
@@ -184,8 +282,24 @@ def composition(pred, truth):
 
 def main():
     ap_ = argparse.ArgumentParser()
-    ap_.add_argument("--members", required=True)
-    ap_.add_argument("--truth", required=True)
+    ap_.add_argument("--members",
+                     help="genome->cluster sidecar; required for --truth-format wide only "
+                          "(long truth already carries a cluster column)")
+    ap_.add_argument("--truth", required=True,
+                     help="wide: the truth matrix file. long: the directory of per-sample "
+                          "<sample><--truth-suffix> files")
+    ap_.add_argument("--truth-format", choices=["wide", "long"], default="wide")
+    ap_.add_argument("--truth-suffix", default=".truth.tsv",
+                     help="long only: per-sample truth filename suffix")
+    ap_.add_argument("--pred-format", choices=["profile", "multi-profile"], default="profile")
+    ap_.add_argument("--abundance-col",
+                     choices=["abundance", "global_abundance", "sample_fraction"],
+                     help="which prediction column to score. Default: `abundance` for "
+                          "profile, `global_abundance` for multi-profile. Match this to how "
+                          "the truth is normalised — single-species sim truth sums to 1 "
+                          "WITHIN a species (abundance), multi-species sim truth sums to 1 "
+                          "across the community (global_abundance). Use sample_fraction only "
+                          "if the truth is a DNA/sequence fraction rather than a cell one.")
     ap_.add_argument("--preds", required=True,
                      help="dir holding <run>/<sample>.tsv")
     ap_.add_argument("--samples", default="sample1,sample2,sample3,sample4,sample5")
@@ -196,10 +310,29 @@ def main():
     ap_.add_argument("--json-out")
     args = ap_.parse_args()
 
-    members = read_members(args.members)
-    truth_all = read_truth(args.truth)
     samples = args.samples.split(",")
     tsamples = args.truth_samples.split(",")
+    if args.truth_format == "wide":
+        if not args.members:
+            sys.exit("--members is required for --truth-format wide")
+        members = read_members(args.members)
+        truth_all = read_truth(args.truth)
+    else:
+        # Long truth is one file per sample and already carries the cluster assignment, so no
+        # membership sidecar is needed.
+        members, truth_all = None, {}
+        for s_ in samples:
+            path = os.path.join(args.truth, f"{s_}{args.truth_suffix}")
+            if not os.path.exists(path):
+                sys.exit(f"missing truth file {path}")
+            truth_all[s_], is_multi = read_truth_long(path)
+            if is_multi and args.pred_format != "multi-profile":
+                sys.exit(f"{path} is multi-species truth (it has a `species` column) but "
+                         "--pred-format is `profile`; the labels cannot join")
+            if not is_multi and args.pred_format == "multi-profile":
+                sys.exit(f"{path} is single-species truth but --pred-format is "
+                         "`multi-profile`; the labels cannot join")
+        tsamples = samples
 
     # A run directory is one holding at least one <sample>.tsv. Testing for that rather than
     # taking every subdirectory keeps siblings like the profiler's logs/ out of the table —
@@ -218,10 +351,13 @@ def main():
     for run in runs:
         per_sample = []
         for s, ts in zip(samples, tsamples):
-            truth_c, unmapped = remap_truth(truth_all[ts], members)
+            if args.truth_format == "wide":
+                truth_c, unmapped = remap_truth(truth_all[ts], members)
+            else:
+                truth_c, unmapped = truth_all[ts], []
             path = os.path.join(args.preds, run, f"{s}.tsv")
-            pred = read_pred(path, args.clade_mode)
-            raw = read_pred(path, "strict")
+            pred = read_pred(path, args.clade_mode, args.pred_format, args.abundance_col)
+            raw = read_pred(path, "strict", args.pred_format, args.abundance_col)
             row = dict(sample=s,
                        n_truth_clusters=len(truth_c),
                        n_truth_genomes=len(truth_all[ts]),
@@ -258,7 +394,10 @@ def main():
         results[run] = dict(per_sample=per_sample, aggregate=agg)
 
     w = 26
-    print(f"presence threshold = {args.thresh}   clade calls scored as: {args.clade_mode}\n")
+    col = args.abundance_col or (
+        "global_abundance" if args.pred_format == "multi-profile" else "abundance")
+    print(f"presence threshold = {args.thresh}   clade calls scored as: {args.clade_mode}")
+    print(f"truth={args.truth_format}  pred={args.pred_format}  scoring column: {col}\n")
     hdr = (f"{'run':<{w}}{'P':>7}{'R':>7}{'F1':>7}{'AUPR':>8}"
            f"{'microP':>8}{'microR':>8}{'TP':>5}{'FP':>5}{'FN':>5}"
            f"{'L1':>8}{'BC':>7}{'BC_tp':>8}{'MARE_tp':>9}")
