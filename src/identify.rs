@@ -103,6 +103,15 @@ pub struct Params {
     /// [`profile`] computes (including under `multi-profile`). **Defaults to 0** — see
     /// [`Params::default`] for why StrainScan's 0.02 is wrong here.
     pub min_rel_abundance: f64,
+    /// Min ratio between consecutive sorted abundances to cut the trace tail. A defined community
+    /// separates from cross-library trace by orders of magnitude, while a staggered community's
+    /// true members never separate from each other by more than their design ratio. Cutting at
+    /// the largest log-gap (only when it exceeds this value) removes the former without touching
+    /// the latter. 0 disables. See [`filter_by_trace_gap`].
+    pub trace_gap: f64,
+    /// Absolute abundance floor applied after [`trace_gap`] filtering. Calls below this value are
+    /// dropped even when no gap was found. 0 disables.
+    pub trace_floor: f64,
     /// Admit `count == 1` markers as evidence when the estimated depth is low enough that
     /// genuine markers are mostly singletons (see [`min_count_for`]). Off ⇒ always `count >= 2`.
     ///
@@ -161,16 +170,23 @@ impl Default for Params {
             // and 0.02 drops the call entirely. Recall collapsed on exactly the samples full of
             // rare strains — staggered mocks and high-host dilutions.
             //
-            // Precision does not depend on this floor: it is carried by `min_support_markers`,
-            // `min_coverage` and (in `multi-profile`) the Layer-1 species gate. On the mocks,
-            // moving it between 0.02 and 0 changes no false positive, only true positives.
-            // Downstream evaluation applies its own presence threshold, so a second hidden one
-            // here is redundant. Pass `--min-abundance 0.02` to restore the old behaviour.
+            // On the original MSA-1002/1003 mocks a fixed floor bought precision with no FP
+            // change because those mocks had no cross-library trace. With MSA-1005/1007 the
+            // picture changes: a 0.001 floor removes ~97% of trace FP (mostly index-hopping
+            // signal from co-multiplexed mocks) but also deletes the rare tail of MSA-1003's
+            // staggered design. Use a per-sample adaptive gap instead (see `trace_gap`).
             min_rel_abundance: 0.0,
-            // 0.5 sits in the middle of a measured gap: synthetic shadows scored <= 0.897 (and
-            // real ones far lower), genuine clusters >= 0.949 across depths 0.3x-20x. Left low
-            // enough to tolerate the coverage non-uniformity of real 2bRAD, which the synthetic
-            // sweep does not model.
+            // Per-sample adaptive trace-tail removal. 0 disables; enable with `--trace-gap N`
+            // and `--trace-floor F`. On the four WMS mocks, `--trace-gap 10 --trace-floor 1e-4`
+            // removes ~92% of FP while keeping recall unchanged, because true communities are
+            // separated from trace by >10x but staggered mocks' rare true members are not.
+            trace_gap: 0.0,
+            trace_floor: 0.0,
+            // 0.5 was calibrated on synthetic shadows, which scored <= 0.897 and genuine clusters
+            // >= 0.949 across depths 0.3x-20x. On real mocks the two distributions overlap
+            // (trace contamination scores 0.73-0.93, and low-depth true clusters as low as 0.51),
+            // so this gate alone cannot separate them. It still rejects extreme shadows; raise it
+            // only if you can tolerate losing low-depth true positives.
             min_consistency: 0.5,
             adaptive_singleton: true,
             adaptive_floor: true,
@@ -380,6 +396,37 @@ pub fn filter_by_abundance(calls: &mut Vec<StrainCall>, min_rel: f64) {
     });
 }
 
+/// Drop the trace tail below the largest abundance gap.
+///
+/// A defined community separates from cross-library trace by orders of magnitude; a staggered
+/// community never separates from itself by more than its design ratio. Cutting at the largest
+/// log-gap (only when it exceeds `min_ratio`) removes the former without touching the latter.
+/// An absolute `floor` is applied after the gap cut.
+pub fn filter_by_trace_gap(calls: &mut Vec<StrainCall>, min_ratio: f64, floor: f64) {
+    if min_ratio > 0.0 && calls.len() >= 2 {
+        calls.sort_by(|a, b| {
+            b.rel_abundance
+                .partial_cmp(&a.rel_abundance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let (mut cut, mut best) = (calls.len(), min_ratio);
+        for i in 0..calls.len() - 1 {
+            let (hi, lo) = (calls[i].rel_abundance, calls[i + 1].rel_abundance);
+            if lo > 0.0 {
+                let ratio = hi / lo;
+                if ratio >= best {
+                    best = ratio;
+                    cut = i + 1;
+                }
+            }
+        }
+        calls.truncate(cut);
+    }
+    if floor > 0.0 {
+        calls.retain(|c| c.rel_abundance >= floor);
+    }
+}
+
 /// Profile one species DB: detect present clusters, estimate absolute depth, gate, and
 /// normalize **within this DB** (`rel_abundance` sums to 1.0 across the returned calls).
 ///
@@ -504,6 +551,7 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
     }
 
     normalize_by_depth(&mut calls);
+    filter_by_trace_gap(&mut calls, p.trace_gap, p.trace_floor);
     filter_by_abundance(&mut calls, p.min_rel_abundance);
     calls
 }
@@ -762,6 +810,43 @@ mod tests {
             .map(|c| c.name.clone())
             .collect();
         assert_eq!(strict_names, vec!["dominant".to_string()]);
+    }
+
+    #[test]
+    fn trace_gap_cuts_between_community_and_trace_without_hurting_staggered_mocks() {
+        // Case 1: a defined community with a clear gap to trace contaminants.
+        let mut defined = vec![
+            StrainCall { strain_index: 0, name: "A".into(), support: 100.0, coverage: 1.0, depth: 10.0, n_markers: 100, rel_abundance: 0.45 },
+            StrainCall { strain_index: 1, name: "B".into(), support: 100.0, coverage: 1.0, depth: 8.0, n_markers: 100, rel_abundance: 0.36 },
+            StrainCall { strain_index: 2, name: "C".into(), support: 100.0, coverage: 1.0, depth: 2.0, n_markers: 100, rel_abundance: 0.09 },
+            // trace tail, >100x below the smallest true member
+            StrainCall { strain_index: 3, name: "trace1".into(), support: 10.0, coverage: 0.2, depth: 0.01, n_markers: 100, rel_abundance: 0.0002 },
+            StrainCall { strain_index: 4, name: "trace2".into(), support: 10.0, coverage: 0.2, depth: 0.01, n_markers: 100, rel_abundance: 0.0001 },
+        ];
+        filter_by_trace_gap(&mut defined, 10.0, 1e-4);
+        let names: Vec<&str> = defined.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B", "C"], "defined community: gap should drop trace tail");
+
+        // Case 2: a staggered mock whose rarest true member is only 2x below the next.
+        // The largest gap is smaller than the threshold, so no knee cut; the floor alone
+        // must be small enough to keep the rarest true member.
+        let mut staggered = vec![
+            StrainCall { strain_index: 0, name: " abundant".into(), support: 100.0, coverage: 1.0, depth: 10.0, n_markers: 100, rel_abundance: 0.50 },
+            StrainCall { strain_index: 1, name: "mid".into(), support: 100.0, coverage: 1.0, depth: 5.0, n_markers: 100, rel_abundance: 0.25 },
+            StrainCall { strain_index: 2, name: "rare".into(), support: 100.0, coverage: 1.0, depth: 2.5, n_markers: 100, rel_abundance: 0.125 },
+            StrainCall { strain_index: 3, name: "very_rare".into(), support: 100.0, coverage: 1.0, depth: 1.25, n_markers: 100, rel_abundance: 0.0625 },
+        ];
+        filter_by_trace_gap(&mut staggered, 10.0, 1e-4);
+        let names: Vec<&str> = staggered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec![" abundant", "mid", "rare", "very_rare"], "staggered mock: no 10x gap, all members kept");
+
+        // Case 3: gap threshold disabled -> no change.
+        let mut disabled = vec![
+            StrainCall { strain_index: 0, name: "A".into(), support: 100.0, coverage: 1.0, depth: 10.0, n_markers: 100, rel_abundance: 0.50 },
+            StrainCall { strain_index: 1, name: "trace".into(), support: 10.0, coverage: 0.2, depth: 0.01, n_markers: 100, rel_abundance: 0.0001 },
+        ];
+        filter_by_trace_gap(&mut disabled, 0.0, 0.0);
+        assert_eq!(disabled.len(), 2, "disabled gap filter should keep everything");
     }
 
     /// A shadow cluster and a genuinely present rare cluster have the **same breadth** and differ

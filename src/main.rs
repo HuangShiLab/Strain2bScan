@@ -55,8 +55,8 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--min-consistency F] [--layer1 auto|unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
+                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--layer1 auto|unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
+                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95]   (can a Cluster Search Tree work on this panel?)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
@@ -102,6 +102,12 @@ fn main() -> ExitCode {
                  within-species, so a species with one cluster always sits at 1.0 there. Use it\n\
                  to separate community members from trace cross-contamination between libraries,\n\
                  which passes every marker-evidence gate because the reads really are present.\n\
+                 --trace-gap R and --trace-floor F provide a per-sample adaptive alternative to\n\
+                 a fixed abundance floor: calls are sorted by abundance and cut at the largest\n\
+                 ratio between consecutive abundances, but only if that ratio exceeds R; anything\n\
+                 below F is then dropped. On multiplexed mocks this removes cross-library trace\n\
+                 (which is separated from true members by >10x) without deleting the rare tail of\n\
+                 a staggered community (whose members are separated by their design ratio only).\n\
                  --fixed-gate restores the pre-0.2 fixed singleton filter (count>=2) AND the\n\
                  unscaled species floor. The two can be reverted independently with\n\
                  --no-adaptive-singleton / --no-adaptive-floor: on a large panel the floor\n\
@@ -503,6 +509,12 @@ fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
     }
     if let Some(v) = opts.get("min-abundance") {
         p.min_rel_abundance = v.parse().map_err(|_| "bad --min-abundance (want 0..1)")?;
+    }
+    if let Some(v) = opts.get("trace-gap") {
+        p.trace_gap = v.parse().map_err(|_| "bad --trace-gap (want ratio >= 1)")?;
+    }
+    if let Some(v) = opts.get("trace-floor") {
+        p.trace_floor = v.parse().map_err(|_| "bad --trace-floor (want 0..1)")?;
     }
     // `--fixed-gate` turns both adaptations off (backwards compatible); the two halves can
     // also be controlled independently, which is what calibrating a large panel needs.
