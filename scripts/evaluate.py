@@ -13,13 +13,25 @@ Two truth layouts and two prediction layouts, in any combination:
   --pred-format profile        `#cluster abundance ...`
   --pred-format multi-profile  `#species cluster abundance ... global_abundance ...`
 
-`--abundance-col` must match how the truth is normalised, and nothing will warn you if it
-does not: detection metrics are identical either way. On a three-cluster check where the
+`--abundance-col` must match the truth on TWO axes, and nothing will warn you if it does
+not: detection metrics are identical either way. On a three-cluster check where the
 truth is community-scope, scoring the within-species column instead left precision, recall
 and F1 at 1.000 while Bray-Curtis went from 0.010 to 0.333. Single-species sim truth sums to
 1 WITHIN a species -> `abundance`; multi-species sim truth sums to 1 across the community ->
-`global_abundance`; a truth stated as DNA/sequence mass rather than cell counts ->
-`sample_fraction`. The defaults follow --pred-format.
+`global_abundance`.
+
+The second axis is cells versus DNA. `abundance` and `global_abundance` are proportional to
+`depth`, and single-copy tags are one per genome copy, so reads-per-tag cancels genome size
+out and both are CELL (taxonomic) fractions. `sample_fraction` is proportional to
+`depth x n_markers` and is a DNA (sequence) fraction. They differ by genome size, so the axis
+is invisible within one species and matters across them: the C. acnes panel scores
+identically against this benchmark's taxonomic and sequence truth files (they differ by at
+most 0.08%), while a community spanning 2.5-4.6 Mb genomes would differ by up to ~1.8x.
+
+Checked for the simulated benchmark: its `relative_abundance` is generated from cell counts,
+not DNA mass, so the cell-scope defaults above are correct and no override is needed. Reach
+for `sample_fraction` only if a truth is restated as sequence/DNA abundance. The defaults
+follow --pred-format.
 
 A run is
 scored on presence (precision/recall/F1 at a threshold, plus AUPR over the ranked
