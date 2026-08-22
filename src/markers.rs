@@ -623,6 +623,69 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **Multi-member gzip must be read in full.** `cat R1.fq.gz R2.fq.gz` is a valid gzip
+    /// stream of two members, and it is how paired reads are routinely combined before
+    /// profiling. Several Rust gzip readers — `flate2::GzDecoder` among them — stop after the
+    /// first member and return EOF, silently discarding R2: a sibling project lost half its tags
+    /// this way and only noticed when low-abundance genomes started dropping out of its calls.
+    ///
+    /// Piping through `gzip -dc` is immune because the tool concatenates members itself, but
+    /// that is a property of the decompressor, not of this code, so it is pinned here: anyone
+    /// swapping the subprocess for an in-process decoder must keep this passing.
+    #[test]
+    fn multi_member_gzip_is_read_in_full() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let (a, b) = (dir.join("s2bs_mm_a.fq"), dir.join("s2bs_mm_b.fq"));
+        let mut w = vec![b'A'; 32];
+        w[10..13].copy_from_slice(b"CGA");
+        w[19..22].copy_from_slice(b"TGC");
+        let seq = String::from_utf8(w).unwrap();
+        for (path, n, tag) in [(&a, 5usize, 'a'), (&b, 7usize, 'b')] {
+            let mut f = File::create(path).unwrap();
+            for i in 0..n {
+                writeln!(f, "@{tag}{i}\n{seq}\n+\n{}", "I".repeat(seq.len())).unwrap();
+            }
+        }
+        // Compress each separately, then concatenate the two archives.
+        let gz_ok = |p: &Path| {
+            Command::new("gzip")
+                .arg("-kf")
+                .arg(p)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !(gz_ok(&a) && gz_ok(&b)) {
+            return; // no gzip on this host; the plain path is covered elsewhere
+        }
+        let (ga, gb) = (dir.join("s2bs_mm_a.fq.gz"), dir.join("s2bs_mm_b.fq.gz"));
+        let cat = dir.join("s2bs_mm_cat.fq.gz");
+        let bytes: Vec<u8> = std::fs::read(&ga)
+            .unwrap()
+            .into_iter()
+            .chain(std::fs::read(&gb).unwrap())
+            .collect();
+        std::fs::write(&cat, bytes).unwrap();
+
+        let count = |p: &Path| {
+            let mut n = 0usize;
+            for_each_sequence(p, |_| n += 1).unwrap();
+            n
+        };
+        assert_eq!(count(&ga), 5);
+        assert_eq!(count(&gb), 7);
+        assert_eq!(
+            count(&cat),
+            12,
+            "a concatenated gzip must yield BOTH members, not just the first"
+        );
+
+        for p in [&a, &b, &ga, &gb, &cat] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     /// A missing gzipped file must report "not found", not "corrupt archive".
     #[test]
     fn missing_gz_reports_not_found() {
