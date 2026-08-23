@@ -674,6 +674,44 @@ struct SpeciesResult {
     calls: Vec<StrainCall>,
 }
 
+/// Collect and load every per-species DB in `--dbs <dir>`. An unreadable directory entry (e.g.
+/// a broken symlink on HPC) or an unloadable DB is a HARD error: the old `e.ok()` /
+/// `unwrap_or_default()` fallbacks silently dropped the species from the panel — reporting it
+/// as "not present" and bypassing the format validation in `StrainDb::load`.
+fn load_species_dbs(dbs_dir: &Path) -> Result<Vec<(String, StrainDb)>, String> {
+    let mut db_paths: Vec<PathBuf> = std::fs::read_dir(dbs_dir)
+        .map_err(|e| format!("cannot list DB dir {}: {e}", dbs_dir.display()))?
+        .map(|e| {
+            e.map(|e| e.path())
+                .map_err(|err| format!("cannot read an entry of DB dir {}: {err}", dbs_dir.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|p| {
+            p.extension().and_then(|x| x.to_str()) == Some("tsv")
+                && p.file_name()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|n| !n.contains(".members."))
+        })
+        .collect();
+    db_paths.sort();
+    if db_paths.is_empty() {
+        return Err("no *.tsv species DBs found in --dbs dir".into());
+    }
+    par_map(&db_paths, |path| {
+        let sp = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        StrainDb::load(path)
+            .map(|db| (sp, db))
+            .map_err(|e| format!("failed to load species DB {}: {e}", path.display()))
+    })
+    .into_iter()
+    .collect()
+}
+
 /// Multi-species strain profiling: digest the sample reads ONCE, then match the shared tag
 /// counts against every per-species cluster DB in `--dbs <dir>`, in parallel across species.
 /// This is the scalability advantage over running a full k-mer profiler once per species
@@ -687,28 +725,7 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     let counts = sample_marker_counts_stream(&reads, &set).map_err(|e| e.to_string())?;
 
     // 2) collect + load per-species DBs
-    let mut db_paths: Vec<PathBuf> = std::fs::read_dir(&dbs_dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension().and_then(|x| x.to_str()) == Some("tsv")
-                && p.file_name()
-                    .and_then(|x| x.to_str())
-                    .is_some_and(|n| !n.contains(".members."))
-        })
-        .collect();
-    db_paths.sort();
-    if db_paths.is_empty() {
-        return Err("no *.tsv species DBs found in --dbs dir".into());
-    }
-    let mut loaded: Vec<(String, StrainDb)> = par_map(&db_paths, |path| {
-        let sp = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        (sp, StrainDb::load(path).unwrap_or_default())
-    });
+    let mut loaded = load_species_dbs(&dbs_dir)?;
 
     // 3) Layer-1 species gate (breadth-aware, three-tier). Strain markers are unique only
     //    *within* a species, so an absent species can be spuriously hit by a present relative's
@@ -1251,8 +1268,33 @@ fn print_stats(db: &StrainDb) {
 
 #[cfg(test)]
 mod tests {
-    use super::{species_tier, SpeciesTier};
+    use super::{load_species_dbs, species_tier, SpeciesTier};
+    use strain2bscan::db::StrainDb;
     use strain2bscan::identify::detectable_fraction;
+
+    /// A DB that fails to load must abort the run with an error naming the file — never
+    /// degrade to an empty DB that silently reports the species as absent (the old
+    /// `StrainDb::load(path).unwrap_or_default()` behavior).
+    #[test]
+    fn multi_profile_panel_load_failure_propagates() {
+        let dir = std::env::temp_dir().join(format!("s2bs_panel_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = StrainDb::build(vec![("A".into(), vec![1, 2, 3, 10]), ("B".into(), vec![1, 2, 3, 20])]);
+        good.save(&dir.join("good.tsv")).unwrap();
+        // Header declares 5 strains / 5 counts but only one strain line is present.
+        std::fs::write(dir.join("broken.tsv"), b"#strain2bscan-db\t5\t\t1,1,1,1,1\nX\t1,2,3\n").unwrap();
+
+        let err = load_species_dbs(&dir).unwrap_err();
+        assert!(err.contains("broken.tsv"), "error must name the failing DB: {err}");
+
+        // An intact panel still loads, keyed by file stem.
+        std::fs::remove_file(dir.join("broken.tsv")).unwrap();
+        let loaded = load_species_dbs(&dir).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, "good");
+        assert_eq!(loaded[0].1.n_strains(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Ample depth: essentially the whole panel is reachable, so the gates are the original
     /// absolute ones.

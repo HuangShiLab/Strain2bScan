@@ -15,6 +15,9 @@ use crate::cst::Cst;
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::markers::Marker;
 
+/// One-per-process warning for legacy database headers (see `load`).
+static LEGACY_HEADER_WARN: std::sync::Once = std::sync::Once::new();
+
 #[derive(Debug, Default, Clone)]
 pub struct StrainDb {
     pub strain_names: Vec<String>,
@@ -118,15 +121,30 @@ impl StrainDb {
 
     // ===== persistence (simple, line-oriented text) ========================
     // Format:
-    //   line 1:            "#strain2bscan-db\t<n_strains>"
+    //   line 1:            "#strain2bscan-db\t<n_strains>\t<enzyme_csv>\t<markers_per_strain_csv>"
+    //   optional sections: "#unique\t<marker_hex,...>" and the "#tree"/"#node"/"#leaf" CST block
     //   next n lines:      "<strain_name>\t<marker_hex,marker_hex,...>"
     // Sparse and compact; production would use a binary/bgzf layout.
+    //
+    // The 4th header field declares each strain's marker count (in strain order) so `load` can
+    // reject a truncated file: a cut that drops whole trailing strain sections mismatches
+    // <n_strains>, and a cut inside the last strain line mismatches that strain's count.
+    // Databases written before this field existed (3-field header) still load, with strain-count
+    // validation only. Known hole: a cut landing mid-token in the final hex number can leave a
+    // shorter-but-valid number with the count unchanged — catching that needs a checksum and is
+    // out of scope for this text format.
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
+        let counts = self
+            .strain_markers
+            .iter()
+            .map(|s| s.len().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         writeln!(
             w,
-            "#strain2bscan-db\t{}\t{}",
+            "#strain2bscan-db\t{}\t{}\t{counts}",
             self.n_strains(),
             self.enzymes.join(",")
         )?;
@@ -167,10 +185,19 @@ impl StrainDb {
                 .join(",");
             writeln!(w, "{name}\t{joined}")?;
         }
+        // `BufWriter::drop` swallows I/O errors, so without an explicit flush a full disk or
+        // interrupted write would produce a truncated database while `save` reports success.
+        w.flush()?;
         Ok(())
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
+        let bad = |msg: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {msg}", path.display()),
+            )
+        };
         let reader = BufReader::new(File::open(path)?);
         let mut strains = Vec::new();
         let mut enzymes: Vec<String> = Vec::new();
@@ -181,64 +208,137 @@ impl StrainDb {
         let mut tree_markers: Vec<FxHashSet<Marker>> = Vec::new();
         let mut tree_sim: Vec<f64> = Vec::new();
         let mut tree_leaves: Vec<Vec<usize>> = Vec::new();
-        let hexset = |csv: &str| {
+        let mut declared_strains: Option<usize> = None;
+        let mut declared_counts: Option<Vec<usize>> = None;
+        // Malformed hex used to be silently dropped (`filter_map(... .ok())`), shrinking marker
+        // sets with no error; every token must parse now.
+        let hexset = |csv: &str, lineno: usize| -> std::io::Result<FxHashSet<Marker>> {
             csv.split(',')
                 .filter(|s| !s.is_empty())
-                .filter_map(|s| Marker::from_str_radix(s, 16).ok())
-                .collect::<FxHashSet<Marker>>()
+                .map(|s| {
+                    Marker::from_str_radix(s, 16)
+                        .map_err(|_| bad(format!("line {lineno}: malformed hex marker '{s}'")))
+                })
+                .collect()
         };
-        for line in reader.lines() {
+        for (lineno, line) in reader.lines().enumerate() {
             let line = line?;
+            let lineno = lineno + 1;
             if line.starts_with('#') {
                 if line.starts_with("#strain2bscan-db") {
-                    if let Some(csv) = line.split('\t').nth(2) {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    let n: usize = f
+                        .get(1)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| bad(format!("line {lineno}: malformed header (strain count)")))?;
+                    declared_strains = Some(n);
+                    if let Some(csv) = f.get(2) {
                         enzymes = csv.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+                    }
+                    match f.get(3) {
+                        Some(csv) => {
+                            let counts: Vec<usize> = csv
+                                .split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(|s| {
+                                    s.parse::<usize>().map_err(|_| {
+                                        bad(format!("line {lineno}: malformed header (marker count '{s}')"))
+                                    })
+                                })
+                                .collect::<std::io::Result<_>>()?;
+                            if counts.len() != n {
+                                return Err(bad(format!(
+                                    "line {lineno}: header declares {n} strains but {} marker counts",
+                                    counts.len()
+                                )));
+                            }
+                            declared_counts = Some(counts);
+                        }
+                        None => {
+                            // Legacy 3-field header (written before per-strain marker counts):
+                            // still loads, but only the strain count can be validated — a
+                            // truncation that drops whole trailing strains is undetectable.
+                            // Warn once per process: a multi-profile run loads hundreds of
+                            // per-species DBs and would be flooded otherwise.
+                            LEGACY_HEADER_WARN.call_once(|| {
+                                eprintln!(
+                                    "warning: {}: legacy database header without per-strain marker \
+                                     counts; truncation of legacy databases is not fully detectable \
+                                     (rebuild the database to enable it)",
+                                    path.display()
+                                );
+                            });
+                        }
                     }
                 } else if line.starts_with("#unique") {
                     if let Some(csv) = line.split('\t').nth(1) {
-                        unique_set = hexset(csv);
+                        unique_set = hexset(csv, lineno)?;
                     }
                 } else if line.starts_with("#tree\t") {
+                    // A corrupt tree section must be a hard error: the old `unwrap_or(0)`
+                    // fallbacks yielded a silent empty tree, quietly degrading `--layer1 cst`
+                    // to the flat path.
                     let f: Vec<&str> = line.split('\t').collect();
-                    if f.len() >= 4 {
-                        let n_nodes: usize = f[2].parse().unwrap_or(0);
-                        tree_root = f[3].parse().unwrap_or(0);
-                        tree_parent = vec![None; n_nodes];
-                        tree_children = vec![None; n_nodes];
-                        tree_markers = vec![FxHashSet::default(); n_nodes];
-                        tree_sim = vec![1.0; n_nodes];
-                        tree_leaves = vec![Vec::new(); f[1].parse().unwrap_or(0)];
-                        have_tree = true;
+                    if f.len() < 4 {
+                        return Err(bad(format!("line {lineno}: malformed #tree header")));
                     }
+                    let n_leaves: usize = f[1]
+                        .parse()
+                        .map_err(|_| bad(format!("line {lineno}: malformed #tree leaf count '{}'", f[1])))?;
+                    let n_nodes: usize = f[2]
+                        .parse()
+                        .map_err(|_| bad(format!("line {lineno}: malformed #tree node count '{}'", f[2])))?;
+                    tree_root = f[3]
+                        .parse()
+                        .map_err(|_| bad(format!("line {lineno}: malformed #tree root '{}'", f[3])))?;
+                    tree_parent = vec![None; n_nodes];
+                    tree_children = vec![None; n_nodes];
+                    tree_markers = vec![FxHashSet::default(); n_nodes];
+                    tree_sim = vec![1.0; n_nodes];
+                    tree_leaves = vec![Vec::new(); n_leaves];
+                    have_tree = true;
                 } else if line.starts_with("#node\t") {
                     let f: Vec<&str> = line.split('\t').collect();
-                    if f.len() >= 7 {
-                        if let Ok(v) = f[1].parse::<usize>() {
-                            if v < tree_parent.len() {
-                                let par: i64 = f[2].parse().unwrap_or(-1);
-                                let ca: i64 = f[3].parse().unwrap_or(-1);
-                                let cb: i64 = f[4].parse().unwrap_or(-1);
-                                tree_parent[v] = (par >= 0).then_some(par as usize);
-                                tree_children[v] =
-                                    (ca >= 0 && cb >= 0).then_some((ca as usize, cb as usize));
-                                tree_sim[v] = f[5].parse().unwrap_or(1.0);
-                                tree_markers[v] = hexset(f[6]);
-                            }
-                        }
+                    if f.len() < 7 {
+                        return Err(bad(format!("line {lineno}: malformed #node line")));
                     }
+                    let v: usize = f[1]
+                        .parse()
+                        .map_err(|_| bad(format!("line {lineno}: malformed #node index '{}'", f[1])))?;
+                    if v >= tree_parent.len() {
+                        return Err(bad(format!("line {lineno}: #node index {v} out of range")));
+                    }
+                    let num = |i: usize| -> std::io::Result<i64> {
+                        f[i].parse()
+                            .map_err(|_| bad(format!("line {lineno}: malformed #node field '{}'", f[i])))
+                    };
+                    let (par, ca, cb) = (num(2)?, num(3)?, num(4)?);
+                    tree_parent[v] = (par >= 0).then_some(par as usize);
+                    tree_children[v] = (ca >= 0 && cb >= 0).then_some((ca as usize, cb as usize));
+                    tree_sim[v] = f[5]
+                        .parse()
+                        .map_err(|_| bad(format!("line {lineno}: malformed #node similarity '{}'", f[5])))?;
+                    tree_markers[v] = hexset(f[6], lineno)?;
                 } else if line.starts_with("#leaf\t") {
                     let f: Vec<&str> = line.split('\t').collect();
-                    if f.len() >= 3 {
-                        if let Ok(l) = f[1].parse::<usize>() {
-                            if l < tree_leaves.len() {
-                                tree_leaves[l] = f[2]
-                                    .split(',')
-                                    .filter(|x| !x.is_empty())
-                                    .filter_map(|x| x.parse::<usize>().ok())
-                                    .collect();
-                            }
-                        }
+                    if f.len() < 3 {
+                        return Err(bad(format!("line {lineno}: malformed #leaf line")));
                     }
+                    let l: usize = f[1]
+                        .parse()
+                        .map_err(|_| bad(format!("line {lineno}: malformed #leaf index '{}'", f[1])))?;
+                    if l >= tree_leaves.len() {
+                        return Err(bad(format!("line {lineno}: #leaf index {l} out of range")));
+                    }
+                    tree_leaves[l] = f[2]
+                        .split(',')
+                        .filter(|x| !x.is_empty())
+                        .map(|x| {
+                            x.parse::<usize>().map_err(|_| {
+                                bad(format!("line {lineno}: malformed #leaf member '{x}'"))
+                            })
+                        })
+                        .collect::<std::io::Result<Vec<_>>>()?;
                 }
                 continue;
             }
@@ -252,9 +352,30 @@ impl StrainDb {
                 .unwrap_or("")
                 .split(',')
                 .filter(|s| !s.is_empty())
-                .filter_map(|s| Marker::from_str_radix(s, 16).ok())
-                .collect::<Vec<_>>();
+                .map(|s| {
+                    Marker::from_str_radix(s, 16)
+                        .map_err(|_| bad(format!("line {lineno}: malformed hex marker '{s}'")))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
             strains.push((name, markers));
+        }
+        let n_declared = declared_strains
+            .ok_or_else(|| bad("missing #strain2bscan-db header".to_string()))?;
+        if strains.len() != n_declared {
+            return Err(bad(format!(
+                "corrupt or truncated database: header declares {n_declared} strains but {} were parsed",
+                strains.len()
+            )));
+        }
+        if let Some(counts) = &declared_counts {
+            for (j, ((name, markers), &want)) in strains.iter().zip(counts).enumerate() {
+                if markers.len() != want {
+                    return Err(bad(format!(
+                        "corrupt or truncated database: strain {j} ('{name}') declares {want} markers but {} were parsed",
+                        markers.len()
+                    )));
+                }
+            }
         }
         let mut db = StrainDb::build(strains);
         db.enzymes = enzymes;
@@ -422,5 +543,103 @@ mod tests {
         assert_eq!(back.n_strains(), 3);
         assert!(back.is_unique(20));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression: a truncated database used to load with NO warning, silently dropping
+    /// markers (2204 -> 1321 in the reported case) while profiling still emitted plausible
+    /// numbers. The header's declared strain count + per-strain marker counts must now make
+    /// `load` fail.
+    #[test]
+    fn truncated_db_is_rejected() {
+        let db = StrainDb::build(vec![
+            ("A".into(), vec![1, 2, 3, 10]),
+            ("B".into(), vec![1, 2, 3, 20]),
+            ("C".into(), vec![1, 2, 3, 30, 40]),
+        ]);
+        let path = std::env::temp_dir().join("s2bs_truncated_db.tsv");
+        db.save(&path).unwrap();
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+
+        // Case 1: cut real content, not just the trailing newline — the last strain loses
+        // its final two markers, so its parsed count mismatches the header.
+        let (head, last) = text.trim_end_matches('\n').rsplit_once('\n').unwrap();
+        let keep = {
+            // drop the last two comma-separated tokens of the last strain line
+            let i = last.rfind(',').unwrap();
+            let i = last[..i].rfind(',').unwrap();
+            &last[..i]
+        };
+        std::fs::write(&path, format!("{head}\n{keep}\n")).unwrap();
+        let err = StrainDb::load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("declares 5 markers but 3 were parsed"),
+            "unexpected error: {err}"
+        );
+
+        // Case 2: a cut that drops a whole trailing strain section mismatches the strain count.
+        db.save(&path).unwrap();
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        let (head, _) = text.rsplit_once('\n').unwrap();
+        let (head, _) = head.rsplit_once('\n').unwrap();
+        std::fs::write(&path, format!("{head}\n")).unwrap();
+        let err = StrainDb::load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("declares 3 strains but 2 were parsed"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Databases written before the header carried per-strain marker counts (3-field header)
+    /// must still load — with strain-count validation only, plus a once-per-process warning.
+    #[test]
+    fn legacy_header_without_marker_count_still_loads() {
+        let db = toy();
+        let path = std::env::temp_dir().join("s2bs_legacy_db.tsv");
+        db.save(&path).unwrap();
+        // Strip the 4th header field to synthesize a pre-counts (legacy) database.
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        assert_eq!(header.split('\t').count(), 4, "save must write the counts field");
+        let mut legacy = header.split('\t').take(3).collect::<Vec<_>>().join("\t");
+        for l in lines {
+            legacy.push('\n');
+            legacy.push_str(l);
+        }
+        legacy.push('\n');
+        std::fs::write(&path, legacy).unwrap();
+
+        let back = StrainDb::load(&path).unwrap();
+        assert_eq!(back.n_strains(), 3);
+        assert!(back.is_unique(20));
+        assert_eq!(back.unique_marker_count(0), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression: malformed hex tokens were silently discarded by
+    /// `filter_map(|s| Marker::from_str_radix(s, 16).ok())`, shrinking marker sets with no
+    /// error. A corrupt token must now fail the load with line context.
+    #[test]
+    fn malformed_hex_marker_is_rejected() {
+        let db = toy();
+        let path = std::env::temp_dir().join("s2bs_badhex_db.tsv");
+        db.save(&path).unwrap();
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        // Corrupt the first marker token of the first strain line (line 2; toy() writes no
+        // #unique/#tree sections).
+        let (name, csv) = lines[1].split_once('\t').unwrap();
+        let mut toks: Vec<&str> = csv.split(',').collect();
+        toks[0] = "not_hex";
+        lines[1] = format!("{name}\t{}", toks.join(","));
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let err = StrainDb::load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("line 2: malformed hex marker 'not_hex'"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
