@@ -166,6 +166,145 @@ pub fn count_markers_into(seq: &[u8], enzymes: &[&Enzyme], counts: &mut MarkerCo
     }
 }
 
+// ===== raw k-mer sketching marker source =====================
+//
+// An alternative to enzyme digestion: markers are canonical k-mers (the same
+// `marker_from_tag` canonicalization + FNV-1a hash used for 2bRAD tags), optionally
+// subsampled by a deterministic hash sketch. Genome build and read profiling share
+// `count_kmers_into`, so both sides live in one marker space, exactly as in enzyme mode.
+//
+// The sketch predicate keeps a marker iff `marker <= u64::MAX / scale` (scale=1 keeps
+// everything), so the kept fraction is ~1/scale. This treats FNV-1a of a canonical DNA
+// k-mer as uniform enough over the u64 range for subsampling — it is not a cryptographic
+// hash, but its avalanche on short inputs is adequate for an unbiased ~1/S draw, and the
+// predicate is a pure function of the marker, so genomes and reads always agree on whether
+// a given k-mer is in the sketch.
+
+/// Largest k the k-mer path handles without allocation (`marker_from_tag`'s stack buffer).
+/// Longer k still works but allocates per window — keep k <= 48 on the hot path.
+pub const MAX_KMER_LEN: usize = MAX_TAG_LEN;
+
+/// Sketch threshold for scale `S`: keep marker `m` iff `m <= sketch_threshold(S)`.
+/// `S = 1` keeps every marker (`u64::MAX`).
+pub fn sketch_threshold(scale: u64) -> u64 {
+    assert!(scale >= 1, "sketch scale must be >= 1");
+    u64::MAX / scale
+}
+
+/// Header token recorded in the DB's `enzyme_csv` position for a k-mer database
+/// (e.g. `kmer31s100`). `StrainDb::load` does not registry-validate the field, so this
+/// loads without format changes; `profile` parses it back to auto-detect k-mer mode.
+pub fn kmer_db_token(k: usize, scale: u64) -> String {
+    format!("kmer{k}s{scale}")
+}
+
+/// Inverse of [`kmer_db_token`]; `None` for anything that is not a k-mer token (in
+/// particular, for every real enzyme name).
+pub fn parse_kmer_db_token(token: &str) -> Option<(usize, u64)> {
+    let rest = token.strip_prefix("kmer")?;
+    let (k, s) = rest.split_once('s')?;
+    let k: usize = k.parse().ok()?;
+    let s: u64 = s.parse().ok()?;
+    if k == 0 || s == 0 {
+        return None;
+    }
+    Some((k, s))
+}
+
+/// Is `b` an unambiguous DNA base (case-insensitive)?
+#[inline]
+fn is_acgt(b: u8) -> bool {
+    matches!(b, b'A' | b'a' | b'C' | b'c' | b'G' | b'g' | b'T' | b't')
+}
+
+/// Count sketched canonical k-mer markers of one sequence into an existing map.
+///
+/// Sliding window, one [`marker_from_tag`] (canonical orientation + FNV-1a, no allocation
+/// for `k <= MAX_KMER_LEN`) per window; windows containing a non-ACGT base are skipped, so
+/// a single N suppresses exactly the k windows spanning it. Sequences shorter than `k`
+/// contribute nothing. A kept marker satisfies `marker <= threshold`
+/// ([`sketch_threshold`]); with `threshold = u64::MAX` every clean window is counted.
+#[inline]
+pub fn count_kmers_into(seq: &[u8], k: usize, threshold: u64, counts: &mut MarkerCounts) {
+    if k == 0 || seq.len() < k {
+        return;
+    }
+    // Index of the most recent non-ACGT base; a window starting at `i` is clean iff it
+    // starts after it. Updating it with only the newly-included base keeps the scan O(n).
+    let mut last_bad: isize = -1;
+    for i in 0..=seq.len() - k {
+        if !is_acgt(seq[i + k - 1]) {
+            last_bad = (i + k - 1) as isize;
+        }
+        if (i as isize) <= last_bad {
+            continue;
+        }
+        let m = marker_from_tag(&seq[i..i + k]);
+        if m <= threshold {
+            *counts.entry(m).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Per-genome sketched k-mer marker copy numbers over all contigs of a genome.
+pub fn genome_kmer_counts(seqs: &[Vec<u8>], k: usize, threshold: u64) -> MarkerCounts {
+    let mut counts = MarkerCounts::default();
+    for s in seqs {
+        count_kmers_into(s, k, threshold, &mut counts);
+    }
+    counts
+}
+
+/// Parallel k-mer counts: mirrors [`genome_marker_counts_multi_par`] — sequence chunks
+/// across threads, then merge the maps.
+pub fn genome_kmer_counts_par(seqs: &[Vec<u8>], k: usize, threshold: u64) -> MarkerCounts {
+    let nt = crate::parallel::num_threads().min(seqs.len().max(1));
+    if nt <= 1 || seqs.len() < 4096 {
+        return genome_kmer_counts(seqs, k, threshold);
+    }
+    let chunk = seqs.len().div_ceil(nt);
+    let chunks: Vec<&[Vec<u8>]> = seqs.chunks(chunk).collect();
+    let partials: Vec<MarkerCounts> =
+        crate::parallel::par_map(&chunks, |c| genome_kmer_counts(c, k, threshold));
+    let mut out = MarkerCounts::default();
+    for p in partials {
+        merge_counts(&mut out, p);
+    }
+    out
+}
+
+/// Stream a sample and accumulate sketched k-mer marker counts, in parallel batches.
+///
+/// Mirrors [`sample_marker_counts_stream`]: same streaming/gzip machinery
+/// ([`for_each_sequence`]), same bounded memory (one batch), same buffer recycling.
+pub fn sample_kmer_counts_stream(path: &Path, k: usize, threshold: u64) -> io::Result<MarkerCounts> {
+    let mut total = MarkerCounts::default();
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(STREAM_BATCH);
+    let mut used = 0usize;
+
+    for_each_sequence(path, |s| {
+        if used < batch.len() {
+            batch[used].clear();
+            batch[used].extend_from_slice(s);
+        } else {
+            batch.push(s.to_vec());
+        }
+        used += 1;
+
+        if used >= STREAM_BATCH {
+            let partial = genome_kmer_counts_par(&batch[..used], k, threshold);
+            merge_counts(&mut total, partial);
+            used = 0;
+        }
+    })?;
+
+    if used > 0 {
+        let partial = genome_kmer_counts_par(&batch[..used], k, threshold);
+        merge_counts(&mut total, partial);
+    }
+    Ok(total)
+}
+
 // ===== streaming FASTA / FASTQ reading (plain or gzip) =====================
 
 /// Lower-cased file name with any `.gz` suffix removed. Every extension decision goes through
@@ -686,10 +825,109 @@ mod tests {
         }
     }
 
+    /// Deterministic pseudo-random DNA (xorshift; no dev-deps) for the k-mer tests.
+    fn rand_dna(len: usize, mut state: u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state % 4) as usize]
+            })
+            .collect()
+    }
+
+    fn kmers(seq: &[u8], k: usize, threshold: u64) -> MarkerCounts {
+        let mut c = MarkerCounts::default();
+        count_kmers_into(seq, k, threshold, &mut c);
+        c
+    }
+
+    /// Canonical orientation: a sequence and its reverse complement must yield the same k-mer
+    /// marker counts (this is why rolling-hash tricks that skip canonicalization are excluded).
+    #[test]
+    fn kmer_extraction_is_strand_invariant() {
+        let seq = rand_dna(5000, 42);
+        let rc = revcomp(&seq);
+        assert_eq!(kmers(&seq, 31, u64::MAX), kmers(&rc, 31, u64::MAX));
+    }
+
+    /// A window containing any non-ACGT base is skipped: exactly the k windows spanning an N
+    /// are lost, and lower-case ACGT still counts.
+    #[test]
+    fn kmer_windows_with_non_acgt_are_skipped() {
+        let k = 15;
+        let mut seq = rand_dna(400, 7);
+        let clean = kmers(&seq, k, u64::MAX);
+        let total: u64 = clean.values().map(|&c| c as u64).sum();
+        seq[200] = b'N';
+        let with_n = kmers(&seq, k, u64::MAX);
+        let kept: u64 = with_n.values().map(|&c| c as u64).sum();
+        // Random 15-mers are effectively distinct, so exactly k windows disappear.
+        assert_eq!(total - kept, k as u64);
+        // Case-insensitivity: a lower-cased copy yields the same counts.
+        let mut lower = rand_dna(400, 7);
+        lower.make_ascii_lowercase();
+        assert_eq!(clean, kmers(&lower, k, u64::MAX));
+    }
+
+    /// Reads/contigs shorter than K contribute nothing; K = 0 is inert.
+    #[test]
+    fn kmer_shorter_than_k_yields_nothing() {
+        assert!(kmers(b"ACGTACGT", 31, u64::MAX).is_empty());
+        assert!(kmers(b"ACGTACGT", 8, u64::MAX).len() <= 1);
+        assert!(kmers(b"ACGTACGT", 0, u64::MAX).is_empty());
+    }
+
+    /// The sketch is a pure function of the marker: same input, same kept set — the property
+    /// that lets genome build and read profiling agree without exchanging the sketch.
+    #[test]
+    fn kmer_sketch_is_deterministic() {
+        let seq = rand_dna(20_000, 99);
+        let t = sketch_threshold(100);
+        assert_eq!(kmers(&seq, 31, t), kmers(&seq, 31, t));
+        // And scale=1 keeps everything: threshold is u64::MAX, so no window is dropped.
+        let all = kmers(&seq, 31, u64::MAX);
+        assert_eq!(all, kmers(&seq, 31, sketch_threshold(1)));
+        let n: u64 = all.values().map(|&c| c as u64).sum();
+        assert_eq!(n, (seq.len() - 31 + 1) as u64, "scale=1 must keep every window");
+    }
+
+    /// The sketch keeps ~1/S of windows. FNV-1a is not a cryptographic hash but is uniform
+    /// enough that a large random sequence lands within a loose band of the expectation.
+    #[test]
+    fn kmer_sketch_keeps_about_one_over_s() {
+        let seq = rand_dna(300_000, 1234);
+        let all = kmers(&seq, 31, u64::MAX);
+        let total: u64 = all.values().map(|&c| c as u64).sum();
+        let sketched = kmers(&seq, 31, sketch_threshold(100));
+        let kept: u64 = sketched.values().map(|&c| c as u64).sum();
+        let frac = kept as f64 / total as f64;
+        assert!(
+            (0.004..=0.02).contains(&frac),
+            "sketch fraction {frac} far from 1/100 (kept {kept}/{total})"
+        );
+        // The sketched set must be a subset of the full set, with identical counts.
+        for (m, c) in &sketched {
+            assert_eq!(all.get(m), Some(c));
+        }
+    }
+
+    /// The DB header token round-trips and never collides with a real enzyme name.
+    #[test]
+    fn kmer_db_token_roundtrip() {
+        assert_eq!(kmer_db_token(31, 100), "kmer31s100");
+        assert_eq!(parse_kmer_db_token("kmer31s100"), Some((31, 100)));
+        assert_eq!(parse_kmer_db_token("kmer15s1"), Some((15, 1)));
+        for bad in ["BcgI", "all", "kmer", "kmer31", "kmer0s1", "kmer31s0", "kmerasb", "kmer31s"] {
+            assert_eq!(parse_kmer_db_token(bad), None, "{bad} must not parse");
+        }
+        assert_eq!(sketch_threshold(1), u64::MAX);
+    }
+
     /// A missing gzipped file must report "not found", not "corrupt archive".
     #[test]
-    fn missing_gz_reports_not_found() {
-        let err = read_fastx(Path::new("/nonexistent/dir/missing.fa.gz")).unwrap_err();
+    fn missing_gz_reports_not_found() {        let err = read_fastx(Path::new("/nonexistent/dir/missing.fa.gz")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "got: {err}");
     }
 

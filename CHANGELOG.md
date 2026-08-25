@@ -2,6 +2,31 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — raw k-mer sketching marker source
+
+### Added — `--marker-source enzyme|kmer`
+
+`build`/`cluster`/`diagnose-tree` (and the sample side of `profile`/`multi-profile`) can now
+run on **sketched canonical k-mers** instead of enzyme-digested 2bRAD tags, so the same
+downstream machinery (unique-marker Layer-2, `--layer1 cst`, `--layer2 enet`, the
+multi-species gate) works on raw whole-genome k-mers. A marker is the same canonical
+FNV-1a hash used for tags (`marker_from_tag`), applied per k-mer window (`--kmer-size K`,
+default 31) on genome and read alike; windows containing a non-ACGT base are skipped. A
+deterministic hash sketch keeps a marker iff `marker <= u64::MAX / S` (`--sketch-scale S`,
+default 100; S=1 keeps all), treating FNV-1a as uniform enough for an unbiased ~1/S draw.
+Enzyme mode is unchanged and remains the default.
+
+A k-mer database stores `kmer<K>s<S>` in the header's enzyme position; `profile` and
+`multi-profile` auto-detect it and inherit K/S from the DB (CLI `--kmer-size`/
+`--sketch-scale` there act as an override-check that errors on mismatch). Crossing the
+marker spaces — enzyme reads on a k-mer DB, k-mer reads on an enzyme DB, or a mixed `--dbs`
+panel — is a hard error. In kmer mode `--enzyme` is not required and is warned-and-ignored.
+New hot path in `markers`: `count_kmers_into`, `genome_kmer_counts(_par)`,
+`sample_kmer_counts_stream` (same streaming/gzip machinery as the enzyme path). Gates and
+the depth estimator are unchanged; absolute depth interpretation differs slightly for
+sketched k-mers, so re-sweep `--min-support/--min-coverage/--min-consistency` for kmer
+mode (see README).
+
 ## [Unreleased] — pin the tree's marker semantics, correct the measured speedup
 
 ### Added — tests for the two semantics that had none

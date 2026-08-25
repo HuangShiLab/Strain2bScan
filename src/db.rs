@@ -126,6 +126,11 @@ impl StrainDb {
     //   next n lines:      "<strain_name>\t<marker_hex,marker_hex,...>"
     // Sparse and compact; production would use a binary/bgzf layout.
     //
+    // In k-mer mode (`--marker-source kmer`) the <enzyme_csv> position holds the single token
+    // `kmer<K>s<S>` (e.g. `kmer31s100`) instead of enzyme names; `load` does not validate the
+    // field against the enzyme registry, so such databases load unchanged and `profile`
+    // auto-detects the marker source from the token.
+    //
     // The 4th header field declares each strain's marker count (in strain order) so `load` can
     // reject a truncated file: a cut that drops whole trailing strain sections mismatches
     // <n_strains>, and a cut inside the last strain line mismatches that strain's count.
@@ -543,6 +548,34 @@ mod tests {
         assert_eq!(back.n_strains(), 3);
         assert!(back.is_unique(20));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A k-mer-mode database stores `kmer<K>s<S>` in the header's enzyme position. It must
+    /// round-trip intact — including the 4th-field per-strain marker counts — and parse back
+    /// as a k-mer token so `profile` can auto-detect the marker source.
+    #[test]
+    fn kmer_mode_roundtrip() {
+        let mut db = toy();
+        db.enzymes = vec![crate::markers::kmer_db_token(15, 1)];
+        let path = std::env::temp_dir().join("s2bs_kmer_db.tsv");
+        db.save(&path).unwrap();
+
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        let header = text.lines().next().unwrap();
+        let f: Vec<&str> = header.split('\t').collect();
+        assert_eq!(f.len(), 4, "header must keep the 4-field form: {header}");
+        assert_eq!(f[2], "kmer15s1");
+        assert_eq!(f[3], "4,4,4", "per-strain marker counts must be declared");
+
+        let back = StrainDb::load(&path).unwrap();
+        assert_eq!(back.enzymes, vec!["kmer15s1".to_string()]);
+        assert_eq!(
+            crate::markers::parse_kmer_db_token(&back.enzymes[0]),
+            Some((15, 1))
+        );
+        assert_eq!(back.n_strains(), 3);
+        assert!(back.is_unique(30));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Regression: a truncated database used to load with NO warning, silently dropping

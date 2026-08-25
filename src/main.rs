@@ -1,7 +1,7 @@
 //! strain2bscan CLI (prototype).
 //!
-//!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]
-//!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]
+//!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]
+//!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]
 //!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]
 //!   strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--fixed-gate]
 //!   strain2bscan info     --db <db.tsv>
@@ -12,6 +12,11 @@
 //! (`BcgI,CspCI`). Use `BcgI` for BcgI 2bRAD data; use `all` to digitally digest a
 //! conventional metagenome and enrich strain-specific markers. The genome DB and the sample
 //! must use the same enzyme set — `profile` reads the set from the DB header automatically.
+//!
+//! `--marker-source kmer` replaces enzyme digestion with sketched canonical k-mers
+//! (k = `--kmer-size`, default 31; keep ~1/`--sketch-scale`, default 100, of them by hash).
+//! A k-mer DB records `kmer<K>s<S>` in its header; `profile`/`multi-profile` auto-detect
+//! this and refuse to cross the two marker spaces.
 //!
 //! Arg parsing is hand-rolled to keep the prototype dependency-free; production uses clap.
 
@@ -29,8 +34,9 @@ use strain2bscan::identify::{
     Params, StrainCall,
 };
 use strain2bscan::markers::{
-    fastx_stem, genome_marker_counts_multi, is_fasta_path, read_fastx, sample_marker_counts_stream,
-    single_copy_markers, Marker, MarkerCounts,
+    fastx_stem, genome_kmer_counts, genome_marker_counts_multi, is_fasta_path, kmer_db_token,
+    parse_kmer_db_token, read_fastx, sample_kmer_counts_stream, sample_marker_counts_stream,
+    single_copy_markers, sketch_threshold, Marker, MarkerCounts,
 };
 use strain2bscan::parallel::{num_threads, par_map};
 use strain2bscan::quality::{self, GenomeRec, QualityFilter};
@@ -165,9 +171,155 @@ fn enzyme_names(set: &[&Enzyme]) -> Vec<String> {
     set.iter().map(|e| e.name.to_string()).collect()
 }
 
+/// Where markers come from: enzyme-digested 2bRAD tags (default), or sketched raw k-mers.
+/// Both sides of a run (genome DB and sample reads) must use the same source and parameters;
+/// the DB header records which one it was built with, and `profile` enforces the match.
+#[derive(Debug)]
+enum MarkerSource {
+    Enzyme(Vec<&'static Enzyme>),
+    Kmer { k: usize, scale: u64 },
+}
+
+impl MarkerSource {
+    /// Digest all contigs of one genome into marker copy numbers.
+    fn genome_counts(&self, seqs: &[Vec<u8>]) -> MarkerCounts {
+        match self {
+            MarkerSource::Enzyme(set) => genome_marker_counts_multi(seqs, set),
+            MarkerSource::Kmer { k, scale } => genome_kmer_counts(seqs, *k, sketch_threshold(*scale)),
+        }
+    }
+
+    /// Digest a sample's reads into marker counts (streamed, parallel batches).
+    fn sample_counts(&self, reads: &Path) -> Result<MarkerCounts, String> {
+        match self {
+            MarkerSource::Enzyme(set) => sample_marker_counts_stream(reads, set),
+            MarkerSource::Kmer { k, scale } => {
+                sample_kmer_counts_stream(reads, *k, sketch_threshold(*scale))
+            }
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// What the DB header records in the `enzyme_csv` position.
+    fn db_token(&self) -> Vec<String> {
+        match self {
+            MarkerSource::Enzyme(set) => enzyme_names(set),
+            MarkerSource::Kmer { k, scale } => vec![kmer_db_token(*k, *scale)],
+        }
+    }
+
+    /// Human-readable form for progress lines ("enzymes: BcgI" / "k-mer sketch: k=31, scale=100").
+    fn describe(&self) -> String {
+        match self {
+            MarkerSource::Enzyme(set) => format!("enzymes: {}", enzyme_names(set).join("+")),
+            MarkerSource::Kmer { k, scale } => format!("k-mer sketch: k={k}, scale={scale}"),
+        }
+    }
+
+    /// Noun for the per-genome marker report ("tags" / "k-mers").
+    fn marker_noun(&self) -> &'static str {
+        match self {
+            MarkerSource::Enzyme(_) => "tags",
+            MarkerSource::Kmer { .. } => "k-mers",
+        }
+    }
+}
+
+/// Parse `--kmer-size` (default 31) and `--sketch-scale` (default 100).
+fn kmer_params(opts: &HashMap<String, String>) -> Result<(usize, u64), String> {
+    let k: usize = match opts.get("kmer-size") {
+        Some(s) => s.parse().map_err(|_| "bad --kmer-size (want integer >= 1)")?,
+        None => 31,
+    };
+    let scale: u64 = match opts.get("sketch-scale") {
+        Some(s) => s.parse().map_err(|_| "bad --sketch-scale (want integer >= 1)")?,
+        None => 100,
+    };
+    if k == 0 {
+        return Err("bad --kmer-size (want integer >= 1)".into());
+    }
+    if scale == 0 {
+        return Err("bad --sketch-scale (want integer >= 1)".into());
+    }
+    Ok((k, scale))
+}
+
+/// Marker source for the genome-side commands (`build`/`cluster`/`diagnose-tree`).
+/// Enzyme mode (default) is unchanged: `--enzyme` is required. In kmer mode it is not, and
+/// passing it anyway is a warning, not an error.
+fn marker_source_for_build(opts: &HashMap<String, String>) -> Result<MarkerSource, String> {
+    match opts.get("marker-source").map(String::as_str) {
+        None | Some("enzyme") => Ok(MarkerSource::Enzyme(enzyme_set(opts)?)),
+        Some("kmer") => {
+            let (k, scale) = kmer_params(opts)?;
+            if let Some(e) = opts.get("enzyme") {
+                eprintln!("warning: --enzyme {e} is ignored with --marker-source kmer");
+            }
+            Ok(MarkerSource::Kmer { k, scale })
+        }
+        Some(x) => Err(format!("bad --marker-source {x} (want enzyme|kmer)")),
+    }
+}
+
+/// Marker source for the sample side (`profile`): auto-detected from the DB header. A k-mer
+/// DB records `kmer<K>s<S>` in the enzyme position and forces k-mer digestion with those
+/// exact parameters (`--kmer-size`/`--sketch-scale` act as an override-check and error on
+/// mismatch); an enzyme DB forces enzyme digestion. Crossing the two is a hard error — the
+/// marker spaces are disjoint, so a mismatch would report silent garbage otherwise.
+fn resolve_sample_source(db: &StrainDb, opts: &HashMap<String, String>) -> Result<MarkerSource, String> {
+    let db_kmer = if db.enzymes.len() == 1 {
+        parse_kmer_db_token(&db.enzymes[0])
+    } else {
+        None
+    };
+    let want = opts.get("marker-source").map(String::as_str);
+    match (db_kmer, want) {
+        (Some((k, scale)), None | Some("kmer")) => {
+            let (want_k, want_scale) = kmer_params(opts)?;
+            if opts.contains_key("kmer-size") && want_k != k {
+                return Err(format!(
+                    "--kmer-size {want_k} does not match the database (built with k={k})"
+                ));
+            }
+            if opts.contains_key("sketch-scale") && want_scale != scale {
+                return Err(format!(
+                    "--sketch-scale {want_scale} does not match the database (built with scale={scale})"
+                ));
+            }
+            if let Some(e) = opts.get("enzyme") {
+                eprintln!("warning: --enzyme {e} is ignored: the DB is a k-mer sketch (k={k}, scale={scale})");
+            }
+            Ok(MarkerSource::Kmer { k, scale })
+        }
+        (Some((k, scale)), Some("enzyme")) => Err(format!(
+            "this database is a k-mer sketch (k={k}, scale={scale}); profiling it with \
+             --marker-source enzyme would compare disjoint marker spaces"
+        )),
+        (Some(_), Some(x)) => Err(format!("bad --marker-source {x} (want enzyme|kmer)")),
+        (None, Some("kmer")) => Err(format!(
+            "this database was built from enzyme-digested tags ({}); --marker-source kmer \
+             would compare disjoint marker spaces",
+            db.enzymes.join("+")
+        )),
+        (None, None | Some("enzyme")) => {
+            if opts.contains_key("kmer-size") || opts.contains_key("sketch-scale") {
+                eprintln!("warning: --kmer-size/--sketch-scale are ignored for an enzyme-tag database");
+            }
+            // Enzyme set: prefer the DB's recorded set (guarantees a match); else require --enzyme.
+            let set: Vec<&Enzyme> = if !db.enzymes.is_empty() {
+                parse_enzyme_set(&db.enzymes.join(",")).ok_or("DB records an unknown enzyme")?
+            } else {
+                enzyme_set(opts)?
+            };
+            Ok(MarkerSource::Enzyme(set))
+        }
+        (None, Some(x)) => Err(format!("bad --marker-source {x} (want enzyme|kmer)")),
+    }
+}
+
 /// Digest every FASTA genome in `dir` → `GenomeRec` (name, contig count, single-copy tag
 /// markers), in parallel across genomes (the dominant build cost).
-fn digest_genome_dir(dir: &Path, enzymes: &[&Enzyme]) -> Result<Vec<GenomeRec>, String> {
+fn digest_genome_dir(dir: &Path, source: &MarkerSource) -> Result<Vec<GenomeRec>, String> {
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
@@ -188,7 +340,7 @@ fn digest_genome_dir(dir: &Path, enzymes: &[&Enzyme]) -> Result<Vec<GenomeRec>, 
         let name = fastx_stem(path);
         let seqs = read_fastx(path).map_err(|e| e.to_string())?;
         let n_contigs = seqs.len();
-        let counts = genome_marker_counts_multi(&seqs, enzymes);
+        let counts = source.genome_counts(&seqs);
         let full_markers: Vec<Marker> = counts.keys().copied().collect();
         Ok(GenomeRec { name, n_contigs, markers: single_copy_markers(&counts), full_markers })
     });
@@ -213,15 +365,17 @@ fn parse_quality_filter(opts: &HashMap<String, String>) -> Result<QualityFilter,
 /// spurious splits; flagging is always on, dropping happens only when a threshold is set.
 fn digest_and_filter(
     dir: &Path,
-    enzymes: &[&Enzyme],
+    source: &MarkerSource,
     opts: &HashMap<String, String>,
 ) -> Result<Vec<GenomeRec>, String> {
-    let genomes = digest_genome_dir(dir, enzymes)?;
+    let genomes = digest_genome_dir(dir, source)?;
     let filt = parse_quality_filter(opts)?;
     let rep = quality::apply(genomes, &filt);
     println!(
-        "quality: {} genomes, median single-copy tags = {}",
-        rep.n_input, rep.median_tags
+        "quality: {} genomes, median single-copy {} = {}",
+        rep.n_input,
+        source.marker_noun(),
+        rep.median_tags
     );
     for (name, nt) in &rep.flagged {
         println!(
@@ -240,16 +394,20 @@ fn digest_and_filter(
 }
 
 fn cmd_build(opts: &HashMap<String, String>) -> Result<(), String> {
-    let set = enzyme_set(opts)?;
+    let source = marker_source_for_build(opts)?;
     let genomes = PathBuf::from(req(opts, "genomes")?);
     let out = PathBuf::from(req(opts, "out")?);
 
-    let recs = digest_and_filter(&genomes, &set, opts)?;
+    let recs = digest_and_filter(&genomes, &source, opts)?;
     for r in &recs {
-        println!("  {}: {} single-copy tag markers", r.name, r.markers.len());
+        let what = match source {
+            MarkerSource::Enzyme(_) => "tag markers",
+            MarkerSource::Kmer { .. } => "k-mer markers",
+        };
+        println!("  {}: {} single-copy {}", r.name, r.markers.len(), what);
     }
     let mut db = StrainDb::build(recs.into_iter().map(|r| (r.name, r.markers)).collect());
-    db.enzymes = enzyme_names(&set);
+    db.enzymes = source.db_token();
     db.save(&out).map_err(|e| e.to_string())?;
     print_stats(&db);
     println!("saved DB ({}) -> {}", db.enzymes.join("+"), out.display());
@@ -258,7 +416,7 @@ fn cmd_build(opts: &HashMap<String, String>) -> Result<(), String> {
 
 /// Build a within-species Cluster Search Tree DB from genomes (StrainScan Layer-1/2 step).
 fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
-    let set = enzyme_set(opts)?;
+    let source = marker_source_for_build(opts)?;
     let genomes = PathBuf::from(req(opts, "genomes")?);
     let out = PathBuf::from(req(opts, "out")?);
     let similarity = opts
@@ -267,7 +425,7 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
         .unwrap_or(DEFAULT_SIMILARITY);
 
     let containment = opts.contains_key("containment");
-    let recs = digest_and_filter(&genomes, &set, opts)?;
+    let recs = digest_and_filter(&genomes, &source, opts)?;
     let n_genomes = recs.len();
     let cst = SpeciesCst::build(
         recs.into_iter().map(|r| (r.name, r.markers, r.full_markers)).collect(),
@@ -285,10 +443,10 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
         "exact"
     };
     println!(
-        "clustered {} genomes into {} cluster(s) @ similarity {similarity} (enzymes: {}, threads: {}, clustering: {}-{})",
+        "clustered {} genomes into {} cluster(s) @ similarity {similarity} ({}, threads: {}, clustering: {}-{})",
         cst.genome_names.len(),
         cst.n_clusters(),
-        enzyme_names(&set).join("+"),
+        source.describe(),
         num_threads(),
         method,
         dist
@@ -311,12 +469,16 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
 
     // Resolvability check: a cluster needs enough cluster-specific markers to be detectable.
     let mut db = cst.cluster_db();
-    db.enzymes = enzyme_names(&set);
+    db.enzymes = source.db_token();
     // Persist the Cluster Search Tree so `profile --layer1 cst` can descend it. The internal
     // nodes' marker sets cannot be recovered from the cluster rows alone.
     db.tree = Some(cst.build_tree());
     let min_markers = Params::default().min_support_markers;
     let mut resolvable = 0usize;
+    let with_what = match &source {
+        MarkerSource::Enzyme(_) => "with this enzyme set".to_string(),
+        MarkerSource::Kmer { k, scale } => format!("with this k-mer sketch (k={k}, scale={scale})"),
+    };
     for cid in 0..db.n_strains() {
         let n_spec = db.unique_marker_count(cid);
         if n_spec >= min_markers {
@@ -324,17 +486,24 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
         } else {
             println!(
                 "  ⚠ C{cid} has only {n_spec} cluster-specific markers (< {min_markers}); \
-                 not reliably resolvable with this enzyme set."
+                 not reliably resolvable {with_what}."
             );
         }
     }
     if resolvable == 0 {
-        println!(
-            "  ✗ NOT DOABLE at strain/cluster level for this species with enzyme(s) {}. \
-             The species can still be detected (Layer-1); for finer resolution use more \
-             enzymes (--enzyme all) on a conventional metagenome.",
-            enzyme_names(&set).join("+")
-        );
+        match &source {
+            MarkerSource::Enzyme(set) => println!(
+                "  ✗ NOT DOABLE at strain/cluster level for this species with enzyme(s) {}. \
+                 The species can still be detected (Layer-1); for finer resolution use more \
+                 enzymes (--enzyme all) on a conventional metagenome.",
+                enzyme_names(set).join("+")
+            ),
+            MarkerSource::Kmer { .. } => println!(
+                "  ✗ NOT DOABLE at strain/cluster level for this species {with_what}. \
+                 The species can still be detected (Layer-1); for finer resolution use a \
+                 smaller k or a denser sketch (lower --sketch-scale)."
+            ),
+        }
     }
 
     // Write membership sidecar (genome -> cluster) for benchmark truth remapping.
@@ -369,14 +538,14 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
 /// empty and the descent would degenerate into enumerating every leaf. Rather than argue from the
 /// mechanism, measure it: run this on a real panel before committing to the port.
 fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
-    let set = enzyme_set(opts)?;
+    let source = marker_source_for_build(opts)?;
     let genomes = PathBuf::from(req(opts, "genomes")?);
     let similarity = opts
         .get("similarity")
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SIMILARITY);
 
-    let recs = digest_and_filter(&genomes, &set, opts)?;
+    let recs = digest_and_filter(&genomes, &source, opts)?;
     let n = recs.len();
     if n < 2 {
         return Err("need at least 2 genomes to form a hierarchy".into());
@@ -387,10 +556,10 @@ fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
         opts.contains_key("containment"),
     );
     println!(
-        "panel: {} genomes -> {} clusters @ similarity {similarity} (enzymes: {})",
+        "panel: {} genomes -> {} clusters @ similarity {similarity} ({})",
         n,
         cst.n_clusters(),
-        enzyme_names(&set).join("+")
+        source.describe()
     );
 
     let stats = cst.hierarchy_stats();
@@ -551,19 +720,21 @@ fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
 fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     let db = StrainDb::load(Path::new(req(opts, "db")?)).map_err(|e| e.to_string())?;
 
-    // Enzyme set: prefer the DB's recorded set (guarantees a match); else require --enzyme.
-    let set: Vec<&Enzyme> = if !db.enzymes.is_empty() {
-        parse_enzyme_set(&db.enzymes.join(",")).ok_or("DB records an unknown enzyme")?
-    } else {
-        enzyme_set(opts)?
-    };
+    // Marker source: auto-detected from the DB header (a `kmer<K>s<S>` token selects the
+    // k-mer path with the DB's own parameters); crossing enzyme reads with a k-mer DB or
+    // vice versa is a hard error.
+    let source = resolve_sample_source(&db, opts)?;
 
     let reads = PathBuf::from(req(opts, "reads")?);
-    let counts = sample_marker_counts_stream(&reads, &set).map_err(|e| e.to_string())?;
+    let counts = source.sample_counts(&reads)?;
     println!(
-        "sample: {} distinct tag markers (enzymes: {}, threads: {})",
+        "sample: {} distinct {} ({}, threads: {})",
         counts.len(),
-        enzyme_names(&set).join("+"),
+        match source {
+            MarkerSource::Enzyme(_) => "tag markers",
+            MarkerSource::Kmer { .. } => "k-mer markers",
+        },
+        source.describe(),
         num_threads()
     );
 
@@ -586,10 +757,16 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     let calls = profile(&db, &counts, &params);
 
     if calls.is_empty() {
-        println!(
-            "  (no strain/cluster resolved — insufficient strain-specific 2b tags for this \
-             enzyme set; the species may still be present at Layer-1)"
-        );
+        match source {
+            MarkerSource::Enzyme(_) => println!(
+                "  (no strain/cluster resolved — insufficient strain-specific 2b tags for this \
+                 enzyme set; the species may still be present at Layer-1)"
+            ),
+            MarkerSource::Kmer { .. } => println!(
+                "  (no strain/cluster resolved — insufficient strain-specific k-mer markers for \
+                 this sketch; the species may still be present at Layer-1)"
+            ),
+        }
     } else {
         report(&calls);
     }
@@ -717,15 +894,68 @@ fn load_species_dbs(dbs_dir: &Path) -> Result<Vec<(String, StrainDb)>, String> {
 /// This is the scalability advantage over running a full k-mer profiler once per species
 /// (which re-counts k-mers every time).
 fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
-    let set = enzyme_set(opts)?;
     let dbs_dir = PathBuf::from(req(opts, "dbs")?);
     let reads = PathBuf::from(req(opts, "reads")?);
 
-    // 1) digest sample reads ONCE (streamed: peak memory is one batch, not the whole file)
-    let counts = sample_marker_counts_stream(&reads, &set).map_err(|e| e.to_string())?;
-
-    // 2) collect + load per-species DBs
+    // 1) collect + load per-species DBs (before digesting, so the DB headers decide which
+    //    marker source the sample needs)
     let mut loaded = load_species_dbs(&dbs_dir)?;
+
+    // 2) The sample is digested ONCE for the whole panel, so every DB must live in the same
+    //    marker space. A k-mer DB records `kmer<K>s<S>` in its header; a panel mixing k-mer
+    //    and enzyme DBs (or k-mer DBs built with different K/S) cannot be profiled in one
+    //    pass — that is a hard error, not a silent empty result.
+    let kmer_of = |db: &StrainDb| {
+        if db.enzymes.len() == 1 {
+            parse_kmer_db_token(&db.enzymes[0])
+        } else {
+            None
+        }
+    };
+    let n_kmer = loaded.iter().filter(|(_, db)| kmer_of(db).is_some()).count();
+    let source: MarkerSource = if n_kmer == 0 {
+        if opts.get("marker-source").is_some_and(|m| m == "kmer") {
+            return Err(
+                "--marker-source kmer but every DB in --dbs is an enzyme-tag database; \
+                 the marker spaces are disjoint".into(),
+            );
+        }
+        MarkerSource::Enzyme(enzyme_set(opts)?)
+    } else if n_kmer != loaded.len() {
+        return Err(format!(
+            "mixed panel: {} k-mer DB(s) and {} enzyme-tag DB(s) in --dbs; a sample can only \
+             be digested one way per run, so profile k-mer and enzyme panels separately",
+            n_kmer,
+            loaded.len() - n_kmer
+        ));
+    } else {
+        let (k, scale) = kmer_of(&loaded[0].1).unwrap();
+        if let Some((sp, _)) = loaded
+            .iter()
+            .find(|(_, db)| kmer_of(db) != Some((k, scale)))
+        {
+            return Err(format!(
+                "k-mer DBs in --dbs disagree on k/scale: '{sp}' was not built with \
+                 k={k}, scale={scale}; rebuild the panel with one parameter set"
+            ));
+        }
+        let (want_k, want_scale) = kmer_params(opts)?;
+        if opts.contains_key("kmer-size") && want_k != k {
+            return Err(format!("--kmer-size {want_k} does not match the panel (built with k={k})"));
+        }
+        if opts.contains_key("sketch-scale") && want_scale != scale {
+            return Err(format!(
+                "--sketch-scale {want_scale} does not match the panel (built with scale={scale})"
+            ));
+        }
+        if let Some(e) = opts.get("enzyme") {
+            eprintln!("warning: --enzyme {e} is ignored: the panel is a k-mer sketch (k={k}, scale={scale})");
+        }
+        MarkerSource::Kmer { k, scale }
+    };
+
+    // 3) digest sample reads ONCE (streamed: peak memory is one batch, not the whole file)
+    let counts = source.sample_counts(&reads)?;
 
     // 3) Layer-1 species gate (breadth-aware, three-tier). Strain markers are unique only
     //    *within* a species, so an absent species can be spuriously hit by a present relative's
@@ -800,15 +1030,27 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     }
     let loaded = loaded;
 
-    println!(
-        "sample: {} distinct tag markers; {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
-        counts.len(),
-        loaded.len(),
-        min_species_markers,
-        min_species_marker_frac * 100.0,
-        min_species_detect,
-        num_threads()
-    );
+    match &source {
+        MarkerSource::Enzyme(_) => println!(
+            "sample: {} distinct tag markers; {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
+            counts.len(),
+            loaded.len(),
+            min_species_markers,
+            min_species_marker_frac * 100.0,
+            min_species_detect,
+            num_threads()
+        ),
+        MarkerSource::Kmer { .. } => println!(
+            "sample: {} distinct k-mer markers ({}); {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
+            counts.len(),
+            source.describe(),
+            loaded.len(),
+            min_species_markers,
+            min_species_marker_frac * 100.0,
+            min_species_detect,
+            num_threads()
+        ),
+    }
 
     // 4) gate + strain-profile each species, in parallel.
     //    `--min-abundance` applies WITHIN a species, matching the primary output column: it
@@ -1095,14 +1337,25 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
 
 fn cmd_info(opts: &HashMap<String, String>) -> Result<(), String> {
     let db = StrainDb::load(Path::new(req(opts, "db")?)).map_err(|e| e.to_string())?;
-    println!(
-        "enzymes: {}",
-        if db.enzymes.is_empty() {
-            "(unspecified)".into()
-        } else {
-            db.enzymes.join("+")
-        }
-    );
+    let kmer = if db.enzymes.len() == 1 {
+        parse_kmer_db_token(&db.enzymes[0])
+    } else {
+        None
+    };
+    match kmer {
+        Some((k, scale)) => println!(
+            "marker source: k-mer sketch (k={k}, sketch scale={scale}; DB token: {})",
+            db.enzymes[0]
+        ),
+        None => println!(
+            "enzymes: {}",
+            if db.enzymes.is_empty() {
+                "(unspecified)".into()
+            } else {
+                db.enzymes.join("+")
+            }
+        ),
+    }
     print_stats(&db);
     for (i, name) in db.strain_names.iter().enumerate() {
         println!(
@@ -1268,9 +1521,77 @@ fn print_stats(db: &StrainDb) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_species_dbs, species_tier, SpeciesTier};
+    use super::{load_species_dbs, resolve_sample_source, species_tier, MarkerSource, SpeciesTier};
+    use std::collections::HashMap;
     use strain2bscan::db::StrainDb;
     use strain2bscan::identify::detectable_fraction;
+
+    fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn kmer_db() -> StrainDb {
+        let mut db = StrainDb::build(vec![("A".into(), vec![1, 2, 3, 10]), ("B".into(), vec![1, 2, 3, 20])]);
+        db.enzymes = vec!["kmer15s1".to_string()];
+        db
+    }
+
+    fn enzyme_db() -> StrainDb {
+        let mut db = StrainDb::build(vec![("A".into(), vec![1, 2, 3, 10]), ("B".into(), vec![1, 2, 3, 20])]);
+        db.enzymes = vec!["BcgI".to_string()];
+        db
+    }
+
+    /// A k-mer DB must auto-detect: no flags needed, and the run inherits the DB's K and S.
+    #[test]
+    fn profile_auto_detects_kmer_db() {
+        let src = resolve_sample_source(&kmer_db(), &opts(&[])).unwrap();
+        match src {
+            MarkerSource::Kmer { k, scale } => assert_eq!((k, scale), (15, 1)),
+            _ => panic!("k-mer DB must select the k-mer source"),
+        }
+        // Explicitly naming the mode and the matching parameters is fine too.
+        let src = resolve_sample_source(
+            &kmer_db(),
+            &opts(&[("marker-source", "kmer"), ("kmer-size", "15"), ("sketch-scale", "1")]),
+        )
+        .unwrap();
+        assert!(matches!(src, MarkerSource::Kmer { k: 15, scale: 1 }));
+    }
+
+    /// CLI K/S against a k-mer DB act as an override-CHECK: a mismatch is a hard error.
+    #[test]
+    fn profile_rejects_kmer_param_mismatch() {
+        let err = resolve_sample_source(&kmer_db(), &opts(&[("kmer-size", "31")])).unwrap_err();
+        assert!(err.contains("does not match the database"), "{err}");
+        let err = resolve_sample_source(&kmer_db(), &opts(&[("sketch-scale", "100")])).unwrap_err();
+        assert!(err.contains("does not match the database"), "{err}");
+    }
+
+    /// Crossing the marker spaces — enzyme reads on a k-mer DB or k-mer reads on an enzyme
+    /// DB — must be a hard error, never silent garbage.
+    #[test]
+    fn profile_rejects_crossing_marker_spaces() {
+        let err = resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "enzyme")])).unwrap_err();
+        assert!(err.contains("k-mer sketch"), "{err}");
+        let err = resolve_sample_source(&enzyme_db(), &opts(&[("marker-source", "kmer")])).unwrap_err();
+        assert!(err.contains("disjoint marker spaces"), "{err}");
+        let err = resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "wat")])).unwrap_err();
+        assert!(err.contains("bad --marker-source"), "{err}");
+    }
+
+    /// Enzyme mode is unchanged: the DB's recorded set wins, no k-mer flags involved.
+    #[test]
+    fn profile_enzyme_db_stays_on_enzyme_path() {
+        let src = resolve_sample_source(&enzyme_db(), &opts(&[])).unwrap();
+        match src {
+            MarkerSource::Enzyme(set) => {
+                assert_eq!(set.len(), 1);
+                assert_eq!(set[0].name, "BcgI");
+            }
+            _ => panic!("enzyme DB must select the enzyme source"),
+        }
+    }
 
     /// A DB that fails to load must abort the run with an error naming the file — never
     /// degrade to an empty DB that silently reports the species as absent (the old

@@ -84,6 +84,39 @@ sample must use the same set — `profile` reads it from the DB header automatic
 2. **Conventional metagenome** (150 bp / long reads): `--enzyme all` — digitally digest with
    all 16 enzymes to enrich strain markers (~hundreds× more tags).
 
+## Raw k-mer mode (`--marker-source kmer`)
+
+The same machinery (unique-marker profiling, `--layer1 cst`, `--layer2 enet`,
+`multi-profile`) can run on **raw whole-genome k-mers** instead of enzyme tags — i.e.
+StrainScan's original marker universe with a deterministic sketch on top:
+
+```bash
+strain2bscan cluster --genomes acnes_genomes/ --marker-source kmer \
+    --kmer-size 31 --sketch-scale 100 --out acnes.kmer.db.tsv
+strain2bscan profile --db acnes.kmer.db.tsv --reads sample.fq --out pred.tsv
+```
+
+- A marker is the **same canonical FNV-1a hash** used for tags (`marker_from_tag`), applied
+  to each k-mer window; genome build and read profiling share the identical path, so the
+  marker spaces match by construction. Windows containing a non-ACGT base are skipped;
+  sequences shorter than K contribute nothing.
+- The **sketch** keeps a marker iff `marker <= u64::MAX / S` (`--sketch-scale S`, default
+  100; `S=1` keeps everything). FNV-1a of a canonical k-mer is treated as uniform enough
+  for this, so the kept fraction is ~1/S and genomes and reads always agree on the sketch.
+  Larger S → smaller/faster DBs, fewer markers per cluster; scale=1 is the right choice for
+  small panels and tests, 50–200 for whole-genome bacterial panels.
+- A k-mer DB stores the token `kmer<K>s<S>` (e.g. `kmer31s100`) in the DB header's enzyme
+  position (`info` shows it). `profile`/`multi-profile` **auto-detect** k-mer mode from the
+  header and inherit K and S from the DB — passing `--kmer-size`/`--sketch-scale` there acts
+  as an override-check and **errors on mismatch**. Crossing the spaces (enzyme reads against
+  a k-mer DB or vice versa, or a mixed `--dbs` panel) is a hard error, never silent garbage.
+  In kmer mode `--enzyme` is not required; passing it is a warning and is ignored.
+- **Gate caveat:** the detection gates (`--min-support`, `--min-coverage`,
+  `--min-consistency`) carry over unchanged, but absolute *depth* interpretation differs
+  slightly in kmer mode — sketched k-mers sample genome positions uniformly, unlike
+  enzyme-restricted tags — so it is worth re-sweeping `--min-support/--min-coverage/
+  --min-consistency` for k-mer databases rather than reusing enzyme-calibrated values.
+
 ## Usage
 
 ```bash
