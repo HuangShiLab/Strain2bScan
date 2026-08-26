@@ -2,6 +2,28 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — `batch` subcommand for multi-sample projects
+
+### Added — `strain2bscan batch --dbs <dir> --manifest <csv> --out <merged.tsv>`
+
+Profiles many samples against a per-species DB panel loaded **once** — previously the only
+option was one `multi-profile` run per sample plus an offline merge. The manifest is a CSV
+with header `sample,reads1,reads2` (`reads2` optional or empty = single-end; relative read
+paths resolve against the manifest's own directory). Paired mates are counted as one sample,
+exactly equivalent to digesting `cat R1 R2` (counting is per-read additive). The output is
+one merged long table: a leading `sample` column followed by the `multi-profile --out`
+columns in their existing append-only order, and each sample's rows are field-identical to
+a solo `multi-profile --out` run — pinned by `tests/batch_mode.rs`, which diffs batch rows
+against per-sample `multi-profile` output (the paired sample against the concatenated
+mates). All of `multi-profile`'s identification parameters are accepted unchanged, and
+per-sample progress is printed to stderr. A missing or unreadable reads file aborts the
+whole run with an error naming the manifest line — a sample is never silently skipped.
+
+`cmd_multi_profile` was refactored into shared `load_panel` / `profile_sample` functions so
+both subcommands run the identical code path; its stdout summary, `--out` file, and
+`--layer1 auto` reporting are byte-identical to before (verified by diffing against the
+pre-refactor binary on a synthetic two-species panel).
+
 ## [Unreleased] — raw k-mer sketching marker source
 
 ### Added — `--marker-source enzyme|kmer`

@@ -128,6 +128,11 @@ strain2bscan evaluate     --pred pred.tsv --truth truth.clusters.tsv --present 0
 # many species at once: one DB per species in a dir; sample digested once, matched in parallel
 strain2bscan multi-profile --dbs species_dbs/ --reads sample.fq --enzyme all --min-species-markers 200
 
+# many samples at once: panel loaded once, one merged long table (leading `sample` column)
+strain2bscan batch --dbs species_dbs/ --manifest samples.csv --enzyme all --out merged.tsv
+# samples.csv header: sample,reads1,reads2  (reads2 optional/empty = single-end; relative
+# paths resolve against the manifest's directory; R1+R2 counted exactly like `cat R1 R2`)
+
 # will a Cluster Search Tree carry any signal on this panel? (answer before profiling)
 strain2bscan diagnose-tree --genomes acnes_genomes/ --enzyme all
 
@@ -139,6 +144,15 @@ STRAIN2BSCAN_THREADS=8 strain2bscan cluster ...   # control threads (default: al
 ```
 
 `cluster` also writes `<out>.members.tsv` (genome→cluster) for remapping ground truth.
+
+`batch` is the multi-sample form of `multi-profile`: the panel is loaded **once** and every
+manifest sample is digested and profiled against it (per-sample progress goes to stderr).
+The merged table's columns are `sample` followed by the `multi-profile --out` columns in
+their existing order (the append-only contract), and a sample's rows are field-identical to
+a solo `multi-profile --out` run — all identification flags are shared. A missing or
+unreadable reads file aborts the run naming the manifest line; samples are never silently
+skipped. If you already have per-sample `.pred` files and only need them combined (no
+re-profiling), `scripts/merge_profiles.py --out merged.tsv *.pred` merges them offline.
 
 ## The two ported layers (`--layer1`, `--layer2`)
 

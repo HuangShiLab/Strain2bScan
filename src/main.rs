@@ -4,6 +4,7 @@
 //!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]
 //!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]
 //!   strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--fixed-gate]
+//!   strain2bscan batch   --dbs <dir> --manifest <csv> --out <merged.tsv> [--enzyme <set>] [multi-profile options]
 //!   strain2bscan info     --db <db.tsv>
 //!   strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]
 //!   strain2bscan demo | cst-demo
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
         "diagnose-tree" => cmd_diagnose_tree(&opts),
         "profile" => cmd_profile(&opts),
         "multi-profile" => cmd_multi_profile(&opts),
+        "batch" => cmd_batch(&opts),
         "info" => cmd_info(&opts),
         "evaluate" => cmd_evaluate(&opts),
         "demo" => cmd_demo(),
@@ -63,6 +65,7 @@ fn main() -> ExitCode {
                  strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--layer1 auto|unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
+                 strain2bscan batch   --dbs <dir> --manifest <csv> --out <merged.tsv> [--enzyme <set>] [same identification options as multi-profile]   (many samples, DBs loaded once; manifest header: sample,reads1,reads2 — reads2 optional, empty = single-end)\n  \
                  strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95]   (can a Cluster Search Tree work on this panel?)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
@@ -198,6 +201,18 @@ impl MarkerSource {
             }
         }
         .map_err(|e| e.to_string())
+    }
+
+    /// Digest a possibly paired-end sample: R1 and R2 counted separately and summed.
+    /// Counting is per-read additive, so this is exactly what digesting `cat R1 R2` yields.
+    fn sample_counts_paired(&self, r1: &Path, r2: Option<&Path>) -> Result<MarkerCounts, String> {
+        let mut counts = self.sample_counts(r1)?;
+        if let Some(r2) = r2 {
+            for (m, c) in self.sample_counts(r2)? {
+                *counts.entry(m).or_insert(0) += c;
+            }
+        }
+        Ok(counts)
     }
 
     /// What the DB header records in the `enzyme_csv` position.
@@ -889,13 +904,48 @@ fn load_species_dbs(dbs_dir: &Path) -> Result<Vec<(String, StrainDb)>, String> {
     .collect()
 }
 
-/// Multi-species strain profiling: digest the sample reads ONCE, then match the shared tag
-/// counts against every per-species cluster DB in `--dbs <dir>`, in parallel across species.
-/// This is the scalability advantage over running a full k-mer profiler once per species
-/// (which re-counts k-mers every time).
-fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
+/// The three-tier species-gate thresholds (`--min-species-markers` /
+/// `--min-species-marker-frac` / `--min-species-detect`), parsed once per run so that every
+/// sample in a `batch` is gated identically.
+#[derive(Clone, Copy)]
+struct SpeciesGate {
+    min_markers: usize,
+    min_frac: f64,
+    min_detect: usize,
+}
+
+fn species_gate(opts: &HashMap<String, String>) -> SpeciesGate {
+    SpeciesGate {
+        min_markers: opts
+            .get("min-species-markers")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200),
+        min_frac: opts
+            .get("min-species-marker-frac")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0),
+        min_detect: opts
+            .get("min-species-detect")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+    }
+}
+
+/// A loaded multi-species panel: the per-species DBs (each already restricted to its
+/// panel-specific markers unless `--no-cross-species-filter`), the marker source their
+/// headers imply, and each species' panel-specific marker set. Loading a panel is the
+/// expensive part of multi-species profiling, so it happens ONCE per run — `batch` exists
+/// to profile many samples against one panel.
+struct Panel {
+    loaded: Vec<(String, StrainDb)>,
+    source: MarkerSource,
+    specific_sets: Vec<FxHashSet<Marker>>,
+}
+
+/// Collect + load the per-species DBs in `--dbs <dir>`, decide the sample marker source from
+/// their headers, and compute (and apply) the cross-species marker restriction.
+fn load_panel(opts: &HashMap<String, String>) -> Result<Panel, String> {
     let dbs_dir = PathBuf::from(req(opts, "dbs")?);
-    let reads = PathBuf::from(req(opts, "reads")?);
 
     // 1) collect + load per-species DBs (before digesting, so the DB headers decide which
     //    marker source the sample needs)
@@ -954,10 +1004,7 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         MarkerSource::Kmer { k, scale }
     };
 
-    // 3) digest sample reads ONCE (streamed: peak memory is one batch, not the whole file)
-    let counts = source.sample_counts(&reads)?;
-
-    // 3) Layer-1 species gate (breadth-aware, three-tier). Strain markers are unique only
+    // Layer-1 species gate (breadth-aware, three-tier). Strain markers are unique only
     //    *within* a species, so an absent species can be spuriously hit by a present relative's
     //    shared tags. We derive species-specific markers — tags carried by exactly ONE species
     //    across the panel (Strain2bScan's own species layer, same tag space as Fast2bRAD-M) —
@@ -971,19 +1018,7 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     //    detected-not-resolvable (species-level only); else absent. All inputs come from
     //    Strain2bScan's own DBs + one digest of the raw reads — no external abundance needed.
     //    Defaults tuned on a 40-species panel (precision ~0.94 @ recall 1.0); calibrate per
-    //    enzyme set and depth.
-    let min_species_markers: usize = opts
-        .get("min-species-markers")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
-    let min_species_marker_frac: f64 = opts
-        .get("min-species-marker-frac")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
-    let min_species_detect: usize = opts
-        .get("min-species-detect")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    //    enzyme set and depth (the thresholds are parsed once per run in `species_gate`).
     let mut species_degree: FxHashMap<Marker, u32> = FxHashMap::default();
     for (_, db) in &loaded {
         for &m in db.marker_degree.keys() {
@@ -1029,34 +1064,50 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         );
     }
     let loaded = loaded;
+    Ok(Panel {
+        loaded,
+        source,
+        specific_sets,
+    })
+}
 
-    match &source {
-        MarkerSource::Enzyme(_) => println!(
-            "sample: {} distinct tag markers; {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
-            counts.len(),
-            loaded.len(),
-            min_species_markers,
-            min_species_marker_frac * 100.0,
-            min_species_detect,
-            num_threads()
-        ),
-        MarkerSource::Kmer { .. } => println!(
-            "sample: {} distinct k-mer markers ({}); {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
-            counts.len(),
-            source.describe(),
-            loaded.len(),
-            min_species_markers,
-            min_species_marker_frac * 100.0,
-            min_species_detect,
-            num_threads()
-        ),
-    }
+/// One output row of a multi-species profile: one resolved cluster of one species, in the
+/// `--out` column order. Owned rather than borrowed so `batch` can hold every sample's rows
+/// at once; `batch` prepends its `sample` column when writing.
+struct ProfileRow {
+    species: String,
+    call: StrainCall,
+    global_abundance: f64,
+    sample_fraction: f64,
+}
+
+/// Everything one sample yields against the panel, before any reporting.
+struct SampleProfile {
+    per_species: Vec<SpeciesResult>,
+    /// Rows sorted by species, then by descending within-species abundance.
+    rows: Vec<ProfileRow>,
+    /// Total tag observations in the sample (the `sample_fraction` denominator).
+    total_tags: u64,
+}
+
+/// Gate + strain-profile every species of the panel against ONE sample's tag counts, then
+/// quantify (steps 4-5 of the multi-species pipeline). Shared by `multi-profile` (one
+/// sample, full stdout report) and `batch` (many samples, rows only).
+fn profile_sample(
+    panel: &Panel,
+    counts: &MarkerCounts,
+    gate: &SpeciesGate,
+    params: &Params,
+    opts: &HashMap<String, String>,
+) -> Result<SampleProfile, String> {
+    let loaded = &panel.loaded;
+    let specific_sets = &panel.specific_sets;
+    let gate = *gate;
 
     // 4) gate + strain-profile each species, in parallel.
     //    `--min-abundance` applies WITHIN a species, matching the primary output column: it
     //    decides which clusters of a present species are real. Whether the *species* is present
-    //    at all is the Layer-1 species gate's decision (step 3), not this filter's.
-    let params = parse_params(opts)?;
+    //    at all is the Layer-1 species gate's decision, not this filter's.
     let order: Vec<usize> = (0..loaded.len()).collect();
     let mut per_species: Vec<SpeciesResult> = par_map(&order, |&i| {
         let (species, db) = &loaded[i];
@@ -1090,17 +1141,17 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         let tier = species_tier(
             present_specific,
             total_specific,
-            min_species_detect,
-            min_species_markers,
-            min_species_marker_frac,
+            gate.min_detect,
+            gate.min_markers,
+            gate.min_frac,
             reachable,
         );
         let calls = if tier == SpeciesTier::Resolved {
-            profile(db, &counts, &params)
+            profile(db, counts, params)
         } else {
             Vec::new()
         };
-        let layer1 = resolve_layer1(db, &params);
+        let layer1 = resolve_layer1(db, params);
         let tree = tree_utility(db, params.min_support_markers);
         SpeciesResult {
             species: species.clone(),
@@ -1217,37 +1268,88 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         }
     };
 
-    // 6) report, grouped by species, most abundant cluster first within each
-    let mut flat: Vec<(&str, &StrainCall, f64, f64)> = per_species
+    // Output rows, grouped by species, most abundant cluster first within each.
+    let mut rows: Vec<ProfileRow> = per_species
         .iter()
         .flat_map(|r| {
-            r.calls
-                .iter()
-                .map(move |c| (r.species.as_str(), c, global_of(c), sample_fraction_of(c)))
+            r.calls.iter().map(move |c| ProfileRow {
+                species: r.species.clone(),
+                call: c.clone(),
+                global_abundance: global_of(c),
+                sample_fraction: sample_fraction_of(c),
+            })
         })
         .collect();
-    flat.sort_by(|a, b| {
-        a.0.cmp(b.0).then(
-            b.1.rel_abundance
-                .partial_cmp(&a.1.rel_abundance)
+    rows.sort_by(|a, b| {
+        a.species.cmp(&b.species).then(
+            b.call
+                .rel_abundance
+                .partial_cmp(&a.call.rel_abundance)
                 .unwrap_or(std::cmp::Ordering::Equal),
         )
     });
 
+    Ok(SampleProfile {
+        per_species,
+        rows,
+        total_tags,
+    })
+}
+
+/// Multi-species strain profiling: digest the sample reads ONCE, then match the shared tag
+/// counts against every per-species cluster DB in `--dbs <dir>`, in parallel across species.
+/// This is the scalability advantage over running a full k-mer profiler once per species
+/// (which re-counts k-mers every time).
+fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
+    let reads = PathBuf::from(req(opts, "reads")?);
+    let panel = load_panel(opts)?;
+    let gate = species_gate(opts);
+    let params = parse_params(opts)?;
+
+    // Digest the sample reads ONCE (streamed: peak memory is one batch, not the whole file).
+    let counts = panel.source.sample_counts(&reads)?;
+
+    match &panel.source {
+        MarkerSource::Enzyme(_) => println!(
+            "sample: {} distinct tag markers; {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
+            counts.len(),
+            panel.loaded.len(),
+            gate.min_markers,
+            gate.min_frac * 100.0,
+            gate.min_detect,
+            num_threads()
+        ),
+        MarkerSource::Kmer { .. } => println!(
+            "sample: {} distinct k-mer markers ({}); {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
+            counts.len(),
+            panel.source.describe(),
+            panel.loaded.len(),
+            gate.min_markers,
+            gate.min_frac * 100.0,
+            gate.min_detect,
+            num_threads()
+        ),
+    }
+
+    let result = profile_sample(&panel, &counts, &gate, &params, opts)?;
+
+    // 6) report, grouped by species, most abundant cluster first within each
     // Append-only column order: the first six match what `multi-profile` wrote before the
     // accuracy rewrite, so positional readers keep working; new columns go on the end.
     println!(
         "#species\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction"
     );
-    for (species, c, g, sf) in &flat {
+    for r in &result.rows {
+        let c = &r.call;
         println!(
             "  {}\t{}\t{:.6}\t{:.2}\t{:.0}\t{:.3}\t{:.6}\t{:.6}",
-            species, c.name, c.rel_abundance, c.coverage, c.support, c.depth, g, sf
+            r.species, c.name, c.rel_abundance, c.coverage, c.support, c.depth,
+            r.global_abundance, r.sample_fraction
         );
     }
 
     let (mut n_resolved, mut n_detected) = (0usize, 0usize);
-    for r in &per_species {
+    for r in &result.per_species {
         match r.tier {
             SpeciesTier::Resolved => {
                 n_resolved += 1;
@@ -1295,21 +1397,22 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     println!(
         "summary: {}/{} species strain-resolved ({} strain calls), {} detected-not-resolvable, {} absent",
         n_resolved,
-        loaded.len(),
-        flat.len(),
+        panel.loaded.len(),
+        result.rows.len(),
         n_detected,
-        loaded.len() - n_resolved - n_detected
+        panel.loaded.len() - n_resolved - n_detected
     );
     // How much of the sequencing the strain calls actually account for. The remainder is
     // unresolved species, organisms with no reference in the panel, host DNA and sequencing
     // error — real signal that `global_abundance`'s denominator silently omits.
-    let classified: f64 = flat.iter().map(|(_, c, _, _)| mass_of(c)).sum();
-    if total_tags > 0 {
-        let pct = 100.0 * classified / total_tags as f64;
+    let mass_of = |c: &StrainCall| c.depth * c.n_markers as f64;
+    let classified: f64 = result.rows.iter().map(|r| mass_of(&r.call)).sum();
+    if result.total_tags > 0 {
+        let pct = 100.0 * classified / result.total_tags as f64;
         println!(
             "coverage of sample: strain calls account for {:.1}% of {} tag observations ({:.1}% unclassified — unresolved species, no reference, host, error)",
             pct.min(100.0),
-            total_tags,
+            result.total_tags,
             (100.0 - pct).max(0.0)
         );
     }
@@ -1322,16 +1425,184 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
             "#species\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction\tn_markers"
         )
         .map_err(|e| e.to_string())?;
-        for (species, c, g, sf) in &flat {
+        for r in &result.rows {
+            let c = &r.call;
             writeln!(
                 w,
                 "{}\t{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{:.6}\t{:.6}\t{}",
-                species, c.name, c.rel_abundance, c.coverage, c.support, c.depth, g, sf, c.n_markers
+                r.species, c.name, c.rel_abundance, c.coverage, c.support, c.depth,
+                r.global_abundance, r.sample_fraction, c.n_markers
             )
             .map_err(|e| e.to_string())?;
         }
         println!("predictions -> {out}");
     }
+    Ok(())
+}
+
+/// One row of the `batch` manifest.
+struct ManifestSample {
+    name: String,
+    reads1: PathBuf,
+    /// `None` = single-end (the `reads2` column was empty or absent).
+    reads2: Option<PathBuf>,
+}
+
+/// Read the batch manifest: a CSV with header `sample,reads1[,reads2]`. Relative read paths
+/// resolve against the manifest's own directory, so a manifest is relocatable. Every problem
+/// — bad header, wrong field count, empty sample name, duplicate names, a missing reads
+/// file — is a HARD error naming the manifest line: a skipped sample would silently vanish
+/// from the merged table, and this codebase has already been bitten by that bug class once.
+fn read_manifest(path: &Path) -> Result<Vec<ManifestSample>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read manifest {}: {e}", path.display()))?;
+    // `parent` of a bare filename is "", which joins as a no-op — relative paths then resolve
+    // against the working directory, exactly where the manifest was found.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut lines = text.lines();
+
+    let header = lines.next().ok_or_else(|| format!("manifest {} is empty", path.display()))?;
+    let cols: Vec<&str> = header.split(',').map(str::trim).collect();
+    if cols.len() < 2 || cols[0] != "sample" || cols[1] != "reads1" {
+        return Err(format!(
+            "manifest {}: header must be `sample,reads1[,reads2]`, got `{header}`",
+            path.display()
+        ));
+    }
+    if cols.len() > 2 && cols[2] != "reads2" {
+        return Err(format!(
+            "manifest {}: third column must be `reads2`, got `{}`",
+            path.display(),
+            cols[2]
+        ));
+    }
+
+    let resolve = |p: &str| {
+        let q = Path::new(p);
+        if q.is_absolute() {
+            q.to_path_buf()
+        } else {
+            dir.join(q)
+        }
+    };
+    let mut samples = Vec::new();
+    for (i, line) in lines.enumerate() {
+        let lineno = i + 2; // 1-based, past the header
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').map(str::trim).collect();
+        if !(2..=3).contains(&f.len()) {
+            return Err(format!(
+                "manifest {} line {lineno}: want `sample,reads1[,reads2]` (2-3 fields), got {} field(s)",
+                path.display(),
+                f.len()
+            ));
+        }
+        if f[0].is_empty() {
+            return Err(format!("manifest {} line {lineno}: empty sample name", path.display()));
+        }
+        if f[1].is_empty() {
+            return Err(format!(
+                "manifest {} line {lineno} (sample '{}'): empty reads1",
+                path.display(),
+                f[0]
+            ));
+        }
+        let reads1 = resolve(f[1]);
+        let reads2 = match f.get(2) {
+            Some(&p) if !p.is_empty() => Some(resolve(p)),
+            _ => None,
+        };
+        for p in [&reads1].into_iter().chain(reads2.iter()) {
+            if !p.is_file() {
+                return Err(format!(
+                    "manifest {} line {lineno} (sample '{}'): reads file not found: {}",
+                    path.display(),
+                    f[0],
+                    p.display()
+                ));
+            }
+        }
+        if samples.iter().any(|s: &ManifestSample| s.name == f[0]) {
+            return Err(format!(
+                "manifest {} line {lineno}: duplicate sample name '{}'",
+                path.display(),
+                f[0]
+            ));
+        }
+        samples.push(ManifestSample {
+            name: f[0].to_string(),
+            reads1,
+            reads2,
+        });
+    }
+    if samples.is_empty() {
+        return Err(format!("manifest {}: no samples", path.display()));
+    }
+    Ok(samples)
+}
+
+/// Batch multi-species profiling: the panel is loaded ONCE, then every sample in the
+/// manifest is digested and profiled against it, writing one merged long table — the
+/// `multi-profile --out` columns with a leading `sample` column (append-only contract: the
+/// existing columns keep their order, `sample` goes in front). A sample's rows are
+/// field-identical to what `multi-profile --out` writes for it; paired-end R1+R2 are counted
+/// as one sample, exactly equivalent to digesting `cat R1 R2`.
+fn cmd_batch(opts: &HashMap<String, String>) -> Result<(), String> {
+    let manifest = PathBuf::from(req(opts, "manifest")?);
+    let out = PathBuf::from(req(opts, "out")?);
+    let panel = load_panel(opts)?;
+    let gate = species_gate(opts);
+    let params = parse_params(opts)?;
+    let samples = read_manifest(&manifest)?;
+
+    use std::io::Write;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(&out).map_err(|e| e.to_string())?);
+    writeln!(
+        w,
+        "#sample\tspecies\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction\tn_markers"
+    )
+    .map_err(|e| e.to_string())?;
+
+    for (i, s) in samples.iter().enumerate() {
+        eprintln!(
+            "[batch {}/{}] sample {}: {}",
+            i + 1,
+            samples.len(),
+            s.name,
+            match &s.reads2 {
+                Some(r2) => format!("{} + {}", s.reads1.display(), r2.display()),
+                None => s.reads1.display().to_string(),
+            }
+        );
+        let counts = panel
+            .source
+            .sample_counts_paired(&s.reads1, s.reads2.as_deref())
+            .map_err(|e| format!("sample '{}': {e}", s.name))?;
+        let result = profile_sample(&panel, &counts, &gate, &params, opts)?;
+        eprintln!(
+            "[batch {}/{}] sample {}: {} distinct markers, {} strain call(s)",
+            i + 1,
+            samples.len(),
+            s.name,
+            counts.len(),
+            result.rows.len()
+        );
+        for r in &result.rows {
+            let c = &r.call;
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{:.6}\t{:.6}\t{}",
+                s.name, r.species, c.name, c.rel_abundance, c.coverage, c.support, c.depth,
+                r.global_abundance, r.sample_fraction, c.n_markers
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    println!("predictions ({} samples) -> {}", samples.len(), out.display());
     Ok(())
 }
 
