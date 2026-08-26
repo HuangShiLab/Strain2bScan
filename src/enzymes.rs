@@ -109,6 +109,20 @@ impl Enzyme {
         }
     }
 
+    /// Does this enzyme recognise the `tag_length` window at `offset`?
+    ///
+    /// The pattern half of [`Enzyme::for_each_tag`]'s test, without the `is_pure_atcg` half.
+    /// Callers use it to ask whether a window *another* enzyme already accepted is also this
+    /// one's site (see `markers::count_markers_into`), and purity is a property of the window,
+    /// not of the enzyme — the first acceptance has already established it.
+    #[inline]
+    pub fn matches_at(&self, sequence: &[u8], offset: usize) -> bool {
+        match sequence.get(offset..offset + self.tag_length) {
+            Some(window) => self.patterns.iter().any(|p| p.matches(window)),
+            None => false,
+        }
+    }
+
     /// Collecting form of [`Enzyme::for_each_tag`], kept for tests and external callers.
     pub fn find_all_tags(&self, sequence: &[u8]) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
@@ -276,6 +290,9 @@ pub fn parse_enzyme(site: &str) -> Option<&'static Enzyme> {
 /// depends on it.
 ///
 /// `recommended` keeps ~15 500 tags (1 per ~116 bp), still a ~16× enrichment over BcgI alone.
+/// (These are per-enzyme hit counts. Same-length enzymes recognise some of the same windows,
+/// and `markers::count_markers_into` pools such a locus once, so the distinct-locus panel is
+/// a few percent smaller than these sums — the relative comparison between enzymes stands.)
 /// Use `all` only when panel size is the binding constraint and the extra noise is acceptable.
 pub static RECOMMENDED_ENZYMES: &[&Enzyme] = &[
     &CSPCI, &ALOI, &BSAXI, &BAEI, &BCGI, &CJEI, &PPII, &PSRI, &BPLI, &FALI, &BSP24I, &CJEPI,

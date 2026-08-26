@@ -143,15 +143,48 @@ pub fn digest_sequence(seq: &[u8], enzyme: &Enzyme) -> Vec<Marker> {
     out
 }
 
+/// Was the tag at `(pos, len)` already emitted by an enzyme earlier in the set?
+///
+/// **One locus must be counted once, however many enzymes recognise it.** Ten of the sixteen
+/// enzymes emit 27 bp tags, two emit 32 and two emit 28, and same-length recognition sites
+/// genuinely coincide — AloI is `GAAC(N6)TCC` and BsaXI is `AC(N5)CTCC`, so *every* AloI site
+/// with a C at offset 16 is also a BsaXI site, and also a PpiI site if offset 19 is C too. On
+/// a 2 Mb genome 64 of 257 AloI sites (25%) are all three at once.
+///
+/// Scanning per enzyme and counting every hit therefore gave one locus a copy number of 2 or
+/// 3. Those loci are single-copy in the genome, but `single_copy_markers` sees the inflated
+/// count and drops them: measured on 2 Mb, the `recommended` set lost 1109 of 16421
+/// single-copy markers (6.8%) and `all` lost 1370 of 24065 (5.7%) — a systematic hole in the
+/// panel, in the multi-enzyme mode the README recommends for shotgun reads.
+///
+/// Deduplication is on `(pos, len)`, not on the marker: two enzymes of *different* lengths at
+/// the same offset cut different tags, which are different loci and must both count.
+///
+/// The test runs only on a hit (roughly one per 116 bp) and allocates nothing, so the
+/// allocation-free hot path is preserved. It is also order-independent: whichever enzyme in
+/// the set scans the locus first emits the identical tag bytes.
+#[inline]
+fn already_emitted(seq: &[u8], pos: usize, len: usize, earlier: &[&Enzyme]) -> bool {
+    earlier
+        .iter()
+        .any(|e| e.tag_length == len && e.matches_at(seq, pos))
+}
+
 /// Digest one sequence with a **set** of enzymes, pooling all tag markers.
 ///
 /// Used for conventional metagenomes: digitally digesting reads with all 16 type-IIB
 /// enzymes enriches the marker pool ~16× vs. BcgI alone, recovering more strain-specific
-/// loci. Different enzymes yield different-length tags → distinct hashes, so pooling is safe.
+/// loci. A locus recognised by several same-length enzymes is pooled once — see
+/// [`already_emitted`].
 pub fn digest_sequence_multi(seq: &[u8], enzymes: &[&Enzyme]) -> Vec<Marker> {
     let mut out = Vec::new();
-    for enzyme in enzymes {
-        enzyme.for_each_tag(seq, |pos, len| out.push(marker_from_tag(&seq[pos..pos + len])));
+    for (i, enzyme) in enzymes.iter().enumerate() {
+        let earlier = &enzymes[..i];
+        enzyme.for_each_tag(seq, |pos, len| {
+            if !already_emitted(seq, pos, len, earlier) {
+                out.push(marker_from_tag(&seq[pos..pos + len]));
+            }
+        });
     }
     out
 }
@@ -159,8 +192,12 @@ pub fn digest_sequence_multi(seq: &[u8], enzymes: &[&Enzyme]) -> Vec<Marker> {
 /// Digest one sequence into an existing count map. The allocation-free hot path.
 #[inline]
 pub fn count_markers_into(seq: &[u8], enzymes: &[&Enzyme], counts: &mut MarkerCounts) {
-    for enzyme in enzymes {
+    for (i, enzyme) in enzymes.iter().enumerate() {
+        let earlier = &enzymes[..i];
         enzyme.for_each_tag(seq, |pos, len| {
+            if already_emitted(seq, pos, len, earlier) {
+                return;
+            }
             *counts.entry(marker_from_tag(&seq[pos..pos + len])).or_insert(0) += 1;
         });
     }
@@ -710,6 +747,66 @@ mod tests {
         seq.extend_from_slice(&w);
         let counts = sample_marker_counts(&[seq], &BCGI);
         assert!(counts.values().any(|&c| c >= 2));
+    }
+
+    /// Regression: one locus, several enzymes, copy number **one**.
+    ///
+    /// Same-length recognition sites coincide — a `GAAC(N6)TCC` AloI site with `CTCC` at
+    /// offset 16 is simultaneously a BsaXI and a PpiI site. Counting it once per enzyme gave
+    /// a single-copy locus a copy number of 3, and `single_copy_markers` then dropped it from
+    /// the database.
+    #[test]
+    fn a_locus_shared_by_several_enzymes_is_counted_once() {
+        use crate::enzymes::{ALOI, BSAXI, PPII};
+        let mut w = vec![b'A'; 27];
+        w[7..11].copy_from_slice(b"GAAC");
+        w[16..20].copy_from_slice(b"CTCC");
+        for e in [&ALOI, &BSAXI, &PPII] {
+            assert!(
+                e.find_all_tags(&w).contains(&(0, 27)),
+                "{} must recognise the crafted window",
+                e.name
+            );
+        }
+        let m = marker_from_tag(&w);
+        let counts = sample_marker_counts_multi(&[w.clone()], &[&ALOI, &BSAXI, &PPII]);
+        assert_eq!(counts.get(&m), Some(&1), "one locus must have copy number 1");
+        assert!(
+            single_copy_markers(&counts).contains(&m),
+            "a single-copy locus must survive the filter that builds the database"
+        );
+    }
+
+    /// The general form: pooled counts must equal counting each distinct `(pos, len)` locus
+    /// once, over a whole sequence and the enzyme set the README recommends for shotgun reads.
+    #[test]
+    fn multi_enzyme_counts_match_distinct_loci() {
+        use crate::enzymes::RECOMMENDED_ENZYMES;
+        let seq = rand_dna(200_000, 4242);
+        let pooled = sample_marker_counts_multi(std::slice::from_ref(&seq), RECOMMENDED_ENZYMES);
+
+        let mut loci: FxHashSet<(usize, usize)> = FxHashSet::default();
+        for e in RECOMMENDED_ENZYMES {
+            e.for_each_tag(&seq, |p, l| {
+                loci.insert((p, l));
+            });
+        }
+        let mut want = MarkerCounts::default();
+        for &(p, l) in &loci {
+            *want.entry(marker_from_tag(&seq[p..p + l])).or_insert(0) += 1;
+        }
+        assert_eq!(pooled, want, "pooled counts must be per-locus, not per-enzyme-hit");
+
+        // Guard the guard: shared loci have to actually occur, or this proves nothing.
+        let hits: usize = RECOMMENDED_ENZYMES
+            .iter()
+            .map(|e| e.find_all_tags(&seq).len())
+            .sum();
+        assert!(
+            hits > loci.len(),
+            "expected same-length enzymes to share loci ({hits} hits, {} loci)",
+            loci.len()
+        );
     }
 
     /// A genome must get the same identifier whether or not it was supplied gzipped.

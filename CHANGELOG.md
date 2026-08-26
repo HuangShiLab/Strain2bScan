@@ -2,6 +2,31 @@
 
 All notable changes to Strain2bScan are documented here.
 
+## [Unreleased] — extraction-path fixes
+
+### Fixed — one locus, one count, however many enzymes recognise it
+
+Ten of the sixteen enzymes emit 27 bp tags, and same-length recognition sites genuinely
+coincide: AloI is `GAAC(N6)TCC` and BsaXI is `AC(N5)CTCC`, so **every** AloI site with a C at
+offset 16 is also a BsaXI site, and a PpiI site as well if offset 19 is C. On a 2 Mb genome 64
+of 257 AloI sites (25%) are all three at once. Multi-enzyme digestion scanned per enzyme and
+counted every hit, so such a locus got a copy number of 2 or 3 — and `single_copy_markers`,
+which is what `build`/`cluster` use to select database markers, then dropped it as multi-copy.
+Measured on 2 Mb: the `recommended` set lost 1109 of 16421 single-copy markers (6.8%) and
+`all` lost 1370 of 24065 (5.7%), in the multi-enzyme mode the README recommends for shotgun
+reads. The module comment asserted the opposite ("different enzymes yield different-length
+tags → distinct hashes, so pooling is safe"), which is why it went unnoticed.
+
+`count_markers_into` and `digest_sequence_multi` now skip a `(pos, len)` locus already emitted
+by an earlier enzyme in the set (`Enzyme::matches_at`). Deduplication is on the locus, not the
+marker: two enzymes of *different* lengths at the same offset cut different tags and must both
+count. The test runs only on a hit (~1 per 116 bp) and allocates nothing, so the
+allocation-free hot path is preserved, and the result does not depend on enzyme order. Read
+counts are unaffected for surviving markers — a read is digested by the same set, so both
+sides always agreed — so this is panel recovery, not an abundance correction.
+
+**Databases built with more than one enzyme must be rebuilt** to pick up the recovered
+markers. Single-enzyme databases are byte-identical to before.
 ## [Unreleased] — `batch` subcommand for multi-sample projects
 
 ### Added — `strain2bscan batch --dbs <dir> --manifest <csv> --out <merged.tsv>`
