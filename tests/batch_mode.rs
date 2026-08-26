@@ -286,6 +286,45 @@ fn batch_matches_per_sample_multi_profile() {
     }
 }
 
+/// A manifest row naming a file the reader cannot parse must fail the same way a missing one
+/// does. The reader picks FASTA or FASTQ by extension and falls back to FASTA, so a FASTQ
+/// called `reads.txt` would otherwise be accumulated as one enormous contig — no error,
+/// unbounded memory, and a plausible-looking table at the end.
+#[test]
+fn batch_unparseable_reads_extension_is_a_hard_error() {
+    let fx = Fixture::new("badext");
+    let (a0, a1) = synth_species(0x9e3779b97f4a7c15);
+    let db_a = build_species_db(&[a0, a1], "a");
+    let dbs = fx.path("dbs");
+    std::fs::create_dir_all(&dbs).unwrap();
+    db_a.save(&dbs.join("speciesA.tsv")).unwrap();
+
+    // The file exists — only its name is unrecognizable.
+    let reads = fx.path("s1.txt");
+    std::fs::write(&reads, "@r1\nACGT\n+\nIIII\n").unwrap();
+    let manifest = fx.path("manifest.csv");
+    std::fs::write(&manifest, format!("sample,reads1\nmisnamed,{}\n", reads.display())).unwrap();
+
+    let out = run(&[
+        "batch",
+        "--dbs",
+        dbs.to_str().unwrap(),
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--out",
+        &fx.str_path("out.tsv"),
+        "--enzyme",
+        "BcgI",
+    ]);
+    assert!(!out.status.success(), "an unparseable extension must fail the run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("misnamed"), "error must name the sample: {stderr}");
+    assert!(
+        stderr.contains("unrecognized sequence format"),
+        "error must say what is wrong: {stderr}"
+    );
+}
+
 /// A manifest row whose reads file does not exist must abort the whole run with an error
 /// naming the sample — never skip the sample and emit a table it is silently absent from.
 #[test]

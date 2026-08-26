@@ -27,6 +27,32 @@ sides always agreed — so this is panel recovery, not an abundance correction.
 
 **Databases built with more than one enzyme must be rebuilt** to pick up the recovered
 markers. Single-enzyme databases are byte-identical to before.
+
+### Fixed — an N in the leading `k - 1` bases no longer leaks into k-mer markers
+
+`count_kmers_into` tracks the last non-ACGT base by inspecting only the base each window
+*newly* includes, but never primed the tracker over the first `k - 1` bases, which no
+iteration introduces. An N at index `j < k - 1` therefore left `j + 1` N-containing windows
+counted — up to `k - 1` per sequence, and Illumina reads whose first base is N, or contigs
+opening on an assembly gap, are ordinary inputs. The resulting markers contain an N, so
+nothing else ever matches them: in a database they sit in the panel as permanent zeros, and
+because the depth estimator is a zero-inclusive mean over the panel they depress both depth
+and coverage for that cluster. The existing test placed its N at index 200 and passed
+throughout.
+
+### Fixed — `--reads` is validated instead of silently misparsed
+
+The sequence reader picks FASTA or FASTQ from the extension alone and falls back to FASTA, but
+`--reads` was handed to it unchecked (`is_fastx_path` existed, with tests, and was called from
+nowhere). A FASTQ under any other name — `reads.txt`, a renamed file, `sample.fastq.bz2`, since
+only `.gz` is stripped — was parsed as FASTA; a FASTQ contains no `>` line, so the reader
+accumulated the **entire file** as one contig. That silently defeats the streaming design
+(peak memory is meant to be one batch, which is what makes 20 GB samples run in bounded RAM)
+and splices reads together across their header lines, with no error at any point. `profile`
+and `multi-profile` now reject an unrecognized extension up front, before the DB panel is
+loaded, naming the formats accepted; `batch` applies the same check per manifest row, so an
+unparseable name fails like a missing file instead of being read as the wrong format.
+
 ## [Unreleased] — `batch` subcommand for multi-sample projects
 
 ### Added — `strain2bscan batch --dbs <dir> --manifest <csv> --out <merged.tsv>`
@@ -48,18 +74,6 @@ whole run with an error naming the manifest line — a sample is never silently 
 both subcommands run the identical code path; its stdout summary, `--out` file, and
 `--layer1 auto` reporting are byte-identical to before (verified by diffing against the
 pre-refactor binary on a synthetic two-species panel).
-
-### Fixed — an N in the leading `k - 1` bases no longer leaks into k-mer markers
-
-`count_kmers_into` tracks the last non-ACGT base by inspecting only the base each window
-*newly* includes, but never primed the tracker over the first `k - 1` bases, which no
-iteration introduces. An N at index `j < k - 1` therefore left `j + 1` N-containing windows
-counted — up to `k - 1` per sequence, and Illumina reads whose first base is N, or contigs
-opening on an assembly gap, are ordinary inputs. The resulting markers contain an N, so
-nothing else ever matches them: in a database they sit in the panel as permanent zeros, and
-because the depth estimator is a zero-inclusive mean over the panel they depress both depth
-and coverage for that cluster. The existing test placed its N at index 200 and passed
-throughout.
 
 ## [Unreleased] — raw k-mer sketching marker source
 

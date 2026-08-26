@@ -35,9 +35,9 @@ use strain2bscan::identify::{
     Params, StrainCall,
 };
 use strain2bscan::markers::{
-    fastx_stem, genome_kmer_counts, genome_marker_counts_multi, is_fasta_path, kmer_db_token,
-    parse_kmer_db_token, read_fastx, sample_kmer_counts_stream, sample_marker_counts_stream,
-    single_copy_markers, sketch_threshold, Marker, MarkerCounts,
+    fastx_stem, genome_kmer_counts, genome_marker_counts_multi, is_fasta_path, is_fastx_path,
+    kmer_db_token, parse_kmer_db_token, read_fastx, sample_kmer_counts_stream,
+    sample_marker_counts_stream, single_copy_markers, sketch_threshold, Marker, MarkerCounts,
 };
 use strain2bscan::parallel::{num_threads, par_map};
 use strain2bscan::quality::{self, GenomeRec, QualityFilter};
@@ -163,6 +163,32 @@ fn parse_opts(args: &[String]) -> HashMap<String, String> {
 
 fn req<'a>(opts: &'a HashMap<String, String>, key: &str) -> Result<&'a String, String> {
     opts.get(key).ok_or_else(|| format!("missing --{key}"))
+}
+
+/// What the sequence reader can parse, and why an unrecognized name has to be a hard error
+/// rather than a best-effort guess. Shared by `--reads` and by the `batch` manifest.
+///
+/// [`markers::for_each_sequence`] picks FASTA vs FASTQ from the extension alone, with FASTA as
+/// the fallback, and read paths used to be handed to it unchecked. A FASTQ under any other
+/// name — `reads.txt`, a renamed file, `sample.fastq.bz2` (only `.gz` is stripped) — therefore
+/// parsed as FASTA, and since a FASTQ contains no `>` line the reader accumulated the *entire
+/// file* as one contig. That silently defeats the streaming design (peak memory is meant to be
+/// one batch, which is what makes 20 GB samples run in bounded RAM) and splices reads together
+/// across their header lines. No error was reported at any point.
+const FASTX_HINT: &str = "expected .fa/.fasta/.fna/.fq/.fastq, optionally .gz. The reader \
+     selects FASTA or FASTQ by extension, so a misnamed file would be parsed as the wrong \
+     format with no error at all";
+
+/// Resolve `--reads` and reject anything the sequence reader cannot parse ([`FASTX_HINT`]).
+fn reads_path(opts: &HashMap<String, String>) -> Result<PathBuf, String> {
+    let path = PathBuf::from(req(opts, "reads")?);
+    if !is_fastx_path(&path) {
+        return Err(format!(
+            "--reads {}: unrecognized sequence format — {FASTX_HINT}.",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 fn enzyme_set(opts: &HashMap<String, String>) -> Result<Vec<&'static Enzyme>, String> {
@@ -740,7 +766,7 @@ fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
     // vice versa is a hard error.
     let source = resolve_sample_source(&db, opts)?;
 
-    let reads = PathBuf::from(req(opts, "reads")?);
+    let reads = reads_path(opts)?;
     let counts = source.sample_counts(&reads)?;
     println!(
         "sample: {} distinct {} ({}, threads: {})",
@@ -1301,7 +1327,7 @@ fn profile_sample(
 /// This is the scalability advantage over running a full k-mer profiler once per species
 /// (which re-counts k-mers every time).
 fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
-    let reads = PathBuf::from(req(opts, "reads")?);
+    let reads = reads_path(opts)?;
     let panel = load_panel(opts)?;
     let gate = species_gate(opts);
     let params = parse_params(opts)?;
@@ -1519,6 +1545,17 @@ fn read_manifest(path: &Path) -> Result<Vec<ManifestSample>, String> {
             if !p.is_file() {
                 return Err(format!(
                     "manifest {} line {lineno} (sample '{}'): reads file not found: {}",
+                    path.display(),
+                    f[0],
+                    p.display()
+                ));
+            }
+            // A file the reader would misparse is as much a broken manifest entry as a
+            // missing one, and fails the same way: silently, with plausible-looking output.
+            if !is_fastx_path(p) {
+                return Err(format!(
+                    "manifest {} line {lineno} (sample '{}'): unrecognized sequence format: {} \
+                     — {FASTX_HINT}.",
                     path.display(),
                     f[0],
                     p.display()
@@ -1792,7 +1829,10 @@ fn print_stats(db: &StrainDb) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_species_dbs, resolve_sample_source, species_tier, MarkerSource, SpeciesTier};
+    use super::{
+        load_species_dbs, reads_path, resolve_sample_source, species_tier, MarkerSource,
+        SpeciesTier,
+    };
     use std::collections::HashMap;
     use strain2bscan::db::StrainDb;
     use strain2bscan::identify::detectable_fraction;
@@ -1811,6 +1851,34 @@ mod tests {
         let mut db = StrainDb::build(vec![("A".into(), vec![1, 2, 3, 10]), ("B".into(), vec![1, 2, 3, 20])]);
         db.enzymes = vec!["BcgI".to_string()];
         db
+    }
+
+    /// `--reads` must name a format the reader can actually parse.
+    ///
+    /// The reader chooses FASTA or FASTQ by extension and falls back to FASTA, so a FASTQ
+    /// under any other name was read as a single enormous FASTA contig — no error, unbounded
+    /// memory, and reads spliced together across their header lines.
+    #[test]
+    fn reads_path_rejects_unrecognized_formats() {
+        for good in [
+            "s.fq", "s.fastq", "s.fq.gz", "s.fastq.gz", "s.FQ.GZ", "s.fa", "s.fasta", "s.fna",
+            "s.fna.gz",
+        ] {
+            assert!(
+                reads_path(&opts(&[("reads", good)])).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+        for bad in ["s.txt", "s.fastq.bz2", "s.bam", "s", "s.fq.zst"] {
+            let err = reads_path(&opts(&[("reads", bad)]))
+                .expect_err("{bad} must be rejected")
+                .to_string();
+            assert!(
+                err.contains("unrecognized sequence format"),
+                "{bad}: unexpected error {err}"
+            );
+        }
+        assert!(reads_path(&opts(&[])).is_err(), "a missing --reads must still error");
     }
 
     /// A k-mer DB must auto-detect: no flags needed, and the run inherits the DB's K and S.

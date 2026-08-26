@@ -70,7 +70,7 @@ while clustering and Layer-2 logic are preserved.
 git clone https://github.com/HuangShiLab/Strain2bScan
 cd Strain2bScan
 cargo build --release      # binary at target/release/strain2bscan
-cargo test                 # 47 tests
+cargo test                 # 93 tests
 ```
 
 ## Two input modes (`--enzyme`)
