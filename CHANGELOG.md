@@ -49,6 +49,18 @@ both subcommands run the identical code path; its stdout summary, `--out` file, 
 `--layer1 auto` reporting are byte-identical to before (verified by diffing against the
 pre-refactor binary on a synthetic two-species panel).
 
+### Fixed — an N in the leading `k - 1` bases no longer leaks into k-mer markers
+
+`count_kmers_into` tracks the last non-ACGT base by inspecting only the base each window
+*newly* includes, but never primed the tracker over the first `k - 1` bases, which no
+iteration introduces. An N at index `j < k - 1` therefore left `j + 1` N-containing windows
+counted — up to `k - 1` per sequence, and Illumina reads whose first base is N, or contigs
+opening on an assembly gap, are ordinary inputs. The resulting markers contain an N, so
+nothing else ever matches them: in a database they sit in the panel as permanent zeros, and
+because the depth estimator is a zero-inclusive mean over the panel they depress both depth
+and coverage for that cluster. The existing test placed its N at index 200 and passed
+throughout.
+
 ## [Unreleased] — raw k-mer sketching marker source
 
 ### Added — `--marker-source enzyme|kmer`

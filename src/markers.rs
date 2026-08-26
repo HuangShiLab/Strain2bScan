@@ -269,6 +269,16 @@ pub fn count_kmers_into(seq: &[u8], k: usize, threshold: u64, counts: &mut Marke
     // Index of the most recent non-ACGT base; a window starting at `i` is clean iff it
     // starts after it. Updating it with only the newly-included base keeps the scan O(n).
     let mut last_bad: isize = -1;
+    // Prime it over the leading `k - 1` bases. The loop below only ever inspects the base a
+    // window *newly* includes, so those bases are introduced by no iteration and would never
+    // be inspected at all: an N among them leaked into every window spanning it (up to k - 1
+    // of them), producing markers that contain an N — reachable from no other sequence, so
+    // they sit in the panel as permanent zeros and depress depth and coverage.
+    for (j, &b) in seq[..k - 1].iter().enumerate() {
+        if !is_acgt(b) {
+            last_bad = j as isize;
+        }
+    }
     for i in 0..=seq.len() - k {
         if !is_acgt(seq[i + k - 1]) {
             last_bad = (i + k - 1) as isize;
@@ -966,6 +976,40 @@ mod tests {
         let mut lower = rand_dna(400, 7);
         lower.make_ascii_lowercase();
         assert_eq!(clean, kmers(&lower, k, u64::MAX));
+    }
+
+    /// Regression: an N in the **leading** `k - 1` bases must suppress its windows too.
+    ///
+    /// The clean-window tracker is updated only with the base each window newly includes, so
+    /// the first `k - 1` bases are introduced by no iteration. Priming the tracker over them
+    /// is what makes the rule uniform; without it an N at index `j < k - 1` left `j + 1`
+    /// N-containing windows counted — and Illumina reads whose first base is N, or contigs
+    /// that open with an assembly gap, are ordinary inputs, not corner cases.
+    #[test]
+    fn kmer_leading_non_acgt_is_skipped() {
+        let k = 15usize;
+        let clean = rand_dna(400, 7);
+        for bad_at in 0..2 * k {
+            let mut seq = clean.clone();
+            seq[bad_at] = b'N';
+            let counts = kmers(&seq, k, u64::MAX);
+            // No counted marker may come from a window containing the N.
+            for i in 0..=seq.len() - k {
+                let w = &seq[i..i + k];
+                if w.contains(&b'N') {
+                    assert!(
+                        !counts.contains_key(&marker_from_tag(w)),
+                        "N at index {bad_at}: window at {i} contains it but was counted"
+                    );
+                }
+            }
+            // And exactly the k windows spanning it are lost (random 15-mers are distinct).
+            let total: u64 = kmers(&clean, k, u64::MAX).values().map(|&c| c as u64).sum();
+            let kept: u64 = counts.values().map(|&c| c as u64).sum();
+            // Near the start fewer than k windows span the N: only `bad_at + 1` do.
+            let spanning = (bad_at + 1).min(k) as u64;
+            assert_eq!(total - kept, spanning, "N at index {bad_at}");
+        }
     }
 
     /// Reads/contigs shorter than K contribute nothing; K = 0 is inert.
