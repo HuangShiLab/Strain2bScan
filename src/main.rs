@@ -61,12 +61,12 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage:\n  \
-                 strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F]\n  \
-                 strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F]\n  \
+                 strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]\n  \
+                 strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]\n  \
                  strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--layer1 auto|unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
                  strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
                  strain2bscan batch   --dbs <dir> --manifest <csv> --out <merged.tsv> [--enzyme <set>] [same identification options as multi-profile]   (many samples, DBs loaded once; manifest header: sample,reads1,reads2 — reads2 optional, empty = single-end)\n  \
-                 strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95]   (can a Cluster Search Tree work on this panel?)\n  \
+                 strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]   (can a Cluster Search Tree work on this panel?)\n  \
                  strain2bscan info     --db <db.tsv>\n  \
                  strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
                  strain2bscan demo | cst-demo\n\n\
@@ -74,7 +74,19 @@ fn main() -> ExitCode {
                  or all for conventional metagenomes. `recommended` is the 14 non-degenerate\n\
                  enzymes: it drops HaeIV/Hin4I, whose loose IUPAC sites contribute 35% of the tags\n\
                  in `all` and are the easiest for a sequencing error to create or destroy.)\n\
-                 reads/genomes may be gzipped (.fq.gz, .fna.gz).\n\
+                 reads/genomes may be gzipped (.fq.gz, .fna.gz).\n\n\
+                 --marker-source kmer replaces digestion with sketched canonical k-mers: every\n\
+                 k-mer (--kmer-size, default 31) whose hash falls below u64::MAX/--sketch-scale\n\
+                 (default 100) is kept, so ~1/scale of them survive and marker density is a\n\
+                 continuous knob rather than the 1/2/4/16 steps an enzyme panel offers. Both\n\
+                 identification layers work unchanged on them. The mode and its parameters are\n\
+                 recorded in the database and detected automatically by profile; --kmer-size and\n\
+                 --sketch-scale then act only as consistency checks. Mixing marker spaces across\n\
+                 a panel, or between build and profile, is an error. Denser sketches are what\n\
+                 make a Cluster Search Tree usable: on a 28-genome panel the internal nodes carry\n\
+                 a median of 45 group-specific markers with --enzyme all (the 16-enzyme ceiling,\n\
+                 still too sparse to descend) against 134 at --sketch-scale 30, at ~3.5x the\n\
+                 database size. Needs assemblies, so it is for shotgun data, not native 2bRAD.\n\
                  multi-profile reports two scopes: `abundance` sums to 1.0 WITHIN each species\n\
                  (the primary number), `global_abundance` sums to 1.0 over the strain-resolved\n\
                  part of the sample. --min-abundance applies within-species. Detection and depth\n\
