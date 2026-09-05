@@ -17,6 +17,10 @@ exactly the kind of low-redundancy marker set that algorithm wants. Using tags i
 k-mers shrinks the database ~50–100×, so digestion and matching are far faster and lighter,
 while clustering and Layer-2 logic are preserved.
 
+> **Testing this build on HPC:** see [HPC_TESTING.md](HPC_TESTING.md) — what changed,
+> which existing results are still valid, and a reproducible accuracy benchmark
+> (`scripts/sim_bench.py`).
+
 ## Highlights
 
 - **All 16 type-IIB enzymes**; single-enzyme (BcgI 2bRAD data) or multi-enzyme digital
