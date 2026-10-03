@@ -28,7 +28,9 @@ impl XorShift {
     }
 
     fn dna(&mut self, len: usize) -> Vec<u8> {
-        (0..len).map(|_| b"ACGT"[(self.next() % 4) as usize]).collect()
+        (0..len)
+            .map(|_| b"ACGT"[(self.next() % 4) as usize])
+            .collect()
     }
 
     fn below(&mut self, n: usize) -> usize {
@@ -68,7 +70,12 @@ fn build_species_db(genomes: &[Vec<u8>], prefix: &str) -> StrainDb {
 }
 
 /// Exact-weight read mixture: `n_reads[i]` random 150-bp windows of genome `i`.
-fn synth_reads(genomes: &[&Vec<u8>], n_reads: &[usize], seed: u64, read_len: usize) -> Vec<Vec<u8>> {
+fn synth_reads(
+    genomes: &[&Vec<u8>],
+    n_reads: &[usize],
+    seed: u64,
+    read_len: usize,
+) -> Vec<Vec<u8>> {
     let mut rng = XorShift(seed);
     let mut reads = Vec::new();
     for (&g, &n) in genomes.iter().zip(n_reads) {
@@ -190,8 +197,14 @@ fn batch_matches_per_sample_multi_profile() {
     // The panels must be big enough for the lowered gates to be meaningful, and each strain
     // must carry private markers, or the comparison below is vacuous.
     for db in [&db_a, &db_b] {
-        assert!(db.unique_marker_count(0) >= 10, "strain 0 needs private markers");
-        assert!(db.unique_marker_count(1) >= 10, "strain 1 needs private markers");
+        assert!(
+            db.unique_marker_count(0) >= 10,
+            "strain 0 needs private markers"
+        );
+        assert!(
+            db.unique_marker_count(1) >= 10,
+            "strain 1 needs private markers"
+        );
     }
     let dbs = fx.path("dbs");
     std::fs::create_dir_all(&dbs).unwrap();
@@ -207,13 +220,20 @@ fn batch_matches_per_sample_multi_profile() {
     let s1_cat = fx.path("s1_cat.fq");
     std::fs::write(
         &s1_cat,
-        [std::fs::read(&s1_r1).unwrap(), std::fs::read(&s1_r2).unwrap()].concat(),
+        [
+            std::fs::read(&s1_r1).unwrap(),
+            std::fs::read(&s1_r2).unwrap(),
+        ]
+        .concat(),
     )
     .unwrap();
 
     // s2 (single-end, absolute path in the manifest, no reads2 column).
     let s2_fq = fx.path("s2.fq");
-    write_fastq(&s2_fq, &synth_reads(&[&a1, &b0, &b1], &[2000, 1500, 3500], 0xccc, 150));
+    write_fastq(
+        &s2_fq,
+        &synth_reads(&[&a1, &b0, &b1], &[2000, 1500, 3500], 0xccc, 150),
+    );
 
     let manifest = fx.path("manifest.csv");
     std::fs::write(
@@ -239,8 +259,14 @@ fn batch_matches_per_sample_multi_profile() {
         batch_out.clone(),
     ]));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("[batch 1/2] sample s1"), "per-sample progress: {stderr}");
-    assert!(stderr.contains("[batch 2/2] sample s2"), "per-sample progress: {stderr}");
+    assert!(
+        stderr.contains("[batch 1/2] sample s1"),
+        "per-sample progress: {stderr}"
+    );
+    assert!(
+        stderr.contains("[batch 2/2] sample s2"),
+        "per-sample progress: {stderr}"
+    );
 
     let batch_text = String::from_utf8(std::fs::read(fx.path("batch.tsv")).unwrap()).unwrap();
     assert_eq!(
@@ -303,7 +329,11 @@ fn batch_unparseable_reads_extension_is_a_hard_error() {
     let reads = fx.path("s1.txt");
     std::fs::write(&reads, "@r1\nACGT\n+\nIIII\n").unwrap();
     let manifest = fx.path("manifest.csv");
-    std::fs::write(&manifest, format!("sample,reads1\nmisnamed,{}\n", reads.display())).unwrap();
+    std::fs::write(
+        &manifest,
+        format!("sample,reads1\nmisnamed,{}\n", reads.display()),
+    )
+    .unwrap();
 
     let out = run(&[
         "batch",
@@ -316,9 +346,15 @@ fn batch_unparseable_reads_extension_is_a_hard_error() {
         "--enzyme",
         "BcgI",
     ]);
-    assert!(!out.status.success(), "an unparseable extension must fail the run");
+    assert!(
+        !out.status.success(),
+        "an unparseable extension must fail the run"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("misnamed"), "error must name the sample: {stderr}");
+    assert!(
+        stderr.contains("misnamed"),
+        "error must name the sample: {stderr}"
+    );
     assert!(
         stderr.contains("unrecognized sequence format"),
         "error must say what is wrong: {stderr}"
@@ -337,7 +373,11 @@ fn batch_missing_reads_is_a_hard_error() {
     db_a.save(&dbs.join("speciesA.tsv")).unwrap();
 
     let manifest = fx.path("manifest.csv");
-    std::fs::write(&manifest, "sample,reads1,reads2\nghost,nope_R1.fq,nope_R2.fq\n").unwrap();
+    std::fs::write(
+        &manifest,
+        "sample,reads1,reads2\nghost,nope_R1.fq,nope_R2.fq\n",
+    )
+    .unwrap();
 
     let out = run(&[
         "batch",
@@ -352,6 +392,12 @@ fn batch_missing_reads_is_a_hard_error() {
     ]);
     assert!(!out.status.success(), "missing reads must fail the run");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("ghost"), "error must name the sample: {stderr}");
-    assert!(stderr.contains("not found"), "error must say what is wrong: {stderr}");
+    assert!(
+        stderr.contains("ghost"),
+        "error must name the sample: {stderr}"
+    );
+    assert!(
+        stderr.contains("not found"),
+        "error must say what is wrong: {stderr}"
+    );
 }

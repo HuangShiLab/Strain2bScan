@@ -139,7 +139,9 @@ pub fn marker_from_tag(tag: &[u8]) -> Marker {
 /// Fast2bRAD-M / `2bRADExtraction.pl` and keeps the marker set at 1× (no doubling).
 pub fn digest_sequence(seq: &[u8], enzyme: &Enzyme) -> Vec<Marker> {
     let mut out = Vec::new();
-    enzyme.for_each_tag(seq, |pos, len| out.push(marker_from_tag(&seq[pos..pos + len])));
+    enzyme.for_each_tag(seq, |pos, len| {
+        out.push(marker_from_tag(&seq[pos..pos + len]))
+    });
     out
 }
 
@@ -198,7 +200,9 @@ pub fn count_markers_into(seq: &[u8], enzymes: &[&Enzyme], counts: &mut MarkerCo
             if already_emitted(seq, pos, len, earlier) {
                 return;
             }
-            *counts.entry(marker_from_tag(&seq[pos..pos + len])).or_insert(0) += 1;
+            *counts
+                .entry(marker_from_tag(&seq[pos..pos + len]))
+                .or_insert(0) += 1;
         });
     }
 }
@@ -324,7 +328,11 @@ pub fn genome_kmer_counts_par(seqs: &[Vec<u8>], k: usize, threshold: u64) -> Mar
 ///
 /// Mirrors [`sample_marker_counts_stream`]: same streaming/gzip machinery
 /// ([`for_each_sequence`]), same bounded memory (one batch), same buffer recycling.
-pub fn sample_kmer_counts_stream(path: &Path, k: usize, threshold: u64) -> io::Result<MarkerCounts> {
+pub fn sample_kmer_counts_stream(
+    path: &Path,
+    k: usize,
+    threshold: u64,
+) -> io::Result<MarkerCounts> {
     let mut total = MarkerCounts::default();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(STREAM_BATCH);
     let mut used = 0usize;
@@ -702,7 +710,13 @@ mod tests {
             }
         }
         // explicit edge cases: palindrome, all-N, single base
-        for tag in [&b"ACGT"[..], &b"NNNN"[..], &b"A"[..], &b"AT"[..], &b"GC"[..]] {
+        for tag in [
+            &b"ACGT"[..],
+            &b"NNNN"[..],
+            &b"A"[..],
+            &b"AT"[..],
+            &b"GC"[..],
+        ] {
             assert_eq!(marker_from_tag(tag), reference(tag), "tag {tag:?}");
         }
     }
@@ -780,7 +794,11 @@ mod tests {
         }
         let m = marker_from_tag(&w);
         let counts = sample_marker_counts_multi(&[w.clone()], &[&ALOI, &BSAXI, &PPII]);
-        assert_eq!(counts.get(&m), Some(&1), "one locus must have copy number 1");
+        assert_eq!(
+            counts.get(&m),
+            Some(&1),
+            "one locus must have copy number 1"
+        );
         assert!(
             single_copy_markers(&counts).contains(&m),
             "a single-copy locus must survive the filter that builds the database"
@@ -805,7 +823,10 @@ mod tests {
         for &(p, l) in &loci {
             *want.entry(marker_from_tag(&seq[p..p + l])).or_insert(0) += 1;
         }
-        assert_eq!(pooled, want, "pooled counts must be per-locus, not per-enzyme-hit");
+        assert_eq!(
+            pooled, want,
+            "pooled counts must be per-locus, not per-enzyme-hit"
+        );
 
         // Guard the guard: shared loci have to actually occur, or this proves nothing.
         let hits: usize = RECOMMENDED_ENZYMES
@@ -1031,7 +1052,11 @@ mod tests {
         let all = kmers(&seq, 31, u64::MAX);
         assert_eq!(all, kmers(&seq, 31, sketch_threshold(1)));
         let n: u64 = all.values().map(|&c| c as u64).sum();
-        assert_eq!(n, (seq.len() - 31 + 1) as u64, "scale=1 must keep every window");
+        assert_eq!(
+            n,
+            (seq.len() - 31 + 1) as u64,
+            "scale=1 must keep every window"
+        );
     }
 
     /// The sketch keeps ~1/S of windows. FNV-1a is not a cryptographic hash but is uniform
@@ -1060,7 +1085,9 @@ mod tests {
         assert_eq!(kmer_db_token(31, 100), "kmer31s100");
         assert_eq!(parse_kmer_db_token("kmer31s100"), Some((31, 100)));
         assert_eq!(parse_kmer_db_token("kmer15s1"), Some((15, 1)));
-        for bad in ["BcgI", "all", "kmer", "kmer31", "kmer0s1", "kmer31s0", "kmerasb", "kmer31s"] {
+        for bad in [
+            "BcgI", "all", "kmer", "kmer31", "kmer0s1", "kmer31s0", "kmerasb", "kmer31s",
+        ] {
             assert_eq!(parse_kmer_db_token(bad), None, "{bad} must not parse");
         }
         assert_eq!(sketch_threshold(1), u64::MAX);
@@ -1068,7 +1095,8 @@ mod tests {
 
     /// A missing gzipped file must report "not found", not "corrupt archive".
     #[test]
-    fn missing_gz_reports_not_found() {        let err = read_fastx(Path::new("/nonexistent/dir/missing.fa.gz")).unwrap_err();
+    fn missing_gz_reports_not_found() {
+        let err = read_fastx(Path::new("/nonexistent/dir/missing.fa.gz")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "got: {err}");
     }
 

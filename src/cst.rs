@@ -78,7 +78,11 @@ pub fn jaccard(a: &FxHashSet<Marker>, b: &FxHashSet<Marker>) -> f64 {
 /// small panels. Note max-containment ≥ Jaccard, so containment clustering merges at least as much.
 pub fn max_containment(a: &FxHashSet<Marker>, b: &FxHashSet<Marker>) -> f64 {
     if a.is_empty() || b.is_empty() {
-        return if a.is_empty() && b.is_empty() { 1.0 } else { 0.0 };
+        return if a.is_empty() && b.is_empty() {
+            1.0
+        } else {
+            0.0
+        };
     }
     let inter = a.iter().filter(|m| b.contains(m)).count();
     inter as f64 / a.len().min(b.len()) as f64
@@ -272,8 +276,10 @@ impl SpeciesCst {
         containment: bool,
     ) -> Self {
         let genome_names: Vec<String> = genomes.iter().map(|(n, _, _)| n.clone()).collect();
-        let genome_full: Vec<FxHashSet<Marker>> =
-            genomes.iter().map(|(_, _, f)| f.iter().copied().collect()).collect();
+        let genome_full: Vec<FxHashSet<Marker>> = genomes
+            .iter()
+            .map(|(_, _, f)| f.iter().copied().collect())
+            .collect();
         let genome_markers: Vec<FxHashSet<Marker>> = genomes
             .into_iter()
             .map(|(_, m, _)| m.into_iter().collect())
@@ -500,8 +506,14 @@ mod tests {
         assert_eq!(stats.len(), 3, "4 genomes -> 3 internal nodes");
 
         let pair = |s: &NodeStat| -> Vec<usize> { s.member_genomes.clone() };
-        let cherry_a = stats.iter().find(|s| pair(s) == vec![0, 1]).expect("g0+g1 node");
-        let cherry_b = stats.iter().find(|s| pair(s) == vec![2, 3]).expect("g2+g3 node");
+        let cherry_a = stats
+            .iter()
+            .find(|s| pair(s) == vec![0, 1])
+            .expect("g0+g1 node");
+        let cherry_b = stats
+            .iter()
+            .find(|s| pair(s) == vec![2, 3])
+            .expect("g2+g3 node");
         assert_eq!(cherry_a.group_specific, 40, "cluster-A shared block");
         assert_eq!(cherry_b.group_specific, 40, "cluster-B shared block");
 
@@ -527,7 +539,10 @@ mod tests {
         let stats = cst.hierarchy_stats();
         for s in &stats {
             if s.n_members < 4 {
-                assert_eq!(s.group_specific, 0, "no nesting -> no group-specific markers");
+                assert_eq!(
+                    s.group_specific, 0,
+                    "no nesting -> no group-specific markers"
+                );
             }
         }
     }
@@ -565,7 +580,10 @@ mod tests {
         // Union keeps it (some member carries it, nobody outside does); intersection drops it
         // (g1 does not carry it).
         let leaf = cst.genome_cluster[0];
-        assert_eq!(cst.genome_cluster[1], leaf, "g0 and g1 must share a cluster");
+        assert_eq!(
+            cst.genome_cluster[1], leaf,
+            "g0 and g1 must share a cluster"
+        );
         assert!(
             tree.node_markers[leaf].contains(&1000),
             "leaf lost g0's private marker — the intersection has been reimposed at the leaves"

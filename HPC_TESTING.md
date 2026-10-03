@@ -1,7 +1,7 @@
 # Testing this build on HPC
 
-Branch `strainscan-port`, at `abcaeb1`. This is what changed since the last HPC run, what is
-already measured, and what still needs your machines.
+`main` at `c394bf2`. This is what changed since the last HPC run, what is already measured, and
+what still needs your machines.
 
 Read §1 first — it says which of your existing results are still valid, so you do not re-run
 things that cannot have changed.
@@ -12,6 +12,7 @@ things that cannot have changed.
 
 | commit | change | effect on results |
 |---|---|---|
+| `c394bf2` | HPC testing guide + `scripts/sim_bench.py` reproducible benchmark | none — documentation/opt-in |
 | `9c5a63a` | truncated/corrupt databases are rejected instead of silently loading | none on intact databases; see §4 |
 | `63c4f50` | new `--marker-source kmer` (FracMinHash sketch) | none — opt-in |
 | `5aa360f` | new `batch` subcommand | none — opt-in |
@@ -151,8 +152,8 @@ them, so a truncated database becomes an error instead of a silent partial load.
 
 Note the remaining gap: for an old three-field header, a cut landing inside the *last* row still
 leaves the cluster count matching, so the binary accepts it. The shell check above catches that
-case and the binary does not; there is an unpushed fix for it on the branch
-`backup/local-truncation-fixes` if you want it.
+case; the binary-side checksum fix is planned for a future release. Rebuild legacy databases to
+the current 4-field header to close this hole.
 
 ---
 

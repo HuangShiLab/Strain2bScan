@@ -265,6 +265,64 @@ struct PanelStats {
     depth: f64,
 }
 
+/// Compute panel size, detected counts (>=1 and >=2), and zero-inclusive winsorized depth over an
+/// arbitrary marker set.
+///
+/// This is the single implementation of the depth estimator: mean count over the whole panel
+/// (zeros included), with the top 1% of *non-zero* observations winsorized down to the 99th
+/// percentile. Keeping it in one place removes the divergence risk between the flat unique-marker
+/// path ([`panel_stats`]) and the tree-descent path ([`set_evidence`]).
+fn marker_panel_evidence(markers: &[Marker], counts: &MarkerCounts) -> PanelStats {
+    let panel = markers.len();
+    if panel == 0 {
+        return PanelStats::default();
+    }
+
+    // One pass: count markers seen once / twice, and collect only the non-zero counts for the
+    // winsorized depth estimate. Avoiding a full sort on the whole panel is a noticeable win when
+    // `panel_stats` is called once per cluster.
+    let mut detected1 = 0usize;
+    let mut detected2 = 0usize;
+    let mut nonzero: Vec<u32> = Vec::new();
+    for &m in markers {
+        let c = counts.get(&m).copied().unwrap_or(0);
+        if c >= 1 {
+            detected1 += 1;
+            nonzero.push(c);
+        }
+        if c >= 2 {
+            detected2 += 1;
+        }
+    }
+
+    // Depth = mean count over the WHOLE panel (zeros included — they are the evidence that the
+    // strain is rare), with the top 1% of *non-zero* observations winsorized down to the 99th
+    // percentile so collapsed repeats and contamination cannot inflate it.
+    //
+    // The cap is the element at position `detected1 - detected1/100 - 1` in the ascending non-zero
+    // array. That leaves at most `detected1/100` non-zero observations strictly above it.
+    let depth = if detected1 == 0 {
+        0.0
+    } else {
+        let trim = detected1 / TRIM_FRACTION;
+        let cap = if trim == 0 {
+            *nonzero.iter().max().unwrap() as u64
+        } else {
+            let k = detected1 - trim - 1;
+            *nonzero.select_nth_unstable(k).1 as u64
+        };
+        let sum: u64 = nonzero.iter().map(|&c| (c as u64).min(cap)).sum();
+        sum as f64 / panel as f64
+    };
+
+    PanelStats {
+        panel,
+        detected1,
+        detected2,
+        depth,
+    }
+}
+
 /// Compute [`PanelStats`] over cluster `j`'s **unique** markers.
 ///
 /// A cluster with no unique markers (e.g. one whose tag set is a subset of another cluster's)
@@ -275,43 +333,7 @@ struct PanelStats {
 /// keeps a full-marker-set fallback, but only for *reporting* coverage of a cluster that has
 /// already been called.
 fn panel_stats(db: &StrainDb, counts: &MarkerCounts, j: usize) -> PanelStats {
-    let mut obs: Vec<u32> = db
-        .unique_markers(j)
-        .map(|m| counts.get(&m).copied().unwrap_or(0))
-        .collect();
-    let panel = obs.len();
-    if panel == 0 {
-        return PanelStats::default();
-    }
-    obs.sort_unstable();
-    // `obs` is ascending, so `detected*` are suffix lengths.
-    let first_ge = |t: u32| obs.partition_point(|&c| c < t);
-    let detected1 = panel - first_ge(1);
-    let detected2 = panel - first_ge(2);
-
-    // Depth = mean count over the WHOLE panel (zeros included — they are the evidence that the
-    // strain is rare), with the top 1% of *non-zero* observations winsorized down to the 99th
-    // percentile so collapsed repeats and contamination cannot inflate it.
-    //
-    // Winsorizing rather than discarding, and taking the fraction of the non-zero observations
-    // rather than of the panel, both matter: trimming `panel/100` entries deletes real signal
-    // once fewer than 1% of the panel is detected, driving the estimate to zero precisely for
-    // the rare strains this estimator exists to measure correctly.
-    let depth = if detected1 == 0 {
-        0.0
-    } else {
-        let cap_idx = panel.saturating_sub(1 + detected1 / TRIM_FRACTION);
-        let cap = obs[cap_idx] as u64;
-        let sum: u64 = obs.iter().map(|&c| (c as u64).min(cap)).sum();
-        sum as f64 / panel as f64
-    };
-
-    PanelStats {
-        panel,
-        detected1,
-        detected2,
-        depth,
-    }
+    marker_panel_evidence(db.unique_markers(j), counts)
 }
 
 /// Robust per-strain absolute depth: the **zero-inclusive** trimmed mean count over the
@@ -344,7 +366,11 @@ pub fn detect_present(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<(
     let mut out = Vec::new();
     for j in 0..db.n_strains() {
         let st = panel_stats(db, counts, j);
-        let min_count = if p.adaptive_singleton { min_count_for(st.depth) } else { 2 };
+        let min_count = if p.adaptive_singleton {
+            min_count_for(st.depth)
+        } else {
+            2
+        };
         let detected = if min_count >= 2 {
             st.detected2
         } else {
@@ -444,7 +470,7 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
     let mut calls: Vec<StrainCall> = match resolve_layer1(db, p) {
         Layer1::Auto | Layer1::Unique => profile_unique(db, counts, p),
         Layer1::Cst => match &db.tree {
-            Some(tree) => descend_tree_masked(tree, counts, p, db.quant_mask.as_ref())
+            Some(tree) => descend_tree_masked(tree, counts, p, db.masked_node_markers.as_deref())
                 .into_iter()
                 .filter(|c| c.desc_leaves.iter().all(|&l| l < db.n_strains()))
                 .map(|c| {
@@ -527,7 +553,9 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
                 // distinguishing "genuinely there" from "the relative's reads". A relative
                 // floor, because the absolute scale is the sample's depth.
                 for &j in &extra {
-                    let Some(&depth) = fitted.get(&j) else { continue };
+                    let Some(&depth) = fitted.get(&j) else {
+                        continue;
+                    };
                     if total <= 0.0 || depth / total < MIN_SUBSET_SHARE {
                         continue;
                     }
@@ -564,7 +592,11 @@ fn profile_unique(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<Strai
         if st.panel == 0 {
             continue;
         }
-        let min_count = if p.adaptive_singleton { min_count_for(st.depth) } else { 2 };
+        let min_count = if p.adaptive_singleton {
+            min_count_for(st.depth)
+        } else {
+            2
+        };
         let support = if min_count >= 2 {
             st.detected2
         } else {
@@ -706,9 +738,12 @@ pub fn naive_profile(db: &StrainDb, counts: &MarkerCounts, min_score: f64) -> Ve
 mod tests {
     use super::*;
 
-
     /// Build a conspecific DB: `core` shared by all strains, plus private markers each.
-    fn conspecific_db(n_strains: usize, core: usize, private: usize) -> (StrainDb, Vec<Vec<Marker>>) {
+    fn conspecific_db(
+        n_strains: usize,
+        core: usize,
+        private: usize,
+    ) -> (StrainDb, Vec<Vec<Marker>>) {
         let mut strains = Vec::new();
         let mut privates = Vec::new();
         let core_markers: Vec<Marker> = (0..core as Marker).collect();
@@ -753,8 +788,16 @@ mod tests {
         let mut got: Vec<usize> = calls.iter().map(|c| c.strain_index).collect();
         got.sort();
         assert_eq!(got, vec![0, 2], "calls: {calls:?}");
-        let a0 = calls.iter().find(|c| c.strain_index == 0).unwrap().rel_abundance;
-        let a2 = calls.iter().find(|c| c.strain_index == 2).unwrap().rel_abundance;
+        let a0 = calls
+            .iter()
+            .find(|c| c.strain_index == 0)
+            .unwrap()
+            .rel_abundance;
+        let a2 = calls
+            .iter()
+            .find(|c| c.strain_index == 2)
+            .unwrap()
+            .rel_abundance;
         assert!((a0 - 0.7).abs() < 0.06, "a0={a0}");
         assert!((a2 - 0.3).abs() < 0.06, "a2={a2}");
 
@@ -775,7 +818,10 @@ mod tests {
     fn abundance_floor_does_not_delete_correctly_estimated_rare_clusters() {
         let a: Vec<Marker> = (10_000..11_000).collect();
         let b: Vec<Marker> = (20_000..21_000).collect();
-        let db = StrainDb::build(vec![("dominant".into(), a.clone()), ("rare".into(), b.clone())]);
+        let db = StrainDb::build(vec![
+            ("dominant".into(), a.clone()),
+            ("rare".into(), b.clone()),
+        ]);
 
         let mut counts = MarkerCounts::default();
         for &m in &a {
@@ -816,37 +862,137 @@ mod tests {
     fn trace_gap_cuts_between_community_and_trace_without_hurting_staggered_mocks() {
         // Case 1: a defined community with a clear gap to trace contaminants.
         let mut defined = vec![
-            StrainCall { strain_index: 0, name: "A".into(), support: 100.0, coverage: 1.0, depth: 10.0, n_markers: 100, rel_abundance: 0.45 },
-            StrainCall { strain_index: 1, name: "B".into(), support: 100.0, coverage: 1.0, depth: 8.0, n_markers: 100, rel_abundance: 0.36 },
-            StrainCall { strain_index: 2, name: "C".into(), support: 100.0, coverage: 1.0, depth: 2.0, n_markers: 100, rel_abundance: 0.09 },
+            StrainCall {
+                strain_index: 0,
+                name: "A".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 10.0,
+                n_markers: 100,
+                rel_abundance: 0.45,
+            },
+            StrainCall {
+                strain_index: 1,
+                name: "B".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 8.0,
+                n_markers: 100,
+                rel_abundance: 0.36,
+            },
+            StrainCall {
+                strain_index: 2,
+                name: "C".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 2.0,
+                n_markers: 100,
+                rel_abundance: 0.09,
+            },
             // trace tail, >100x below the smallest true member
-            StrainCall { strain_index: 3, name: "trace1".into(), support: 10.0, coverage: 0.2, depth: 0.01, n_markers: 100, rel_abundance: 0.0002 },
-            StrainCall { strain_index: 4, name: "trace2".into(), support: 10.0, coverage: 0.2, depth: 0.01, n_markers: 100, rel_abundance: 0.0001 },
+            StrainCall {
+                strain_index: 3,
+                name: "trace1".into(),
+                support: 10.0,
+                coverage: 0.2,
+                depth: 0.01,
+                n_markers: 100,
+                rel_abundance: 0.0002,
+            },
+            StrainCall {
+                strain_index: 4,
+                name: "trace2".into(),
+                support: 10.0,
+                coverage: 0.2,
+                depth: 0.01,
+                n_markers: 100,
+                rel_abundance: 0.0001,
+            },
         ];
         filter_by_trace_gap(&mut defined, 10.0, 1e-4);
         let names: Vec<&str> = defined.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["A", "B", "C"], "defined community: gap should drop trace tail");
+        assert_eq!(
+            names,
+            vec!["A", "B", "C"],
+            "defined community: gap should drop trace tail"
+        );
 
         // Case 2: a staggered mock whose rarest true member is only 2x below the next.
         // The largest gap is smaller than the threshold, so no knee cut; the floor alone
         // must be small enough to keep the rarest true member.
         let mut staggered = vec![
-            StrainCall { strain_index: 0, name: " abundant".into(), support: 100.0, coverage: 1.0, depth: 10.0, n_markers: 100, rel_abundance: 0.50 },
-            StrainCall { strain_index: 1, name: "mid".into(), support: 100.0, coverage: 1.0, depth: 5.0, n_markers: 100, rel_abundance: 0.25 },
-            StrainCall { strain_index: 2, name: "rare".into(), support: 100.0, coverage: 1.0, depth: 2.5, n_markers: 100, rel_abundance: 0.125 },
-            StrainCall { strain_index: 3, name: "very_rare".into(), support: 100.0, coverage: 1.0, depth: 1.25, n_markers: 100, rel_abundance: 0.0625 },
+            StrainCall {
+                strain_index: 0,
+                name: " abundant".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 10.0,
+                n_markers: 100,
+                rel_abundance: 0.50,
+            },
+            StrainCall {
+                strain_index: 1,
+                name: "mid".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 5.0,
+                n_markers: 100,
+                rel_abundance: 0.25,
+            },
+            StrainCall {
+                strain_index: 2,
+                name: "rare".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 2.5,
+                n_markers: 100,
+                rel_abundance: 0.125,
+            },
+            StrainCall {
+                strain_index: 3,
+                name: "very_rare".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 1.25,
+                n_markers: 100,
+                rel_abundance: 0.0625,
+            },
         ];
         filter_by_trace_gap(&mut staggered, 10.0, 1e-4);
         let names: Vec<&str> = staggered.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec![" abundant", "mid", "rare", "very_rare"], "staggered mock: no 10x gap, all members kept");
+        assert_eq!(
+            names,
+            vec![" abundant", "mid", "rare", "very_rare"],
+            "staggered mock: no 10x gap, all members kept"
+        );
 
         // Case 3: gap threshold disabled -> no change.
         let mut disabled = vec![
-            StrainCall { strain_index: 0, name: "A".into(), support: 100.0, coverage: 1.0, depth: 10.0, n_markers: 100, rel_abundance: 0.50 },
-            StrainCall { strain_index: 1, name: "trace".into(), support: 10.0, coverage: 0.2, depth: 0.01, n_markers: 100, rel_abundance: 0.0001 },
+            StrainCall {
+                strain_index: 0,
+                name: "A".into(),
+                support: 100.0,
+                coverage: 1.0,
+                depth: 10.0,
+                n_markers: 100,
+                rel_abundance: 0.50,
+            },
+            StrainCall {
+                strain_index: 1,
+                name: "trace".into(),
+                support: 10.0,
+                coverage: 0.2,
+                depth: 0.01,
+                n_markers: 100,
+                rel_abundance: 0.0001,
+            },
         ];
         filter_by_trace_gap(&mut disabled, 0.0, 0.0);
-        assert_eq!(disabled.len(), 2, "disabled gap filter should keep everything");
+        assert_eq!(
+            disabled.len(),
+            2,
+            "disabled gap filter should keep everything"
+        );
     }
 
     /// A shadow cluster and a genuinely present rare cluster have the **same breadth** and differ
@@ -863,7 +1009,10 @@ mod tests {
         let db = StrainDb::build(vec![("A".into(), a.clone()), ("B".into(), b.clone())]);
 
         let names = |p: &Params, counts: &MarkerCounts| -> Vec<String> {
-            profile(&db, counts, p).iter().map(|c| c.name.clone()).collect()
+            profile(&db, counts, p)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
         };
         let loose = Params {
             min_rel_abundance: 0.0,
@@ -883,7 +1032,11 @@ mod tests {
         for &m in b.iter().take(300) {
             shadow.insert(m, 20);
         }
-        assert_eq!(names(&loose, &shadow), vec!["A", "B"], "filter off: both called");
+        assert_eq!(
+            names(&loose, &shadow),
+            vec!["A", "B"],
+            "filter off: both called"
+        );
         assert_eq!(
             names(&default, &shadow),
             vec!["A"],
@@ -938,10 +1091,11 @@ mod tests {
         let gb = mk(&ab, 1100..1200);
         let gc = mk(&cd, 1200..1300);
         let gd = mk(&cd, 1300..1400);
-        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = [("A", &ga), ("B", &gb), ("C", &gc), ("D", &gd)]
-            .into_iter()
-            .map(|(n, g)| (n.to_string(), g.clone(), g.clone()))
-            .collect();
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> =
+            [("A", &ga), ("B", &gb), ("C", &gc), ("D", &gd)]
+                .into_iter()
+                .map(|(n, g)| (n.to_string(), g.clone(), g.clone()))
+                .collect();
         let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
         assert_eq!(cst.n_clusters(), 4, "each genome should be its own cluster");
 
@@ -953,21 +1107,42 @@ mod tests {
 
         // --- flat algorithm: A has 5 unique markers, below the support floor -> missed
         let db = cst.cluster_db();
-        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
-        let flat: Vec<String> = profile(&db, &counts, &p).iter().map(|c| c.name.clone()).collect();
-        assert!(flat.is_empty(), "flat algorithm should miss the sparse leaf, got {flat:?}");
+        let p = Params {
+            min_rel_abundance: 0.0,
+            ..Params::default()
+        };
+        let flat: Vec<String> = profile(&db, &counts, &p)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert!(
+            flat.is_empty(),
+            "flat algorithm should miss the sparse leaf, got {flat:?}"
+        );
 
         // --- tree: pools ancestors whose siblings were never entered
         let tree = cst.build_tree();
         let calls = descend_tree(&tree, &counts, &p);
-        assert_eq!(calls.len(), 1, "tree should call exactly the present leaf: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            1,
+            "tree should call exactly the present leaf: {calls:?}"
+        );
         let call = &calls[0];
         assert_eq!(
-            tree.leaves[call.node], vec![0],
+            tree.leaves[call.node],
+            vec![0],
             "the called leaf must be A (genome 0)"
         );
-        assert_eq!(call.panel, 305, "pooled 5 own + 100 A/B-group + 200 root-core");
-        assert!(call.path.len() == 3, "pooled leaf + 2 ancestors, got {:?}", call.path);
+        assert_eq!(
+            call.panel, 305,
+            "pooled 5 own + 100 A/B-group + 200 root-core"
+        );
+        assert!(
+            call.path.len() == 3,
+            "pooled leaf + 2 ancestors, got {:?}",
+            call.path
+        );
         assert!((call.coverage - 1.0).abs() < 1e-9);
         assert!((call.depth - 20.0).abs() < 0.5, "depth {}", call.depth);
     }
@@ -990,10 +1165,11 @@ mod tests {
         let gb = mk(&ab, 1100..1200);
         let gc = mk(&cd, 1200..1300);
         let gd = mk(&cd, 1300..1400);
-        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = [("A", &ga), ("B", &gb), ("C", &gc), ("D", &gd)]
-            .into_iter()
-            .map(|(n, g)| (n.to_string(), g.clone(), g.clone()))
-            .collect();
+        let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> =
+            [("A", &ga), ("B", &gb), ("C", &gc), ("D", &gd)]
+                .into_iter()
+                .map(|(n, g)| (n.to_string(), g.clone(), g.clone()))
+                .collect();
         let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
         let tree = cst.build_tree();
 
@@ -1002,7 +1178,10 @@ mod tests {
         for &m in ga.iter().chain(gb.iter()) {
             counts.insert(m, 20);
         }
-        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        let p = Params {
+            min_rel_abundance: 0.0,
+            ..Params::default()
+        };
         let calls = descend_tree(&tree, &counts, &p);
         assert_eq!(calls.len(), 2, "both leaves present: {calls:?}");
         for c in &calls {
@@ -1026,8 +1205,15 @@ mod tests {
     fn joint_fit_recovers_a_subset_cluster_the_flat_path_cannot_see() {
         let a: Vec<Marker> = (10_000..11_000).collect();
         let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
-        let db = StrainDb::build(vec![("A".into(), a.clone()), ("B_subset".into(), b.clone())]);
-        assert_eq!(db.unique_marker_count(1), 0, "B has no unique markers by construction");
+        let db = StrainDb::build(vec![
+            ("A".into(), a.clone()),
+            ("B_subset".into(), b.clone()),
+        ]);
+        assert_eq!(
+            db.unique_marker_count(1),
+            0,
+            "B has no unique markers by construction"
+        );
 
         let mut counts = MarkerCounts::default();
         for &m in &a {
@@ -1036,9 +1222,19 @@ mod tests {
         }
 
         // Flat path: B is invisible.
-        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
-        let flat: Vec<String> = profile(&db, &counts, &p).iter().map(|c| c.name.clone()).collect();
-        assert_eq!(flat, vec!["A".to_string()], "flat path cannot see the subset cluster");
+        let p = Params {
+            min_rel_abundance: 0.0,
+            ..Params::default()
+        };
+        let flat: Vec<String> = profile(&db, &counts, &p)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(
+            flat,
+            vec!["A".to_string()],
+            "flat path cannot see the subset cluster"
+        );
 
         // Joint fit: both recovered, at the right depths.
         let design = build_l2_design(&db, &[0, 1], &counts);
@@ -1063,20 +1259,40 @@ mod tests {
     fn enet_reaches_the_subset_cluster_through_profile() {
         let a: Vec<Marker> = (10_000..11_000).collect();
         let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
-        let db = StrainDb::build(vec![("A".into(), a.clone()), ("B_subset".into(), b.clone())]);
-        assert_eq!(db.unique_marker_count(1), 0, "B has no unique markers by construction");
+        let db = StrainDb::build(vec![
+            ("A".into(), a.clone()),
+            ("B_subset".into(), b.clone()),
+        ]);
+        assert_eq!(
+            db.unique_marker_count(1),
+            0,
+            "B has no unique markers by construction"
+        );
 
         let mut counts = MarkerCounts::default();
         for &m in &a {
             counts.insert(m, if b.contains(&m) { 15 } else { 10 });
         }
 
-        let flat = Params { min_rel_abundance: 0.0, layer1: Layer1::Unique, ..Params::default() };
-        let got: Vec<String> =
-            profile(&db, &counts, &flat).iter().map(|c| c.name.clone()).collect();
-        assert_eq!(got, vec!["A".to_string()], "flat path still cannot see the subset cluster");
+        let flat = Params {
+            min_rel_abundance: 0.0,
+            layer1: Layer1::Unique,
+            ..Params::default()
+        };
+        let got: Vec<String> = profile(&db, &counts, &flat)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["A".to_string()],
+            "flat path still cannot see the subset cluster"
+        );
 
-        let enet = Params { layer2: Layer2::Enet, ..flat };
+        let enet = Params {
+            layer2: Layer2::Enet,
+            ..flat
+        };
         let calls = profile(&db, &counts, &enet);
         let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
         assert!(
@@ -1106,7 +1322,10 @@ mod tests {
         for &m in &a {
             counts.insert(m, 10);
         }
-        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        let p = Params {
+            min_rel_abundance: 0.0,
+            ..Params::default()
+        };
         assert!(
             subset_candidates(&db, &counts, &[0], &p).is_empty(),
             "a cluster with unobserved markers of its own is not a subset candidate"
@@ -1134,7 +1353,11 @@ mod tests {
 
         let design = build_l2_design(&db, &[0, 1, 2], &counts);
         let chosen = pre_scan(&design, 15, 10);
-        assert_eq!(chosen.first(), Some(&0), "A explains the most, picked first");
+        assert_eq!(
+            chosen.first(),
+            Some(&0),
+            "A explains the most, picked first"
+        );
         assert!(
             !chosen.contains(&1),
             "the 99%-duplicate has almost nothing left to explain once A's markers are consumed"
@@ -1181,7 +1404,10 @@ mod tests {
             counts.insert(m, 20);
         }
 
-        let p = Params { min_rel_abundance: 0.0, ..Params::default() };
+        let p = Params {
+            min_rel_abundance: 0.0,
+            ..Params::default()
+        };
         let calls = descend_tree(&tree, &counts, &p);
         assert_eq!(calls.len(), 1, "one organism, one call: {calls:?}");
         let c = &calls[0];
@@ -1196,7 +1422,11 @@ mod tests {
             .flat_map(|&l| tree.leaves[l].clone())
             .collect();
         spanned.sort_unstable();
-        assert_eq!(spanned, vec![0, 1], "the clade spanned must be exactly A and B");
+        assert_eq!(
+            spanned,
+            vec![0, 1],
+            "the clade spanned must be exactly A and B"
+        );
 
         // And it surfaces through profile() under both leaf names rather than one of them.
         let mut db = cst.cluster_db();
@@ -1204,7 +1434,11 @@ mod tests {
         let named: Vec<String> = profile(
             &db,
             &counts,
-            &Params { layer1: Layer1::Cst, min_rel_abundance: 0.0, ..Params::default() },
+            &Params {
+                layer1: Layer1::Cst,
+                min_rel_abundance: 0.0,
+                ..Params::default()
+            },
         )
         .iter()
         .map(|c| c.name.clone())
@@ -1311,7 +1545,11 @@ mod tests {
         let a: Vec<Marker> = (10_000..11_000).collect();
         let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
         let db = StrainDb::build(vec![("A".into(), a.clone()), ("B_subset".into(), b)]);
-        assert_eq!(db.unique_marker_count(1), 0, "B must have no unique markers");
+        assert_eq!(
+            db.unique_marker_count(1),
+            0,
+            "B must have no unique markers"
+        );
 
         let mut counts = MarkerCounts::default();
         for &m in &a {
@@ -1323,7 +1561,11 @@ mod tests {
         };
         let calls = profile(&db, &counts, &p);
         let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["A"], "phantom subset cluster was called: {calls:?}");
+        assert_eq!(
+            names,
+            vec!["A"],
+            "phantom subset cluster was called: {calls:?}"
+        );
         assert!((calls[0].rel_abundance - 1.0).abs() < 1e-9);
     }
 
@@ -1471,7 +1713,10 @@ mod tests {
     fn explicit_layer1_is_not_second_guessed_by_auto() {
         let db = StrainDb::build(vec![("A".into(), (0..500).collect::<Vec<Marker>>())]);
         for want in [Layer1::Unique, Layer1::Cst] {
-            let p = Params { layer1: want, ..Params::default() };
+            let p = Params {
+                layer1: want,
+                ..Params::default()
+            };
             assert_eq!(resolve_layer1(&db, &p), want);
         }
     }
@@ -1521,7 +1766,10 @@ mod tests {
         let cols = vec![vec![1.0, 0.0, 1.0, 2.0], vec![0.0, 1.0, 1.0, 1.0]];
         let y = vec![2.0, 3.0, 5.0, 7.0];
         let w = nonneg_elastic_net(&cols, &y, 0.0, 0.5, 5000, 1e-10);
-        assert!((w[0] - 2.0).abs() < 1e-3 && (w[1] - 3.0).abs() < 1e-3, "w={w:?}");
+        assert!(
+            (w[0] - 2.0).abs() < 1e-3 && (w[1] - 3.0).abs() < 1e-3,
+            "w={w:?}"
+        );
     }
 }
 
@@ -1649,24 +1897,8 @@ pub struct TreeCall {
 
 /// Evidence for one marker set.
 fn set_evidence(markers: &[Marker], counts: &MarkerCounts) -> (usize, usize, f64) {
-    let panel = markers.len();
-    if panel == 0 {
-        return (0, 0, 0.0);
-    }
-    let mut obs: Vec<u32> = markers
-        .iter()
-        .map(|m| counts.get(m).copied().unwrap_or(0))
-        .collect();
-    obs.sort_unstable();
-    let detected = panel - obs.partition_point(|&c| c < 1);
-    let depth = if detected == 0 {
-        0.0
-    } else {
-        let cap_idx = panel.saturating_sub(1 + detected / TRIM_FRACTION);
-        let cap = obs[cap_idx] as u64;
-        obs.iter().map(|&c| (c as u64).min(cap)).sum::<u64>() as f64 / panel as f64
-    };
-    (panel, detected, depth)
+    let ev = marker_panel_evidence(markers, counts);
+    (ev.panel, ev.detected1, ev.depth)
 }
 
 /// Descend the Cluster Search Tree, returning the leaves it accepts.
@@ -1685,49 +1917,53 @@ fn set_evidence(markers: &[Marker], counts: &MarkerCounts) -> (usize, usize, f64
 /// and pooling stops there.
 /// Descend the tree with no cross-species restriction. See [`descend_tree_masked`].
 pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCall> {
-    descend_tree_masked(cst, counts, p, None)
+    let node_markers: Vec<Vec<Marker>> = cst
+        .node_markers
+        .iter()
+        .map(|set| set.iter().copied().collect())
+        .collect();
+    descend_tree_inner(cst, counts, p, &node_markers)
 }
 
 /// The tree descent, honouring `multi-profile`'s cross-species marker restriction.
 ///
-/// `mask` is the DB's `quant_mask`: the markers specific to this species across the whole
-/// panel being profiled together. It has to be applied HERE, not just to the cluster rows.
-/// `restrict_to` records the restriction as a mask on the database, and `unique_markers`
-/// consults it — but the tree's node sets are reached through `Cst` directly, which the mask
-/// never touched, so the descent was scoring internal nodes on markers this species shares
-/// with a congener in the panel. That is precisely the cross-talk the filter exists to stop:
-/// a co-present relative's reads land on those tags and manufacture evidence for a node.
-/// The flat path was filtered and the tree path was not, so `--layer1 cst` and `--layer1
-/// unique` were not scoring the same sample.
+/// `masked_nodes`, when provided, holds the pre-filtered marker set for every CST node (built
+/// once by [`StrainDb::restrict_to`] from the DB's `quant_mask`). Using the precomputed slices
+/// removes the per-node allocation that the old on-the-fly filter introduced.
 pub fn descend_tree_masked(
     cst: &Cst,
     counts: &MarkerCounts,
     p: &Params,
-    mask: Option<&crate::fxhash::FxHashSet<Marker>>,
+    masked_nodes: Option<&[Vec<Marker>]>,
 ) -> Vec<TreeCall> {
-    let ms_of = |v: usize| -> Vec<Marker> {
-        match mask {
-            Some(allow) => cst.node_markers[v]
+    let owned: Vec<Vec<Marker>>;
+    let node_markers: &[Vec<Marker>] = match masked_nodes {
+        Some(nodes) => nodes,
+        None => {
+            owned = cst
+                .node_markers
                 .iter()
-                .copied()
-                .filter(|m| allow.contains(m))
-                .collect(),
-            None => cst.node_markers[v].iter().copied().collect(),
+                .map(|set| set.iter().copied().collect())
+                .collect();
+            &owned
         }
     };
-    let n_ms = |v: usize| -> usize {
-        match mask {
-            Some(allow) => cst.node_markers[v].iter().filter(|m| allow.contains(m)).count(),
-            None => cst.node_markers[v].len(),
-        }
-    };
+    descend_tree_inner(cst, counts, p, node_markers)
+}
+
+fn descend_tree_inner(
+    cst: &Cst,
+    counts: &MarkerCounts,
+    p: &Params,
+    node_markers: &[Vec<Marker>],
+) -> Vec<TreeCall> {
     if cst.n_leaves() == 0 {
         return Vec::new();
     }
     if cst.n_leaves() == 1 {
         // Degenerate tree: the single leaf is the root; test it directly.
-        let ms = ms_of(0);
-        let (panel, detected, depth) = set_evidence(&ms, counts);
+        let ms = &node_markers[0];
+        let (panel, detected, depth) = set_evidence(ms, counts);
         if panel > 0 && detected >= p.min_support_markers {
             let coverage = detected as f64 / panel as f64;
             if coverage >= p.min_coverage {
@@ -1747,26 +1983,26 @@ pub fn descend_tree_masked(
 
     // A node "fires" when its own marker set is informative AND observed.
     let fires = |v: usize| -> bool {
-        let ms = ms_of(v);
+        let ms = &node_markers[v];
         if ms.len() < MIN_NODE_MARKERS {
             return false; // uninformative: cannot rule the subtree in or out
         }
-        let (panel, detected, depth) = set_evidence(&ms, counts);
-        let min_count = if p.adaptive_singleton { min_count_for(depth) } else { 2 };
+        let (panel, detected, depth) = set_evidence(ms, counts);
+        let min_count = if p.adaptive_singleton {
+            min_count_for(depth)
+        } else {
+            2
+        };
         let support = if min_count >= 2 {
-            let mut n = 0;
-            for m in &ms {
-                if counts.get(m).copied().unwrap_or(0) >= 2 {
-                    n += 1;
-                }
-            }
-            n
+            ms.iter()
+                .filter(|&&m| counts.get(&m).copied().unwrap_or(0) >= 2)
+                .count()
         } else {
             detected
         };
         support >= p.min_support_markers && (detected as f64 / panel as f64) >= p.min_coverage
     };
-    let informative = |v: usize| n_ms(v) >= MIN_NODE_MARKERS;
+    let informative = |v: usize| node_markers[v].len() >= MIN_NODE_MARKERS;
 
     // Descend, recording which nodes were entered.
     let mut entered: Vec<bool> = vec![false; cst.n_nodes()];
@@ -1802,14 +2038,14 @@ pub fn descend_tree_masked(
     let mut rejected: Vec<usize> = Vec::new();
     for &node in &reached {
         let mut path = vec![node];
-        let mut pooled: Vec<Marker> = ms_of(node);
+        let mut pooled: Vec<Marker> = node_markers[node].clone();
         let mut v = node;
         while let Some(par) = cst.parent[v] {
             match cst.sibling(v) {
                 // The sibling branch was never entered, so this ancestor's group-specific
                 // markers belong to our side and can be pooled.
                 Some(s) if !entered[s] => {
-                    pooled.extend(ms_of(par));
+                    pooled.extend(node_markers[par].iter().copied());
                     path.push(par);
                     v = par;
                 }
@@ -1822,7 +2058,11 @@ pub fn descend_tree_masked(
         if panel == 0 {
             continue;
         }
-        let min_count = if p.adaptive_singleton { min_count_for(depth) } else { 2 };
+        let min_count = if p.adaptive_singleton {
+            min_count_for(depth)
+        } else {
+            2
+        };
         let support = if min_count >= 2 {
             pooled
                 .iter()
@@ -1871,7 +2111,8 @@ pub fn descend_tree_masked(
     // alternatives, which are to invent two strains or to report nothing.
     if !rejected.is_empty() {
         let accepted_under = |v: usize, out: &[TreeCall]| -> bool {
-            out.iter().any(|c| cst.desc_leaves[v].contains(&cst.desc_leaves[c.node][0]))
+            out.iter()
+                .any(|c| cst.desc_leaves[v].contains(&cst.desc_leaves[c.node][0]))
         };
         let mut added: Vec<usize> = Vec::new();
         for &r in &rejected {
@@ -1894,9 +2135,9 @@ pub fn descend_tree_masked(
                 if cst.desc_leaves[par].len() > MAX_FALLBACK_CLADE {
                     break;
                 }
-                let ms = ms_of(par);
+                let ms = &node_markers[par];
                 if ms.len() >= MIN_NODE_MARKERS {
-                    let (panel, detected, depth) = set_evidence(&ms, counts);
+                    let (panel, detected, depth) = set_evidence(ms, counts);
                     let coverage = detected as f64 / panel as f64;
                     let expected = detectable_fraction(depth);
                     let consistent = expected <= 0.0 || coverage / expected >= p.min_consistency;
@@ -2091,7 +2332,13 @@ pub fn build_l2_design(db: &StrainDb, candidates: &[usize], counts: &MarkerCount
         .map(|&j| {
             markers
                 .iter()
-                .map(|m| if db.strain_markers[j].contains(m) { 1.0 } else { 0.0 })
+                .map(|m| {
+                    if db.strain_markers[j].contains(m) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
                 .collect()
         })
         .collect();
@@ -2099,7 +2346,12 @@ pub fn build_l2_design(db: &StrainDb, candidates: &[usize], counts: &MarkerCount
         .iter()
         .map(|m| counts.get(m).copied().unwrap_or(0) as f64)
         .collect();
-    L2Design { markers, clusters: candidates.to_vec(), cols, y }
+    L2Design {
+        markers,
+        clusters: candidates.to_vec(),
+        cols,
+        y,
+    }
 }
 
 /// StrainScan's iterative pre-scan: greedily pick the cluster explaining the most **not yet
@@ -2155,12 +2407,7 @@ pub fn pre_scan(design: &L2Design, max_iter: usize, min_new_markers: usize) -> V
 /// Joint abundance for the selected clusters, via the non-negative Elastic Net.
 ///
 /// Returns one depth per entry of `selected` (indices into `design.clusters`), in the same order.
-pub fn l2_abundance(
-    design: &L2Design,
-    selected: &[usize],
-    alpha: f64,
-    l1_ratio: f64,
-) -> Vec<f64> {
+pub fn l2_abundance(design: &L2Design, selected: &[usize], alpha: f64, l1_ratio: f64) -> Vec<f64> {
     if selected.is_empty() || design.n_rows() == 0 {
         return vec![0.0; selected.len()];
     }

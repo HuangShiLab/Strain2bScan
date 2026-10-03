@@ -94,11 +94,26 @@ def read_pred(path):
     d = {}
     if not os.path.exists(path):
         return d
-    for l in open(path):
-        if l.startswith("#"):
-            continue
-        f = l.split("\t")
-        d[f[0]] = float(f[1])
+    with open(path) as fi:
+        header = None
+        for line in fi:
+            if line.startswith("#"):
+                # Header line is the first comment line, e.g. "#cluster abundance coverage support depth".
+                header = line.lstrip("#").strip().split("\t")
+                break
+        if header is None:
+            raise ValueError(f"{path}: missing header")
+        try:
+            ab_idx = header.index("abundance")
+        except ValueError:
+            raise ValueError(f"{path}: header has no 'abundance' column: {header}")
+        for line in fi:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) <= ab_idx:
+                continue
+            d[f[0]] = float(f[ab_idx])
     return d
 
 

@@ -226,7 +226,9 @@ impl MarkerSource {
     fn genome_counts(&self, seqs: &[Vec<u8>]) -> MarkerCounts {
         match self {
             MarkerSource::Enzyme(set) => genome_marker_counts_multi(seqs, set),
-            MarkerSource::Kmer { k, scale } => genome_kmer_counts(seqs, *k, sketch_threshold(*scale)),
+            MarkerSource::Kmer { k, scale } => {
+                genome_kmer_counts(seqs, *k, sketch_threshold(*scale))
+            }
         }
     }
 
@@ -281,11 +283,15 @@ impl MarkerSource {
 /// Parse `--kmer-size` (default 31) and `--sketch-scale` (default 100).
 fn kmer_params(opts: &HashMap<String, String>) -> Result<(usize, u64), String> {
     let k: usize = match opts.get("kmer-size") {
-        Some(s) => s.parse().map_err(|_| "bad --kmer-size (want integer >= 1)")?,
+        Some(s) => s
+            .parse()
+            .map_err(|_| "bad --kmer-size (want integer >= 1)")?,
         None => 31,
     };
     let scale: u64 = match opts.get("sketch-scale") {
-        Some(s) => s.parse().map_err(|_| "bad --sketch-scale (want integer >= 1)")?,
+        Some(s) => s
+            .parse()
+            .map_err(|_| "bad --sketch-scale (want integer >= 1)")?,
         None => 100,
     };
     if k == 0 {
@@ -319,7 +325,10 @@ fn marker_source_for_build(opts: &HashMap<String, String>) -> Result<MarkerSourc
 /// exact parameters (`--kmer-size`/`--sketch-scale` act as an override-check and error on
 /// mismatch); an enzyme DB forces enzyme digestion. Crossing the two is a hard error — the
 /// marker spaces are disjoint, so a mismatch would report silent garbage otherwise.
-fn resolve_sample_source(db: &StrainDb, opts: &HashMap<String, String>) -> Result<MarkerSource, String> {
+fn resolve_sample_source(
+    db: &StrainDb,
+    opts: &HashMap<String, String>,
+) -> Result<MarkerSource, String> {
     let db_kmer = if db.enzymes.len() == 1 {
         parse_kmer_db_token(&db.enzymes[0])
     } else {
@@ -356,7 +365,9 @@ fn resolve_sample_source(db: &StrainDb, opts: &HashMap<String, String>) -> Resul
         )),
         (None, None | Some("enzyme")) => {
             if opts.contains_key("kmer-size") || opts.contains_key("sketch-scale") {
-                eprintln!("warning: --kmer-size/--sketch-scale are ignored for an enzyme-tag database");
+                eprintln!(
+                    "warning: --kmer-size/--sketch-scale are ignored for an enzyme-tag database"
+                );
             }
             // Enzyme set: prefer the DB's recorded set (guarantees a match); else require --enzyme.
             let set: Vec<&Enzyme> = if !db.enzymes.is_empty() {
@@ -395,7 +406,12 @@ fn digest_genome_dir(dir: &Path, source: &MarkerSource) -> Result<Vec<GenomeRec>
         let n_contigs = seqs.len();
         let counts = source.genome_counts(&seqs);
         let full_markers: Vec<Marker> = counts.keys().copied().collect();
-        Ok(GenomeRec { name, n_contigs, markers: single_copy_markers(&counts), full_markers })
+        Ok(GenomeRec {
+            name,
+            n_contigs,
+            markers: single_copy_markers(&counts),
+            full_markers,
+        })
     });
     results.into_iter().collect()
 }
@@ -407,10 +423,17 @@ fn parse_quality_filter(opts: &HashMap<String, String>) -> Result<QualityFilter,
         None => None,
     };
     let min_tag_fraction = match opts.get("min-tag-fraction") {
-        Some(s) => Some(s.parse().map_err(|_| "bad --min-tag-fraction (want 0..1)")?),
+        Some(s) => Some(
+            s.parse()
+                .map_err(|_| "bad --min-tag-fraction (want 0..1)")?,
+        ),
         None => None,
     };
-    Ok(QualityFilter { max_contigs, min_tag_fraction, ..QualityFilter::default() })
+    Ok(QualityFilter {
+        max_contigs,
+        min_tag_fraction,
+        ..QualityFilter::default()
+    })
 }
 
 /// Digest a genome dir, apply the assembly-quality filter, print the report, and return the
@@ -481,7 +504,9 @@ fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
     let recs = digest_and_filter(&genomes, &source, opts)?;
     let n_genomes = recs.len();
     let cst = SpeciesCst::build(
-        recs.into_iter().map(|r| (r.name, r.markers, r.full_markers)).collect(),
+        recs.into_iter()
+            .map(|r| (r.name, r.markers, r.full_markers))
+            .collect(),
         similarity,
         containment,
     );
@@ -604,7 +629,9 @@ fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
         return Err("need at least 2 genomes to form a hierarchy".into());
     }
     let cst = SpeciesCst::build(
-        recs.into_iter().map(|r| (r.name, r.markers, r.full_markers)).collect(),
+        recs.into_iter()
+            .map(|r| (r.name, r.markers, r.full_markers))
+            .collect(),
         similarity,
         opts.contains_key("containment"),
     );
@@ -639,7 +666,9 @@ fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
     // merged into one cluster before they can become separate leaves.
     let cdb = cst.cluster_db();
     let floor = Params::default().min_support_markers;
-    let mut uniq_counts: Vec<usize> = (0..cdb.n_strains()).map(|j| cdb.unique_marker_count(j)).collect();
+    let mut uniq_counts: Vec<usize> = (0..cdb.n_strains())
+        .map(|j| cdb.unique_marker_count(j))
+        .collect();
     uniq_counts.sort_unstable();
     let below = uniq_counts.iter().filter(|&&u| u < floor).count();
     println!("\n#cluster_unique_markers");
@@ -653,9 +682,7 @@ fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
         uniq_counts.len()
     );
     if below == 0 {
-        println!(
-            "  -> every cluster already clears the floor on its own markers, so tree pooling"
-        );
+        println!("  -> every cluster already clears the floor on its own markers, so tree pooling");
         println!("     has nothing to rescue here and --layer1 cst will reach the same leaves.");
     } else {
         println!(
@@ -693,9 +720,15 @@ fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
     // smallest panel at which a coverage fraction can distinguish 0.1 from 0.3.
     const MINK: usize = 25;
     if med >= 4 * MINK {
-        println!("VERDICT: tree is viable here (median {med} >= {}). Node sets carry real signal.", 4 * MINK);
+        println!(
+            "VERDICT: tree is viable here (median {med} >= {}). Node sets carry real signal.",
+            4 * MINK
+        );
     } else if med >= MINK {
-        println!("VERDICT: marginal (median {med} in [{MINK}, {})). Viable but with little headroom.", 4 * MINK);
+        println!(
+            "VERDICT: marginal (median {med} in [{MINK}, {})). Viable but with little headroom.",
+            4 * MINK
+        );
     } else {
         println!("VERDICT: NOT viable (median {med} < {MINK}). Internal nodes are too sparse to");
         println!("descend on; invest in the shared-marker regression instead of the tree.");
@@ -912,8 +945,12 @@ fn load_species_dbs(dbs_dir: &Path) -> Result<Vec<(String, StrainDb)>, String> {
     let mut db_paths: Vec<PathBuf> = std::fs::read_dir(dbs_dir)
         .map_err(|e| format!("cannot list DB dir {}: {e}", dbs_dir.display()))?
         .map(|e| {
-            e.map(|e| e.path())
-                .map_err(|err| format!("cannot read an entry of DB dir {}: {err}", dbs_dir.display()))
+            e.map(|e| e.path()).map_err(|err| {
+                format!(
+                    "cannot read an entry of DB dir {}: {err}",
+                    dbs_dir.display()
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -1000,12 +1037,16 @@ fn load_panel(opts: &HashMap<String, String>) -> Result<Panel, String> {
             None
         }
     };
-    let n_kmer = loaded.iter().filter(|(_, db)| kmer_of(db).is_some()).count();
+    let n_kmer = loaded
+        .iter()
+        .filter(|(_, db)| kmer_of(db).is_some())
+        .count();
     let source: MarkerSource = if n_kmer == 0 {
         if opts.get("marker-source").is_some_and(|m| m == "kmer") {
             return Err(
                 "--marker-source kmer but every DB in --dbs is an enzyme-tag database; \
-                 the marker spaces are disjoint".into(),
+                 the marker spaces are disjoint"
+                    .into(),
             );
         }
         MarkerSource::Enzyme(enzyme_set(opts)?)
@@ -1029,7 +1070,9 @@ fn load_panel(opts: &HashMap<String, String>) -> Result<Panel, String> {
         }
         let (want_k, want_scale) = kmer_params(opts)?;
         if opts.contains_key("kmer-size") && want_k != k {
-            return Err(format!("--kmer-size {want_k} does not match the panel (built with k={k})"));
+            return Err(format!(
+                "--kmer-size {want_k} does not match the panel (built with k={k})"
+            ));
         }
         if opts.contains_key("sketch-scale") && want_scale != scale {
             return Err(format!(
@@ -1381,8 +1424,14 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
         let c = &r.call;
         println!(
             "  {}\t{}\t{:.6}\t{:.2}\t{:.0}\t{:.3}\t{:.6}\t{:.6}",
-            r.species, c.name, c.rel_abundance, c.coverage, c.support, c.depth,
-            r.global_abundance, r.sample_fraction
+            r.species,
+            c.name,
+            c.rel_abundance,
+            c.coverage,
+            c.support,
+            c.depth,
+            r.global_abundance,
+            r.sample_fraction
         );
     }
 
@@ -1468,8 +1517,15 @@ fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
             writeln!(
                 w,
                 "{}\t{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{:.6}\t{:.6}\t{}",
-                r.species, c.name, c.rel_abundance, c.coverage, c.support, c.depth,
-                r.global_abundance, r.sample_fraction, c.n_markers
+                r.species,
+                c.name,
+                c.rel_abundance,
+                c.coverage,
+                c.support,
+                c.depth,
+                r.global_abundance,
+                r.sample_fraction,
+                c.n_markers
             )
             .map_err(|e| e.to_string())?;
         }
@@ -1499,7 +1555,9 @@ fn read_manifest(path: &Path) -> Result<Vec<ManifestSample>, String> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut lines = text.lines();
 
-    let header = lines.next().ok_or_else(|| format!("manifest {} is empty", path.display()))?;
+    let header = lines
+        .next()
+        .ok_or_else(|| format!("manifest {} is empty", path.display()))?;
     let cols: Vec<&str> = header.split(',').map(str::trim).collect();
     if cols.len() < 2 || cols[0] != "sample" || cols[1] != "reads1" {
         return Err(format!(
@@ -1539,7 +1597,10 @@ fn read_manifest(path: &Path) -> Result<Vec<ManifestSample>, String> {
             ));
         }
         if f[0].is_empty() {
-            return Err(format!("manifest {} line {lineno}: empty sample name", path.display()));
+            return Err(format!(
+                "manifest {} line {lineno}: empty sample name",
+                path.display()
+            ));
         }
         if f[1].is_empty() {
             return Err(format!(
@@ -1644,14 +1705,26 @@ fn cmd_batch(opts: &HashMap<String, String>) -> Result<(), String> {
             writeln!(
                 w,
                 "{}\t{}\t{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{:.6}\t{:.6}\t{}",
-                s.name, r.species, c.name, c.rel_abundance, c.coverage, c.support, c.depth,
-                r.global_abundance, r.sample_fraction, c.n_markers
+                s.name,
+                r.species,
+                c.name,
+                c.rel_abundance,
+                c.coverage,
+                c.support,
+                c.depth,
+                r.global_abundance,
+                r.sample_fraction,
+                c.n_markers
             )
             .map_err(|e| e.to_string())?;
         }
     }
     w.flush().map_err(|e| e.to_string())?;
-    println!("predictions ({} samples) -> {}", samples.len(), out.display());
+    println!(
+        "predictions ({} samples) -> {}",
+        samples.len(),
+        out.display()
+    );
     Ok(())
 }
 
@@ -1816,7 +1889,10 @@ fn report(calls: &[StrainCall]) {
 fn write_pred_tsv(path: &Path, calls: &[StrainCall]) -> std::io::Result<()> {
     use std::io::Write;
     let mut w = std::fs::File::create(path)?;
-    writeln!(w, "#cluster\tabundance\tcoverage\tsupport\tdepth\tn_markers")?;
+    writeln!(
+        w,
+        "#cluster\tabundance\tcoverage\tsupport\tdepth\tn_markers"
+    )?;
     for c in calls {
         writeln!(
             w,
@@ -1850,17 +1926,26 @@ mod tests {
     use strain2bscan::identify::detectable_fraction;
 
     fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn kmer_db() -> StrainDb {
-        let mut db = StrainDb::build(vec![("A".into(), vec![1, 2, 3, 10]), ("B".into(), vec![1, 2, 3, 20])]);
+        let mut db = StrainDb::build(vec![
+            ("A".into(), vec![1, 2, 3, 10]),
+            ("B".into(), vec![1, 2, 3, 20]),
+        ]);
         db.enzymes = vec!["kmer15s1".to_string()];
         db
     }
 
     fn enzyme_db() -> StrainDb {
-        let mut db = StrainDb::build(vec![("A".into(), vec![1, 2, 3, 10]), ("B".into(), vec![1, 2, 3, 20])]);
+        let mut db = StrainDb::build(vec![
+            ("A".into(), vec![1, 2, 3, 10]),
+            ("B".into(), vec![1, 2, 3, 20]),
+        ]);
         db.enzymes = vec!["BcgI".to_string()];
         db
     }
@@ -1873,7 +1958,14 @@ mod tests {
     #[test]
     fn reads_path_rejects_unrecognized_formats() {
         for good in [
-            "s.fq", "s.fastq", "s.fq.gz", "s.fastq.gz", "s.FQ.GZ", "s.fa", "s.fasta", "s.fna",
+            "s.fq",
+            "s.fastq",
+            "s.fq.gz",
+            "s.fastq.gz",
+            "s.FQ.GZ",
+            "s.fa",
+            "s.fasta",
+            "s.fna",
             "s.fna.gz",
         ] {
             assert!(
@@ -1890,7 +1982,10 @@ mod tests {
                 "{bad}: unexpected error {err}"
             );
         }
-        assert!(reads_path(&opts(&[])).is_err(), "a missing --reads must still error");
+        assert!(
+            reads_path(&opts(&[])).is_err(),
+            "a missing --reads must still error"
+        );
     }
 
     /// A k-mer DB must auto-detect: no flags needed, and the run inherits the DB's K and S.
@@ -1904,7 +1999,11 @@ mod tests {
         // Explicitly naming the mode and the matching parameters is fine too.
         let src = resolve_sample_source(
             &kmer_db(),
-            &opts(&[("marker-source", "kmer"), ("kmer-size", "15"), ("sketch-scale", "1")]),
+            &opts(&[
+                ("marker-source", "kmer"),
+                ("kmer-size", "15"),
+                ("sketch-scale", "1"),
+            ]),
         )
         .unwrap();
         assert!(matches!(src, MarkerSource::Kmer { k: 15, scale: 1 }));
@@ -1923,11 +2022,14 @@ mod tests {
     /// DB — must be a hard error, never silent garbage.
     #[test]
     fn profile_rejects_crossing_marker_spaces() {
-        let err = resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "enzyme")])).unwrap_err();
+        let err =
+            resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "enzyme")])).unwrap_err();
         assert!(err.contains("k-mer sketch"), "{err}");
-        let err = resolve_sample_source(&enzyme_db(), &opts(&[("marker-source", "kmer")])).unwrap_err();
+        let err =
+            resolve_sample_source(&enzyme_db(), &opts(&[("marker-source", "kmer")])).unwrap_err();
         assert!(err.contains("disjoint marker spaces"), "{err}");
-        let err = resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "wat")])).unwrap_err();
+        let err =
+            resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "wat")])).unwrap_err();
         assert!(err.contains("bad --marker-source"), "{err}");
     }
 
@@ -1951,13 +2053,23 @@ mod tests {
     fn multi_profile_panel_load_failure_propagates() {
         let dir = std::env::temp_dir().join(format!("s2bs_panel_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let good = StrainDb::build(vec![("A".into(), vec![1, 2, 3, 10]), ("B".into(), vec![1, 2, 3, 20])]);
+        let good = StrainDb::build(vec![
+            ("A".into(), vec![1, 2, 3, 10]),
+            ("B".into(), vec![1, 2, 3, 20]),
+        ]);
         good.save(&dir.join("good.tsv")).unwrap();
         // Header declares 5 strains / 5 counts but only one strain line is present.
-        std::fs::write(dir.join("broken.tsv"), b"#strain2bscan-db\t5\t\t1,1,1,1,1\nX\t1,2,3\n").unwrap();
+        std::fs::write(
+            dir.join("broken.tsv"),
+            b"#strain2bscan-db\t5\t\t1,1,1,1,1\nX\t1,2,3\n",
+        )
+        .unwrap();
 
         let err = load_species_dbs(&dir).unwrap_err();
-        assert!(err.contains("broken.tsv"), "error must name the failing DB: {err}");
+        assert!(
+            err.contains("broken.tsv"),
+            "error must name the failing DB: {err}"
+        );
 
         // An intact panel still loads, keyed by file stem.
         std::fs::remove_file(dir.join("broken.tsv")).unwrap();
@@ -1975,25 +2087,46 @@ mod tests {
     #[test]
     fn absolute_floor_gates_when_no_fraction() {
         // frac = 0 -> resolve gate is the absolute floor (200); detect gate = min(10, 200) = 10.
-        assert_eq!(species_tier(250, 5000, 10, 200, 0.0, FULL), SpeciesTier::Resolved);
-        assert_eq!(species_tier(50, 5000, 10, 200, 0.0, FULL), SpeciesTier::DetectedNotResolved);
-        assert_eq!(species_tier(5, 5000, 10, 200, 0.0, FULL), SpeciesTier::Absent);
+        assert_eq!(
+            species_tier(250, 5000, 10, 200, 0.0, FULL),
+            SpeciesTier::Resolved
+        );
+        assert_eq!(
+            species_tier(50, 5000, 10, 200, 0.0, FULL),
+            SpeciesTier::DetectedNotResolved
+        );
+        assert_eq!(
+            species_tier(5, 5000, 10, 200, 0.0, FULL),
+            SpeciesTier::Absent
+        );
     }
 
     #[test]
     fn breadth_fraction_raises_the_bar_for_large_panels() {
         // 10% of a 5000-marker panel = 500 > floor 200, so 300 observed is below the resolve gate
         // even though it clears the absolute floor. This is the whole point of the breadth term.
-        assert_eq!(species_tier(300, 5000, 10, 200, 0.10, FULL), SpeciesTier::DetectedNotResolved);
-        assert_eq!(species_tier(600, 5000, 10, 200, 0.10, FULL), SpeciesTier::Resolved);
+        assert_eq!(
+            species_tier(300, 5000, 10, 200, 0.10, FULL),
+            SpeciesTier::DetectedNotResolved
+        );
+        assert_eq!(
+            species_tier(600, 5000, 10, 200, 0.10, FULL),
+            SpeciesTier::Resolved
+        );
     }
 
     #[test]
     fn small_panel_species_can_still_be_detected() {
         // total 150 < floor 200 -> can never clear the resolve gate, but the detect gate
         // (min(10, 200) = 10) still flags presence rather than dropping it silently.
-        assert_eq!(species_tier(150, 150, 10, 200, 0.0, FULL), SpeciesTier::DetectedNotResolved);
-        assert_eq!(species_tier(5, 150, 10, 200, 0.0, FULL), SpeciesTier::Absent);
+        assert_eq!(
+            species_tier(150, 150, 10, 200, 0.0, FULL),
+            SpeciesTier::DetectedNotResolved
+        );
+        assert_eq!(
+            species_tier(5, 150, 10, 200, 0.0, FULL),
+            SpeciesTier::Absent
+        );
     }
 
     /// At low depth only a few percent of any panel is observable, so an unscaled 200-marker
@@ -2005,9 +2138,15 @@ mod tests {
         let reachable = detectable_fraction(0.05);
         assert!(reachable < 0.05);
         // 60 observed markers: below the full-depth floor of 200 ...
-        assert_eq!(species_tier(60, 5000, 10, 200, 0.0, FULL), SpeciesTier::DetectedNotResolved);
+        assert_eq!(
+            species_tier(60, 5000, 10, 200, 0.0, FULL),
+            SpeciesTier::DetectedNotResolved
+        );
         // ... but above the relaxed floor of 50 at low depth.
-        assert_eq!(species_tier(60, 5000, 10, 200, 0.0, reachable), SpeciesTier::Resolved);
+        assert_eq!(
+            species_tier(60, 5000, 10, 200, 0.0, reachable),
+            SpeciesTier::Resolved
+        );
     }
 
     /// The relaxation must be **bounded**. Scaling the floor by the reachable fraction `r` alone
@@ -2018,13 +2157,16 @@ mod tests {
     #[test]
     fn adaptive_floor_does_not_cancel_itself_away() {
         let r = detectable_fraction(0.002); // ~0.2% reachable
-        // 40 stray tags on a 20k panel: detected as present, but NOT strain-resolvable.
+                                            // 40 stray tags on a 20k panel: detected as present, but NOT strain-resolvable.
         assert_eq!(
             species_tier(40, 20_000, 10, 200, 0.0, r),
             SpeciesTier::DetectedNotResolved
         );
         // The bounded floor is 50, so real evidence still resolves.
-        assert_eq!(species_tier(50, 20_000, 10, 200, 0.0, r), SpeciesTier::Resolved);
+        assert_eq!(
+            species_tier(50, 20_000, 10, 200, 0.0, r),
+            SpeciesTier::Resolved
+        );
     }
 
     /// The gate must never fall below the absolute detect floor, at any depth.

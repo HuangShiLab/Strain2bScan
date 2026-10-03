@@ -36,7 +36,11 @@ pub struct QualityFilter {
 
 impl Default for QualityFilter {
     fn default() -> Self {
-        QualityFilter { max_contigs: None, min_tag_fraction: None, warn_fraction: 0.5 }
+        QualityFilter {
+            max_contigs: None,
+            min_tag_fraction: None,
+            warn_fraction: 0.5,
+        }
     }
 }
 
@@ -96,7 +100,13 @@ pub fn apply(genomes: Vec<GenomeRec>, f: &QualityFilter) -> QualityReport {
             }
         }
     }
-    QualityReport { n_input, median_tags: median, flagged, dropped, kept }
+    QualityReport {
+        n_input,
+        median_tags: median,
+        flagged,
+        dropped,
+        kept,
+    }
 }
 
 #[cfg(test)]
@@ -105,18 +115,32 @@ mod tests {
 
     fn rec(name: &str, n_contigs: usize, n_tags: usize) -> GenomeRec {
         let m: Vec<Marker> = (0..n_tags as u64).collect();
-        GenomeRec { name: name.into(), n_contigs, markers: m.clone(), full_markers: m }
+        GenomeRec {
+            name: name.into(),
+            n_contigs,
+            markers: m.clone(),
+            full_markers: m,
+        }
     }
 
     #[test]
     fn median_is_robust_to_a_few_incompletes() {
-        let g = vec![rec("a", 1, 1000), rec("b", 1, 1010), rec("c", 1, 990), rec("d", 50, 300)];
+        let g = vec![
+            rec("a", 1, 1000),
+            rec("b", 1, 1010),
+            rec("c", 1, 990),
+            rec("d", 50, 300),
+        ];
         assert_eq!(median_tags(&g), 1000);
     }
 
     #[test]
     fn flags_low_completeness_without_dropping_by_default() {
-        let g = vec![rec("complete1", 1, 1000), rec("complete2", 1, 1000), rec("partial", 1, 300)];
+        let g = vec![
+            rec("complete1", 1, 1000),
+            rec("complete2", 1, 1000),
+            rec("partial", 1, 300),
+        ];
         let r = apply(g, &QualityFilter::default());
         assert_eq!(r.kept.len(), 3); // nothing dropped by default
         assert_eq!(r.dropped.len(), 0);
@@ -129,10 +153,14 @@ mod tests {
         let g = vec![
             rec("good", 2, 1000),
             rec("good2", 3, 1000),
-            rec("incomplete", 4, 200),  // 200 < 0.5*1000 -> dropped
+            rec("incomplete", 4, 200),    // 200 < 0.5*1000 -> dropped
             rec("fragmented", 800, 1000), // contigs > 500 -> dropped
         ];
-        let f = QualityFilter { max_contigs: Some(500), min_tag_fraction: Some(0.5), warn_fraction: 0.5 };
+        let f = QualityFilter {
+            max_contigs: Some(500),
+            min_tag_fraction: Some(0.5),
+            warn_fraction: 0.5,
+        };
         let r = apply(g, &f);
         let kept: Vec<&str> = r.kept.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(kept, vec!["good", "good2"]);

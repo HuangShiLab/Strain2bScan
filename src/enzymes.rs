@@ -149,7 +149,10 @@ macro_rules! classes {
 }
 /// Exact (no degenerate positions) pattern.
 const fn pat(anchors: &'static [Anchor]) -> Pattern {
-    Pattern { anchors, classes: &[] }
+    Pattern {
+        anchors,
+        classes: &[],
+    }
 }
 
 // 1. CspCI (33)
@@ -157,103 +160,198 @@ const CSPCI_P: [Pattern; 2] = [
     pat(anchors!(11 => b"CAA", 19 => b"GTGG")),
     pat(anchors!(10 => b"CCAC", 19 => b"TTG")),
 ];
-pub const CSPCI: Enzyme = Enzyme { name: "CspCI", id: 1, tag_length: 33, patterns: &CSPCI_P };
+pub const CSPCI: Enzyme = Enzyme {
+    name: "CspCI",
+    id: 1,
+    tag_length: 33,
+    patterns: &CSPCI_P,
+};
 
 // 2. AloI (27)
 const ALOI_P: [Pattern; 2] = [
     pat(anchors!(7 => b"GAAC", 17 => b"TCC")),
     pat(anchors!(7 => b"GGA", 16 => b"GTTC")),
 ];
-pub const ALOI: Enzyme = Enzyme { name: "AloI", id: 2, tag_length: 27, patterns: &ALOI_P };
+pub const ALOI: Enzyme = Enzyme {
+    name: "AloI",
+    id: 2,
+    tag_length: 27,
+    patterns: &ALOI_P,
+};
 
 // 3. BsaXI (27)
 const BSAXI_P: [Pattern; 2] = [
     pat(anchors!(9 => b"AC", 16 => b"CTCC")),
     pat(anchors!(7 => b"GGAG", 16 => b"GT")),
 ];
-pub const BSAXI: Enzyme = Enzyme { name: "BsaXI", id: 3, tag_length: 27, patterns: &BSAXI_P };
+pub const BSAXI: Enzyme = Enzyme {
+    name: "BsaXI",
+    id: 3,
+    tag_length: 27,
+    patterns: &BSAXI_P,
+};
 
 // 4. BaeI (28) — degenerate: forward [CT]@19, reverse [AG]@8
 const BAEI_P: [Pattern; 2] = [
-    Pattern { anchors: anchors!(10 => b"AC", 16 => b"GTA", 20 => b"C"), classes: classes!(19 => b"CT") },
-    Pattern { anchors: anchors!(7 => b"G", 9 => b"TAC", 16 => b"GT"), classes: classes!(8 => b"AG") },
+    Pattern {
+        anchors: anchors!(10 => b"AC", 16 => b"GTA", 20 => b"C"),
+        classes: classes!(19 => b"CT"),
+    },
+    Pattern {
+        anchors: anchors!(7 => b"G", 9 => b"TAC", 16 => b"GT"),
+        classes: classes!(8 => b"AG"),
+    },
 ];
-pub const BAEI: Enzyme = Enzyme { name: "BaeI", id: 4, tag_length: 28, patterns: &BAEI_P };
+pub const BAEI: Enzyme = Enzyme {
+    name: "BaeI",
+    id: 4,
+    tag_length: 28,
+    patterns: &BAEI_P,
+};
 
 // 5. BcgI (32) — the canonical 2bRAD enzyme
 const BCGI_P: [Pattern; 2] = [
     pat(anchors!(10 => b"CGA", 19 => b"TGC")),
     pat(anchors!(10 => b"GCA", 19 => b"TCG")),
 ];
-pub const BCGI: Enzyme = Enzyme { name: "BcgI", id: 5, tag_length: 32, patterns: &BCGI_P };
+pub const BCGI: Enzyme = Enzyme {
+    name: "BcgI",
+    id: 5,
+    tag_length: 32,
+    patterns: &BCGI_P,
+};
 
 // 6. CjeI (28)
 const CJEI_P: [Pattern; 2] = [
     pat(anchors!(8 => b"CCA", 17 => b"GT")),
     pat(anchors!(9 => b"AC", 17 => b"TGG")),
 ];
-pub const CJEI: Enzyme = Enzyme { name: "CjeI", id: 6, tag_length: 28, patterns: &CJEI_P };
+pub const CJEI: Enzyme = Enzyme {
+    name: "CjeI",
+    id: 6,
+    tag_length: 28,
+    patterns: &CJEI_P,
+};
 
 // 7. PpiI (27)
 const PPII_P: [Pattern; 2] = [
     pat(anchors!(7 => b"GAAC", 16 => b"CTC")),
     pat(anchors!(8 => b"GAG", 16 => b"GTTC")),
 ];
-pub const PPII: Enzyme = Enzyme { name: "PpiI", id: 7, tag_length: 27, patterns: &PPII_P };
+pub const PPII: Enzyme = Enzyme {
+    name: "PpiI",
+    id: 7,
+    tag_length: 27,
+    patterns: &PPII_P,
+};
 
 // 8. PsrI (27)
 const PSRI_P: [Pattern; 2] = [
     pat(anchors!(7 => b"GAAC", 17 => b"TAC")),
     pat(anchors!(7 => b"GTA", 16 => b"GTTC")),
 ];
-pub const PSRI: Enzyme = Enzyme { name: "PsrI", id: 8, tag_length: 27, patterns: &PSRI_P };
+pub const PSRI: Enzyme = Enzyme {
+    name: "PsrI",
+    id: 8,
+    tag_length: 27,
+    patterns: &PSRI_P,
+};
 
 // 9. BplI (27, palindrome — self-RC single pattern)
 const BPLI_P: [Pattern; 1] = [pat(anchors!(8 => b"GAG", 16 => b"CTC"))];
-pub const BPLI: Enzyme = Enzyme { name: "BplI", id: 9, tag_length: 27, patterns: &BPLI_P };
+pub const BPLI: Enzyme = Enzyme {
+    name: "BplI",
+    id: 9,
+    tag_length: 27,
+    patterns: &BPLI_P,
+};
 
 // 10. FalI (27, palindrome)
 const FALI_P: [Pattern; 1] = [pat(anchors!(8 => b"AAG", 16 => b"CTT"))];
-pub const FALI: Enzyme = Enzyme { name: "FalI", id: 10, tag_length: 27, patterns: &FALI_P };
+pub const FALI: Enzyme = Enzyme {
+    name: "FalI",
+    id: 10,
+    tag_length: 27,
+    patterns: &FALI_P,
+};
 
 // 11. Bsp24I (27)
 const BSP24I_P: [Pattern; 2] = [
     pat(anchors!(8 => b"GAC", 17 => b"TGG")),
     pat(anchors!(7 => b"CCA", 16 => b"GTC")),
 ];
-pub const BSP24I: Enzyme = Enzyme { name: "Bsp24I", id: 11, tag_length: 27, patterns: &BSP24I_P };
+pub const BSP24I: Enzyme = Enzyme {
+    name: "Bsp24I",
+    id: 11,
+    tag_length: 27,
+    patterns: &BSP24I_P,
+};
 
 // 12. HaeIV (27) — degenerate: forward [CT]@9,[AG]@15 ; reverse [CT]@11,[AG]@17
 const HAEIV_P: [Pattern; 2] = [
-    Pattern { anchors: anchors!(7 => b"GA", 16 => b"TC"), classes: classes!(9 => b"CT", 15 => b"AG") },
-    Pattern { anchors: anchors!(9 => b"GA", 18 => b"TC"), classes: classes!(11 => b"CT", 17 => b"AG") },
+    Pattern {
+        anchors: anchors!(7 => b"GA", 16 => b"TC"),
+        classes: classes!(9 => b"CT", 15 => b"AG"),
+    },
+    Pattern {
+        anchors: anchors!(9 => b"GA", 18 => b"TC"),
+        classes: classes!(11 => b"CT", 17 => b"AG"),
+    },
 ];
-pub const HAEIV: Enzyme = Enzyme { name: "HaeIV", id: 12, tag_length: 27, patterns: &HAEIV_P };
+pub const HAEIV: Enzyme = Enzyme {
+    name: "HaeIV",
+    id: 12,
+    tag_length: 27,
+    patterns: &HAEIV_P,
+};
 
 // 13. CjePI (27)
 const CJEPI_P: [Pattern; 2] = [
     pat(anchors!(7 => b"CCA", 17 => b"TC")),
     pat(anchors!(8 => b"GA", 17 => b"TGG")),
 ];
-pub const CJEPI: Enzyme = Enzyme { name: "CjePI", id: 13, tag_length: 27, patterns: &CJEPI_P };
+pub const CJEPI: Enzyme = Enzyme {
+    name: "CjePI",
+    id: 13,
+    tag_length: 27,
+    patterns: &CJEPI_P,
+};
 
 // 14. Hin4I (27) — degenerate: forward [CT]@10,[GAC]@16 ; reverse [CTG]@10,[AG]@16
 const HIN4I_P: [Pattern; 2] = [
-    Pattern { anchors: anchors!(8 => b"GA", 17 => b"TC"), classes: classes!(10 => b"CT", 16 => b"GAC") },
-    Pattern { anchors: anchors!(8 => b"GA", 17 => b"TC"), classes: classes!(10 => b"CTG", 16 => b"AG") },
+    Pattern {
+        anchors: anchors!(8 => b"GA", 17 => b"TC"),
+        classes: classes!(10 => b"CT", 16 => b"GAC"),
+    },
+    Pattern {
+        anchors: anchors!(8 => b"GA", 17 => b"TC"),
+        classes: classes!(10 => b"CTG", 16 => b"AG"),
+    },
 ];
-pub const HIN4I: Enzyme = Enzyme { name: "Hin4I", id: 14, tag_length: 27, patterns: &HIN4I_P };
+pub const HIN4I: Enzyme = Enzyme {
+    name: "Hin4I",
+    id: 14,
+    tag_length: 27,
+    patterns: &HIN4I_P,
+};
 
 // 15. AlfI (32, palindrome)
 const ALFI_P: [Pattern; 1] = [pat(anchors!(10 => b"GCA", 19 => b"TGC"))];
-pub const ALFI: Enzyme = Enzyme { name: "AlfI", id: 15, tag_length: 32, patterns: &ALFI_P };
+pub const ALFI: Enzyme = Enzyme {
+    name: "AlfI",
+    id: 15,
+    tag_length: 32,
+    patterns: &ALFI_P,
+};
 
 // 16. BslFI (25)
-const BSLFI_P: [Pattern; 2] = [
-    pat(anchors!(6 => b"GGGAC")),
-    pat(anchors!(14 => b"GTCCC")),
-];
-pub const BSLFI: Enzyme = Enzyme { name: "BslFI", id: 16, tag_length: 25, patterns: &BSLFI_P };
+const BSLFI_P: [Pattern; 2] = [pat(anchors!(6 => b"GGGAC")), pat(anchors!(14 => b"GTCCC"))];
+pub const BSLFI: Enzyme = Enzyme {
+    name: "BslFI",
+    id: 16,
+    tag_length: 25,
+    patterns: &BSLFI_P,
+};
 
 /// All 16 enzymes, in id order.
 pub static ALL_ENZYMES: &[&Enzyme] = &[
@@ -295,8 +393,8 @@ pub fn parse_enzyme(site: &str) -> Option<&'static Enzyme> {
 /// a few percent smaller than these sums — the relative comparison between enzymes stands.)
 /// Use `all` only when panel size is the binding constraint and the extra noise is acceptable.
 pub static RECOMMENDED_ENZYMES: &[&Enzyme] = &[
-    &CSPCI, &ALOI, &BSAXI, &BAEI, &BCGI, &CJEI, &PPII, &PSRI, &BPLI, &FALI, &BSP24I, &CJEPI,
-    &ALFI, &BSLFI,
+    &CSPCI, &ALOI, &BSAXI, &BAEI, &BCGI, &CJEI, &PPII, &PSRI, &BPLI, &FALI, &BSP24I, &CJEPI, &ALFI,
+    &BSLFI,
 ];
 
 pub fn parse_enzyme_set(spec: &str) -> Option<Vec<&'static Enzyme>> {
@@ -350,9 +448,22 @@ mod tests {
     fn tag_lengths_match_fast2brad_m() {
         // From the authoritative Fast2bRAD-M / 2bRADExtraction.pl table.
         let expected: [(&str, usize); 16] = [
-            ("CspCI", 33), ("AloI", 27), ("BsaXI", 27), ("BaeI", 28), ("BcgI", 32), ("CjeI", 28),
-            ("PpiI", 27), ("PsrI", 27), ("BplI", 27), ("FalI", 27), ("Bsp24I", 27), ("HaeIV", 27),
-            ("CjePI", 27), ("Hin4I", 27), ("AlfI", 32), ("BslFI", 25),
+            ("CspCI", 33),
+            ("AloI", 27),
+            ("BsaXI", 27),
+            ("BaeI", 28),
+            ("BcgI", 32),
+            ("CjeI", 28),
+            ("PpiI", 27),
+            ("PsrI", 27),
+            ("BplI", 27),
+            ("FalI", 27),
+            ("Bsp24I", 27),
+            ("HaeIV", 27),
+            ("CjePI", 27),
+            ("Hin4I", 27),
+            ("AlfI", 32),
+            ("BslFI", 25),
         ];
         for (name, len) in expected {
             let e = enzyme_by_name(name).unwrap();
@@ -379,9 +490,16 @@ mod tests {
         // building a window that matches the forward pattern and confirming its reverse complement
         // matches (some) pattern of the same enzyme.
         fn rc(seq: &[u8]) -> Vec<u8> {
-            seq.iter().rev().map(|&b| match b {
-                b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C', x => x,
-            }).collect()
+            seq.iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'T' => b'A',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    x => x,
+                })
+                .collect()
         }
         for e in ALL_ENZYMES {
             for p in e.patterns {

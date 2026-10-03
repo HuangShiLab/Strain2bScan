@@ -27,7 +27,9 @@ impl XorShift {
     }
 
     fn dna(&mut self, len: usize) -> Vec<u8> {
-        (0..len).map(|_| b"ACGT"[(self.next() % 4) as usize]).collect()
+        (0..len)
+            .map(|_| b"ACGT"[(self.next() % 4) as usize])
+            .collect()
     }
 
     fn below(&mut self, n: usize) -> usize {
@@ -74,7 +76,11 @@ fn build_kmer_cluster_db(genomes: &[Vec<u8>]) -> StrainDb {
         })
         .collect();
     let cst = SpeciesCst::build(recs, DEFAULT_SIMILARITY, false);
-    assert_eq!(cst.n_clusters(), 2, "core+private genomes must split into 2 clusters");
+    assert_eq!(
+        cst.n_clusters(),
+        2,
+        "core+private genomes must split into 2 clusters"
+    );
     let mut db = cst.cluster_db();
     db.enzymes = vec![kmer_db_token(K, SCALE)];
     db.tree = Some(cst.build_tree());
@@ -98,7 +104,11 @@ fn kmer_mode_end_to_end_recovers_70_30_mixture() {
     db.save(&path).unwrap();
     let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
     let header = text.lines().next().unwrap();
-    assert_eq!(header.split('\t').count(), 4, "header must keep the counts field");
+    assert_eq!(
+        header.split('\t').count(),
+        4,
+        "header must keep the counts field"
+    );
     assert_eq!(header.split('\t').nth(1), Some("2"));
     assert_eq!(header.split('\t').nth(2), Some("kmer15s1"));
     let db = StrainDb::load(&path).unwrap();
@@ -124,7 +134,10 @@ fn kmer_mode_end_to_end_recovers_70_30_mixture() {
         c1.rel_abundance
     );
     let sum: f64 = calls.iter().map(|c| c.rel_abundance).sum();
-    assert!((sum - 1.0).abs() < 1e-6, "abundances must sum to 1, got {sum}");
+    assert!(
+        (sum - 1.0).abs() < 1e-6,
+        "abundances must sum to 1, got {sum}"
+    );
     // Both are fully covered: 700 reads of 150 bp over ~6.5 kb is ~15x per k-mer.
     assert!(c0.coverage > 0.9 && c1.coverage > 0.9);
 }
@@ -142,12 +155,18 @@ fn kmer_mode_cst_enet_smoke() {
     };
     // Must not panic, and the output must be well-formed (parses as a prediction set).
     let calls = profile(&db, &counts, &params);
-    assert!(!calls.is_empty(), "cst/enet on the k-mer DB must call something");
+    assert!(
+        !calls.is_empty(),
+        "cst/enet on the k-mer DB must call something"
+    );
     for c in &calls {
         assert!(c.rel_abundance.is_finite() && c.rel_abundance > 0.0);
         assert!(c.depth.is_finite() && c.depth >= 0.0);
         assert!((0.0..=1.0).contains(&c.coverage));
     }
     let sum: f64 = calls.iter().map(|c| c.rel_abundance).sum();
-    assert!((sum - 1.0).abs() < 1e-6, "abundances must sum to 1, got {sum}");
+    assert!(
+        (sum - 1.0).abs() < 1e-6,
+        "abundances must sum to 1, got {sum}"
+    );
 }

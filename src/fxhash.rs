@@ -90,7 +90,10 @@ mod tests {
         }
         assert_eq!(m.len(), 10_000);
         for i in 0..10_000u64 {
-            assert_eq!(m.get(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15)), Some(&(i as u32)));
+            assert_eq!(
+                m.get(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                Some(&(i as u32))
+            );
         }
     }
 

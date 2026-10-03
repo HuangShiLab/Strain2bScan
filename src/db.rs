@@ -50,6 +50,13 @@ pub struct StrainDb {
     /// therefore what makes `--layer1 cst` usable at profile time. Databases written before this
     /// existed have `None` and fall back to the flat path, so old databases stay readable.
     pub tree: Option<Cst>,
+    /// Cached unique + quantifiable marker panel for each strain. Built on load / restrict so the
+    /// hot profiling loop does not repeatedly filter `strain_markers` through `is_unique` and
+    /// `is_quantifiable`.
+    pub quant_panels: Vec<Vec<Marker>>,
+    /// Cached tree node markers after applying `quant_mask`. `None` when no cross-species mask is
+    /// in force; built once in `restrict_to` so tree descent stops allocating per node.
+    pub masked_node_markers: Option<Vec<Vec<Marker>>>,
 }
 
 impl StrainDb {
@@ -64,7 +71,25 @@ impl StrainDb {
             db.strain_names.push(name);
             db.strain_markers.push(set);
         }
+        db.compute_quant_panels();
         db
+    }
+
+    /// Populate `quant_panels` from the current `strain_markers`, `unique_set`, and `quant_mask`.
+    fn compute_quant_panels(&mut self) {
+        self.quant_panels = self
+            .strain_markers
+            .iter()
+            .map(|set| {
+                let mut panel: Vec<Marker> = set
+                    .iter()
+                    .copied()
+                    .filter(|&m| self.is_unique(m) && self.is_quantifiable(m))
+                    .collect();
+                panel.sort_unstable();
+                panel
+            })
+            .collect();
     }
 
     pub fn n_strains(&self) -> usize {
@@ -104,19 +129,35 @@ impl StrainDb {
             .filter(|m| allowed.contains(m))
             .collect();
         self.quant_mask = Some(kept);
+        self.compute_quant_panels();
+        self.compute_masked_node_markers(allowed);
+    }
+
+    /// Populate `masked_node_markers` by filtering each CST node's marker set with `allowed`.
+    fn compute_masked_node_markers(&mut self, allowed: &FxHashSet<Marker>) {
+        self.masked_node_markers = self.tree.as_ref().map(|t| {
+            t.node_markers
+                .iter()
+                .map(|set| {
+                    set.iter()
+                        .copied()
+                        .filter(|m| allowed.contains(m))
+                        .collect()
+                })
+                .collect()
+        });
     }
 
     /// The unique markers of strain `j` — cluster-specific within this species, and (when a
     /// cross-species restriction is in force) not shared with any other species in the panel.
-    pub fn unique_markers(&self, j: usize) -> impl Iterator<Item = Marker> + '_ {
-        self.strain_markers[j]
-            .iter()
-            .copied()
-            .filter(move |&m| self.is_unique(m) && self.is_quantifiable(m))
+    ///
+    /// Returns a sorted slice into the precomputed `quant_panels` cache.
+    pub fn unique_markers(&self, j: usize) -> &[Marker] {
+        &self.quant_panels[j]
     }
 
     pub fn unique_marker_count(&self, j: usize) -> usize {
-        self.unique_markers(j).count()
+        self.quant_panels[j].len()
     }
 
     // ===== persistence (simple, line-oriented text) ========================
@@ -175,10 +216,18 @@ impl StrainDb {
                     .map(|m| format!("{m:x}"))
                     .collect::<Vec<_>>()
                     .join(",");
-                writeln!(w, "#node\t{v}\t{par}\t{ca}\t{cb}\t{:.6}\t{joined}", t.merge_similarity[v])?;
+                writeln!(
+                    w,
+                    "#node\t{v}\t{par}\t{ca}\t{cb}\t{:.6}\t{joined}",
+                    t.merge_similarity[v]
+                )?;
             }
             for (l, gs) in t.leaves.iter().enumerate() {
-                let joined = gs.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",");
+                let joined = gs
+                    .iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 writeln!(w, "#leaf\t{l}\t{joined}")?;
             }
         }
@@ -232,13 +281,16 @@ impl StrainDb {
             if line.starts_with('#') {
                 if line.starts_with("#strain2bscan-db") {
                     let f: Vec<&str> = line.split('\t').collect();
-                    let n: usize = f
-                        .get(1)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| bad(format!("line {lineno}: malformed header (strain count)")))?;
+                    let n: usize = f.get(1).and_then(|s| s.parse().ok()).ok_or_else(|| {
+                        bad(format!("line {lineno}: malformed header (strain count)"))
+                    })?;
                     declared_strains = Some(n);
                     if let Some(csv) = f.get(2) {
-                        enzymes = csv.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+                        enzymes = csv
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .collect();
                     }
                     match f.get(3) {
                         Some(csv) => {
@@ -247,7 +299,9 @@ impl StrainDb {
                                 .filter(|s| !s.is_empty())
                                 .map(|s| {
                                     s.parse::<usize>().map_err(|_| {
-                                        bad(format!("line {lineno}: malformed header (marker count '{s}')"))
+                                        bad(format!(
+                                            "line {lineno}: malformed header (marker count '{s}')"
+                                        ))
                                     })
                                 })
                                 .collect::<std::io::Result<_>>()?;
@@ -287,15 +341,21 @@ impl StrainDb {
                     if f.len() < 4 {
                         return Err(bad(format!("line {lineno}: malformed #tree header")));
                     }
-                    let n_leaves: usize = f[1]
-                        .parse()
-                        .map_err(|_| bad(format!("line {lineno}: malformed #tree leaf count '{}'", f[1])))?;
-                    let n_nodes: usize = f[2]
-                        .parse()
-                        .map_err(|_| bad(format!("line {lineno}: malformed #tree node count '{}'", f[2])))?;
-                    tree_root = f[3]
-                        .parse()
-                        .map_err(|_| bad(format!("line {lineno}: malformed #tree root '{}'", f[3])))?;
+                    let n_leaves: usize = f[1].parse().map_err(|_| {
+                        bad(format!(
+                            "line {lineno}: malformed #tree leaf count '{}'",
+                            f[1]
+                        ))
+                    })?;
+                    let n_nodes: usize = f[2].parse().map_err(|_| {
+                        bad(format!(
+                            "line {lineno}: malformed #tree node count '{}'",
+                            f[2]
+                        ))
+                    })?;
+                    tree_root = f[3].parse().map_err(|_| {
+                        bad(format!("line {lineno}: malformed #tree root '{}'", f[3]))
+                    })?;
                     tree_parent = vec![None; n_nodes];
                     tree_children = vec![None; n_nodes];
                     tree_markers = vec![FxHashSet::default(); n_nodes];
@@ -307,31 +367,35 @@ impl StrainDb {
                     if f.len() < 7 {
                         return Err(bad(format!("line {lineno}: malformed #node line")));
                     }
-                    let v: usize = f[1]
-                        .parse()
-                        .map_err(|_| bad(format!("line {lineno}: malformed #node index '{}'", f[1])))?;
+                    let v: usize = f[1].parse().map_err(|_| {
+                        bad(format!("line {lineno}: malformed #node index '{}'", f[1]))
+                    })?;
                     if v >= tree_parent.len() {
                         return Err(bad(format!("line {lineno}: #node index {v} out of range")));
                     }
                     let num = |i: usize| -> std::io::Result<i64> {
-                        f[i].parse()
-                            .map_err(|_| bad(format!("line {lineno}: malformed #node field '{}'", f[i])))
+                        f[i].parse().map_err(|_| {
+                            bad(format!("line {lineno}: malformed #node field '{}'", f[i]))
+                        })
                     };
                     let (par, ca, cb) = (num(2)?, num(3)?, num(4)?);
                     tree_parent[v] = (par >= 0).then_some(par as usize);
                     tree_children[v] = (ca >= 0 && cb >= 0).then_some((ca as usize, cb as usize));
-                    tree_sim[v] = f[5]
-                        .parse()
-                        .map_err(|_| bad(format!("line {lineno}: malformed #node similarity '{}'", f[5])))?;
+                    tree_sim[v] = f[5].parse().map_err(|_| {
+                        bad(format!(
+                            "line {lineno}: malformed #node similarity '{}'",
+                            f[5]
+                        ))
+                    })?;
                     tree_markers[v] = hexset(f[6], lineno)?;
                 } else if line.starts_with("#leaf\t") {
                     let f: Vec<&str> = line.split('\t').collect();
                     if f.len() < 3 {
                         return Err(bad(format!("line {lineno}: malformed #leaf line")));
                     }
-                    let l: usize = f[1]
-                        .parse()
-                        .map_err(|_| bad(format!("line {lineno}: malformed #leaf index '{}'", f[1])))?;
+                    let l: usize = f[1].parse().map_err(|_| {
+                        bad(format!("line {lineno}: malformed #leaf index '{}'", f[1]))
+                    })?;
                     if l >= tree_leaves.len() {
                         return Err(bad(format!("line {lineno}: #leaf index {l} out of range")));
                     }
@@ -364,8 +428,8 @@ impl StrainDb {
                 .collect::<std::io::Result<Vec<_>>>()?;
             strains.push((name, markers));
         }
-        let n_declared = declared_strains
-            .ok_or_else(|| bad("missing #strain2bscan-db header".to_string()))?;
+        let n_declared =
+            declared_strains.ok_or_else(|| bad("missing #strain2bscan-db header".to_string()))?;
         if strains.len() != n_declared {
             return Err(bad(format!(
                 "corrupt or truncated database: header declares {n_declared} strains but {} were parsed",
@@ -385,6 +449,7 @@ impl StrainDb {
         let mut db = StrainDb::build(strains);
         db.enzymes = enzymes;
         db.unique_set = unique_set;
+        db.compute_quant_panels();
         if have_tree {
             // `desc_leaves` is derivable from the topology, so it is not serialized.
             let n = tree_parent.len();
@@ -467,7 +532,7 @@ mod tests {
         assert!(db.is_unique(10) && db.is_unique(20) && db.is_unique(30));
         assert!(!db.is_unique(1));
         assert_eq!(db.unique_marker_count(0), 1);
-        assert_eq!(db.unique_markers(0).next(), Some(10));
+        assert_eq!(db.unique_markers(0).first(), Some(&10));
     }
 
     /// Cluster-uniqueness is defined within one species, so a tag can be unique to a cluster
@@ -481,14 +546,22 @@ mod tests {
             ("B".into(), vec![1, 2, 20]),
         ]);
         let mut db = db_unrestricted.clone();
-        assert_eq!(db.unique_markers(0).count(), 2, "10 and 99 are unique within the species");
+        assert_eq!(
+            db.unique_markers(0).len(),
+            2,
+            "10 and 99 are unique within the species"
+        );
 
         // Panel-wide species-specific markers: 99 is shared with another species, so it is out.
         let specific: FxHashSet<Marker> = [1, 2, 10, 20].into_iter().collect();
         db.restrict_to(&specific);
 
-        let kept: Vec<Marker> = db.unique_markers(0).collect();
-        assert_eq!(kept, vec![10], "only the genuinely species-specific marker may be used");
+        let kept: Vec<Marker> = db.unique_markers(0).to_vec();
+        assert_eq!(
+            kept,
+            vec![10],
+            "only the genuinely species-specific marker may be used"
+        );
         assert!(db.is_quantifiable(10) && !db.is_quantifiable(99));
         // Unrestricted DBs (e.g. single-species `profile`) are unaffected.
         assert!(db_unrestricted.is_quantifiable(99));
@@ -605,7 +678,8 @@ mod tests {
         std::fs::write(&path, format!("{head}\n{keep}\n")).unwrap();
         let err = StrainDb::load(&path).unwrap_err();
         assert!(
-            err.to_string().contains("declares 5 markers but 3 were parsed"),
+            err.to_string()
+                .contains("declares 5 markers but 3 were parsed"),
             "unexpected error: {err}"
         );
 
@@ -617,7 +691,8 @@ mod tests {
         std::fs::write(&path, format!("{head}\n")).unwrap();
         let err = StrainDb::load(&path).unwrap_err();
         assert!(
-            err.to_string().contains("declares 3 strains but 2 were parsed"),
+            err.to_string()
+                .contains("declares 3 strains but 2 were parsed"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_file(&path);
@@ -634,7 +709,11 @@ mod tests {
         let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
         let mut lines = text.lines();
         let header = lines.next().unwrap();
-        assert_eq!(header.split('\t').count(), 4, "save must write the counts field");
+        assert_eq!(
+            header.split('\t').count(),
+            4,
+            "save must write the counts field"
+        );
         let mut legacy = header.split('\t').take(3).collect::<Vec<_>>().join("\t");
         for l in lines {
             legacy.push('\n');
@@ -670,7 +749,8 @@ mod tests {
 
         let err = StrainDb::load(&path).unwrap_err();
         assert!(
-            err.to_string().contains("line 2: malformed hex marker 'not_hex'"),
+            err.to_string()
+                .contains("line 2: malformed hex marker 'not_hex'"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_file(&path);
