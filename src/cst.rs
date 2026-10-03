@@ -414,6 +414,9 @@ impl SpeciesCst {
             .into_iter()
             .filter(|m| full_unions.iter().filter(|fu| fu.contains(m)).count() == 1)
             .collect();
+        // `build` populated the cache before `unique_set` existed. Refresh it so the cached
+        // quantification panels obey the stricter occurrence-based definition.
+        db.compute_quant_panels();
         db
     }
 }
@@ -556,6 +559,36 @@ mod tests {
         assert!(db.is_unique(200));
         // ...but the species-core marker is shared across both clusters.
         assert!(!db.is_unique(0));
+    }
+
+    /// The cached quantification panels must see the same uniqueness definition as
+    /// `is_unique`. This panel needs a genome with a marker that is scored in one cluster but
+    /// occurs multi-copy in another cluster's full genome: membership degree calls it unique,
+    /// the occurrence-based `unique_set` must overrule it.
+    #[test]
+    fn cluster_db_quant_panels_respect_unique_set() {
+        let genomes = vec![
+            ("scored_99".to_string(), vec![10, 99], vec![10, 99]),
+            ("other_a".to_string(), vec![20], vec![20]),
+            ("full_99".to_string(), vec![30], vec![30, 99]),
+            ("other_b".to_string(), vec![40], vec![40]),
+        ];
+        let cst = SpeciesCst::build(genomes, DEFAULT_SIMILARITY, false);
+        let db = cst.cluster_db();
+        let j = db
+            .strain_markers
+            .iter()
+            .position(|markers| markers.contains(&99))
+            .expect("one cluster carries scored marker 99");
+
+        assert!(
+            !db.is_unique(99),
+            "99 also occurs in another cluster's full genomes"
+        );
+        assert!(
+            !db.unique_markers(j).contains(&99),
+            "the quantification cache still contains a marker rejected by unique_set"
+        );
     }
 
     /// A LEAF's marker set is the UNION of its members', not the intersection.

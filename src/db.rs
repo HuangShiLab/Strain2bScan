@@ -76,7 +76,7 @@ impl StrainDb {
     }
 
     /// Populate `quant_panels` from the current `strain_markers`, `unique_set`, and `quant_mask`.
-    fn compute_quant_panels(&mut self) {
+    pub(crate) fn compute_quant_panels(&mut self) {
         self.quant_panels = self
             .strain_markers
             .iter()

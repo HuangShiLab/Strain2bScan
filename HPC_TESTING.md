@@ -1,7 +1,7 @@
 # Testing this build on HPC
 
-`main` at `c394bf2`. This is what changed since the last HPC run, what is already measured, and
-what still needs your machines.
+`strainscan-port` at `f26f234` plus the cache-refresh fix. This is what changed since the last HPC
+run, what is already measured, and what still needs your machines.
 
 Read §1 first — it says which of your existing results are still valid, so you do not re-run
 things that cannot have changed.
@@ -12,6 +12,7 @@ things that cannot have changed.
 
 | commit | change | effect on results |
 |---|---|---|
+| `f26f234` | precompute unique/quantifiable panels and masked CST nodes; one-pass panel statistics | none expected — caches and equivalent percentile logic; verify call identity |
 | `c394bf2` | HPC testing guide + `scripts/sim_bench.py` reproducible benchmark | none — documentation/opt-in |
 | `9c5a63a` | truncated/corrupt databases are rejected instead of silently loading | none on intact databases; see §4 |
 | `63c4f50` | new `--marker-source kmer` (FracMinHash sketch) | none — opt-in |
