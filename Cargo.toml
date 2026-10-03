@@ -15,6 +15,7 @@ categories = ["science", "command-line-utilities"]
 #   - needletail  (streaming + gzip FASTA/FASTQ, replaces markers::read_fastx)
 #   - clap        (richer CLI; replaces the hand-rolled parser in main.rs)
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 
 [lib]
 name = "strain2bscan"

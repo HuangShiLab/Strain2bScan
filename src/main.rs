@@ -1,143 +1,46 @@
-//! strain2bscan CLI (prototype).
-//!
-//!   strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]
-//!   strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]
-//!   strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--fixed-gate]
-//!   strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--fixed-gate]
-//!   strain2bscan batch   --dbs <dir> --manifest <csv> --out <merged.tsv> [--enzyme <set>] [multi-profile options]
-//!   strain2bscan info     --db <db.tsv>
-//!   strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]
-//!   strain2bscan demo | cst-demo
-//!
-//! `<set>` is `all` (all 16 type-IIB enzymes), a single enzyme (`BcgI`), or a comma list
-//! (`BcgI,CspCI`). Use `BcgI` for BcgI 2bRAD data; use `all` to digitally digest a
-//! conventional metagenome and enrich strain-specific markers. The genome DB and the sample
-//! must use the same enzyme set — `profile` reads the set from the DB header automatically.
-//!
-//! `--marker-source kmer` replaces enzyme digestion with sketched canonical k-mers
-//! (k = `--kmer-size`, default 31; keep ~1/`--sketch-scale`, default 100, of them by hash).
-//! A k-mer DB records `kmer<K>s<S>` in its header; `profile`/`multi-profile` auto-detect
-//! this and refuse to cross the two marker spaces.
-//!
-//! Arg parsing is hand-rolled to keep the prototype dependency-free; production uses clap.
+//! strain2bscan CLI.
 
-use std::collections::HashMap;
+mod cli;
+mod commands;
+mod panel;
+mod report;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use strain2bscan::bench::{evaluate, parse_abundance_tsv};
-use strain2bscan::cst::{SpeciesCst, DEFAULT_SIMILARITY, MINHASH_ABOVE};
+use clap::Parser;
+use cli::{Cli, Commands};
 use strain2bscan::db::StrainDb;
 use strain2bscan::enzymes::{parse_enzyme_set, Enzyme};
-use strain2bscan::fxhash::{FxHashMap, FxHashSet};
-use strain2bscan::identify::{
-    detectable_fraction, naive_profile, profile, resolve_layer1, tree_utility, Layer1, Layer2,
-    Params, StrainCall,
-};
 use strain2bscan::markers::{
-    fastx_stem, genome_kmer_counts, genome_marker_counts_multi, is_fasta_path, is_fastx_path,
-    kmer_db_token, parse_kmer_db_token, read_fastx, sample_kmer_counts_stream,
-    sample_marker_counts_stream, single_copy_markers, sketch_threshold, Marker, MarkerCounts,
+    fastx_stem, genome_kmer_counts, genome_marker_counts_multi, is_fasta_path, kmer_db_token,
+    parse_kmer_db_token, read_fastx, sample_kmer_counts_stream, sample_marker_counts_stream,
+    single_copy_markers, sketch_threshold, Marker, MarkerCounts,
 };
-use strain2bscan::parallel::{num_threads, par_map};
+use strain2bscan::parallel::par_map;
 use strain2bscan::quality::{self, GenomeRec, QualityFilter};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("");
-    let opts = parse_opts(&args);
-
-    let result = match cmd {
-        "build" => cmd_build(&opts),
-        "cluster" => cmd_cluster(&opts),
-        "diagnose-tree" => cmd_diagnose_tree(&opts),
-        "profile" => cmd_profile(&opts),
-        "multi-profile" => cmd_multi_profile(&opts),
-        "batch" => cmd_batch(&opts),
-        "info" => cmd_info(&opts),
-        "evaluate" => cmd_evaluate(&opts),
-        "demo" => cmd_demo(),
-        "cst-demo" => cmd_cst_demo(),
-        _ => {
-            eprintln!(
-                "usage:\n  \
-                 strain2bscan build    --genomes <dir> --enzyme <set> --out <db.tsv> [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]\n  \
-                 strain2bscan cluster  --genomes <dir> --enzyme <set> --out <clusterdb.tsv> [--similarity 0.95] [--containment (uneven-completeness panels)] [--max-contigs N] [--min-tag-fraction F] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]\n  \
-                 strain2bscan profile  --db <db.tsv> --reads <fastx> [--enzyme <set>] [--out pred.tsv] [--min-support N] [--min-coverage F] [--min-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--layer1 auto|unique|cst] [--layer2 depth|enet] [--fixed-gate]\n  \
-                 strain2bscan multi-profile --dbs <dir> --reads <fastx> --enzyme <set> [--out pred.tsv] [--min-species-markers N] [--min-species-marker-frac F] [--min-species-detect N] [--min-abundance F] [--min-global-abundance F] [--trace-gap R] [--trace-floor F] [--min-consistency F] [--fixed-gate|--no-adaptive-singleton|--no-adaptive-floor] [--no-cross-species-filter]   (many species, sample digested once)\n  \
-                 strain2bscan batch   --dbs <dir> --manifest <csv> --out <merged.tsv> [--enzyme <set>] [same identification options as multi-profile]   (many samples, DBs loaded once; manifest header: sample,reads1,reads2 — reads2 optional, empty = single-end)\n  \
-                 strain2bscan diagnose-tree --genomes <dir> --enzyme <set> [--similarity 0.95] [--marker-source enzyme|kmer] [--kmer-size K] [--sketch-scale S]   (can a Cluster Search Tree work on this panel?)\n  \
-                 strain2bscan info     --db <db.tsv>\n  \
-                 strain2bscan evaluate --pred <pred.tsv> --truth <truth.tsv> [--present 0.01]\n  \
-                 strain2bscan demo | cst-demo\n\n\
-                 <set> = all | recommended | BcgI | BcgI,CspCI  (BcgI for 2bRAD data; recommended\n\
-                 or all for conventional metagenomes. `recommended` is the 14 non-degenerate\n\
-                 enzymes: it drops HaeIV/Hin4I, whose loose IUPAC sites contribute 35% of the tags\n\
-                 in `all` and are the easiest for a sequencing error to create or destroy.)\n\
-                 reads/genomes may be gzipped (.fq.gz, .fna.gz).\n\n\
-                 --marker-source kmer replaces digestion with sketched canonical k-mers: every\n\
-                 k-mer (--kmer-size, default 31) whose hash falls below u64::MAX/--sketch-scale\n\
-                 (default 100) is kept, so ~1/scale of them survive and marker density is a\n\
-                 continuous knob rather than the 1/2/4/16 steps an enzyme panel offers. Both\n\
-                 identification layers work unchanged on them. The mode and its parameters are\n\
-                 recorded in the database and detected automatically by profile; --kmer-size and\n\
-                 --sketch-scale then act only as consistency checks. Mixing marker spaces across\n\
-                 a panel, or between build and profile, is an error. Denser sketches are what\n\
-                 make a Cluster Search Tree usable: on a 28-genome panel the internal nodes carry\n\
-                 a median of 45 group-specific markers with --enzyme all (the 16-enzyme ceiling,\n\
-                 still too sparse to descend) against 134 at --sketch-scale 30, at ~3.5x the\n\
-                 database size. Needs assemblies, so it is for shotgun data, not native 2bRAD.\n\
-                 multi-profile reports two scopes: `abundance` sums to 1.0 WITHIN each species\n\
-                 (the primary number), `global_abundance` sums to 1.0 over the strain-resolved\n\
-                 part of the sample. --min-abundance applies within-species. Detection and depth\n\
-                 use only markers specific to their species across the whole panel, so a\n\
-                 co-present congener cannot inflate a cluster's depth; disable with\n\
-                 --no-cross-species-filter (single-species `profile` cannot do this).\n\
-                 --min-consistency F (default 0.5) rejects a cluster whose markers are too DEEP\n\
-                 for how FEW of them were seen: coverage/(1-e^-depth) is ~1 for a genuinely\n\
-                 present cluster at any depth, but ~f for a shadow cluster -- one called because\n\
-                 the sample strain happens to carry a fraction f of its distinguishing loci. Set\n\
-                 0 to disable. This is the main same-species false-positive source; no coverage\n\
-                 floor can catch it, since a shadow and a genuine rare strain have the same\n\
-                 breadth and differ only in depth.\n\
-                 --layer1 cst descends the Cluster Search Tree instead of scoring each cluster on\n\
-                 its own unique markers, pooling an ancestor's group-specific markers into a leaf\n\
-                 whose sibling branch was never entered -- which lets a leaf with too few markers\n\
-                 of its own be called at all. Needs a DB built by `cluster` (the tree is stored\n\
-                 there); falls back to the flat path otherwise.\n\
-                 --layer1 defaults to `auto`, which reads the answer off the DB: descend only if\n\
-                 some cluster falls below the support floor (the only case pooling can change an\n\
-                 outcome) AND some internal node carries enough markers to pool. Whether a tree\n\
-                 helps is a property of the panel, not of the software, and on a dense one it\n\
-                 does not -- so the choice belongs per database rather than in a global flag.\n\
-                 The decision and the two counts behind it are printed. Force either path with\n\
-                 --layer1 unique|cst.\n\
-                 --layer2 enet replaces the per-cluster mean depth with StrainScan's joint fit:\n\
-                 a non-negative ElasticNet over the SHARED-marker design matrix, which can\n\
-                 apportion a cluster that has no unique markers at all -- one whose tag set is\n\
-                 contained in a co-present relative's. Layer-1 is blind to those by construction,\n\
-                 so enet is also given the contained clusters Layer-1 skipped, not merely the\n\
-                 ones it called; without that the layer cannot reach the case it exists for.\n\
-                 --min-global-abundance F drops calls below F of the cross-species composition.\n\
-                 It is the only filter that can remove a spurious SPECIES: --min-abundance is\n\
-                 within-species, so a species with one cluster always sits at 1.0 there. Use it\n\
-                 to separate community members from trace cross-contamination between libraries,\n\
-                 which passes every marker-evidence gate because the reads really are present.\n\
-                 --trace-gap R and --trace-floor F provide a per-sample adaptive alternative to\n\
-                 a fixed abundance floor: calls are sorted by abundance and cut at the largest\n\
-                 ratio between consecutive abundances, but only if that ratio exceeds R; anything\n\
-                 below F is then dropped. On multiplexed mocks this removes cross-library trace\n\
-                 (which is separated from true members by >10x) without deleting the rare tail of\n\
-                 a staggered community (whose members are separated by their design ratio only).\n\
-                 --fixed-gate restores the pre-0.2 fixed singleton filter (count>=2) AND the\n\
-                 unscaled species floor. The two can be reverted independently with\n\
-                 --no-adaptive-singleton / --no-adaptive-floor: on a large panel the floor\n\
-                 relaxation costs specificity (an ABSENT species has the lowest estimated depth,\n\
-                 so it receives the largest relaxation), while the singleton admission is what\n\
-                 buys low-depth sensitivity. Calibrate the pair on your own panel."
-            );
-            return ExitCode::from(2);
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            let code = if e.use_stderr() { 2 } else { 0 };
+            e.print().expect("failed to print clap error");
+            return ExitCode::from(code);
         }
+    };
+
+    let result = match cli.command {
+        Commands::Build(args) => commands::build::run(&args),
+        Commands::Cluster(args) => commands::cluster::run(&args),
+        Commands::DiagnoseTree(args) => commands::diagnose_tree::run(&args),
+        Commands::Profile(args) => commands::profile::run(&args),
+        Commands::MultiProfile(args) => commands::multi_profile::run(&args),
+        Commands::Batch(args) => commands::batch::run(&args),
+        Commands::Info(args) => commands::info::run(&args),
+        Commands::Evaluate(args) => commands::evaluate::run(&args),
+        Commands::Demo => commands::demo::run(),
+        Commands::CstDemo => commands::cst_demo::run(),
     };
 
     match result {
@@ -149,74 +52,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// Collect `--key value` pairs (and bare `--flag`).
-fn parse_opts(args: &[String]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let mut i = 1;
-    while i < args.len() {
-        if let Some(key) = args[i].strip_prefix("--") {
-            let val = args.get(i + 1).filter(|v| !v.starts_with("--"));
-            match val {
-                Some(v) => {
-                    map.insert(key.to_string(), v.clone());
-                    i += 2;
-                }
-                None => {
-                    map.insert(key.to_string(), "true".into());
-                    i += 1;
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
-    map
-}
-
-fn req<'a>(opts: &'a HashMap<String, String>, key: &str) -> Result<&'a String, String> {
-    opts.get(key).ok_or_else(|| format!("missing --{key}"))
-}
-
-/// What the sequence reader can parse, and why an unrecognized name has to be a hard error
-/// rather than a best-effort guess. Shared by `--reads` and by the `batch` manifest.
-///
-/// [`markers::for_each_sequence`] picks FASTA vs FASTQ from the extension alone, with FASTA as
-/// the fallback, and read paths used to be handed to it unchecked. A FASTQ under any other
-/// name — `reads.txt`, a renamed file, `sample.fastq.bz2` (only `.gz` is stripped) — therefore
-/// parsed as FASTA, and since a FASTQ contains no `>` line the reader accumulated the *entire
-/// file* as one contig. That silently defeats the streaming design (peak memory is meant to be
-/// one batch, which is what makes 20 GB samples run in bounded RAM) and splices reads together
-/// across their header lines. No error was reported at any point.
-const FASTX_HINT: &str = "expected .fa/.fasta/.fna/.fq/.fastq, optionally .gz. The reader \
-     selects FASTA or FASTQ by extension, so a misnamed file would be parsed as the wrong \
-     format with no error at all";
-
-/// Resolve `--reads` and reject anything the sequence reader cannot parse ([`FASTX_HINT`]).
-fn reads_path(opts: &HashMap<String, String>) -> Result<PathBuf, String> {
-    let path = PathBuf::from(req(opts, "reads")?);
-    if !is_fastx_path(&path) {
-        return Err(format!(
-            "--reads {}: unrecognized sequence format — {FASTX_HINT}.",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
-fn enzyme_set(opts: &HashMap<String, String>) -> Result<Vec<&'static Enzyme>, String> {
-    let spec = req(opts, "enzyme")?;
-    parse_enzyme_set(spec).ok_or_else(|| format!("unknown enzyme set: {spec}"))
-}
-
-fn enzyme_names(set: &[&Enzyme]) -> Vec<String> {
-    set.iter().map(|e| e.name.to_string()).collect()
-}
-
 /// Where markers come from: enzyme-digested 2bRAD tags (default), or sketched raw k-mers.
-/// Both sides of a run (genome DB and sample reads) must use the same source and parameters;
-/// the DB header records which one it was built with, and `profile` enforces the match.
 #[derive(Debug)]
-enum MarkerSource {
+pub(crate) enum MarkerSource {
     Enzyme(Vec<&'static Enzyme>),
     Kmer { k: usize, scale: u64 },
 }
@@ -232,8 +70,8 @@ impl MarkerSource {
         }
     }
 
-    /// Digest a sample's reads into marker counts (streamed, parallel batches).
-    fn sample_counts(&self, reads: &Path) -> Result<MarkerCounts, String> {
+    /// Digest a sample's reads into marker counts.
+    pub(crate) fn sample_counts(&self, reads: &Path) -> Result<MarkerCounts, String> {
         match self {
             MarkerSource::Enzyme(set) => sample_marker_counts_stream(reads, set),
             MarkerSource::Kmer { k, scale } => {
@@ -244,8 +82,11 @@ impl MarkerSource {
     }
 
     /// Digest a possibly paired-end sample: R1 and R2 counted separately and summed.
-    /// Counting is per-read additive, so this is exactly what digesting `cat R1 R2` yields.
-    fn sample_counts_paired(&self, r1: &Path, r2: Option<&Path>) -> Result<MarkerCounts, String> {
+    pub(crate) fn sample_counts_paired(
+        &self,
+        r1: &Path,
+        r2: Option<&Path>,
+    ) -> Result<MarkerCounts, String> {
         let mut counts = self.sample_counts(r1)?;
         if let Some(r2) = r2 {
             for (m, c) in self.sample_counts(r2)? {
@@ -263,8 +104,8 @@ impl MarkerSource {
         }
     }
 
-    /// Human-readable form for progress lines ("enzymes: BcgI" / "k-mer sketch: k=31, scale=100").
-    fn describe(&self) -> String {
+    /// Human-readable form for progress lines.
+    pub(crate) fn describe(&self) -> String {
         match self {
             MarkerSource::Enzyme(set) => format!("enzymes: {}", enzyme_names(set).join("+")),
             MarkerSource::Kmer { k, scale } => format!("k-mer sketch: k={k}, scale={scale}"),
@@ -280,20 +121,21 @@ impl MarkerSource {
     }
 }
 
+fn enzyme_set(spec: &str) -> Result<Vec<&'static Enzyme>, String> {
+    parse_enzyme_set(spec).ok_or_else(|| format!("unknown enzyme set: {spec}"))
+}
+
+fn enzyme_names(set: &[&Enzyme]) -> Vec<String> {
+    set.iter().map(|e| e.name.to_string()).collect()
+}
+
 /// Parse `--kmer-size` (default 31) and `--sketch-scale` (default 100).
-fn kmer_params(opts: &HashMap<String, String>) -> Result<(usize, u64), String> {
-    let k: usize = match opts.get("kmer-size") {
-        Some(s) => s
-            .parse()
-            .map_err(|_| "bad --kmer-size (want integer >= 1)")?,
-        None => 31,
-    };
-    let scale: u64 = match opts.get("sketch-scale") {
-        Some(s) => s
-            .parse()
-            .map_err(|_| "bad --sketch-scale (want integer >= 1)")?,
-        None => 100,
-    };
+pub(crate) fn kmer_params(
+    kmer_size: Option<usize>,
+    sketch_scale: Option<u64>,
+) -> Result<(usize, u64), String> {
+    let k = kmer_size.unwrap_or(31);
+    let scale = sketch_scale.unwrap_or(100);
     if k == 0 {
         return Err("bad --kmer-size (want integer >= 1)".into());
     }
@@ -304,51 +146,62 @@ fn kmer_params(opts: &HashMap<String, String>) -> Result<(usize, u64), String> {
 }
 
 /// Marker source for the genome-side commands (`build`/`cluster`/`diagnose-tree`).
-/// Enzyme mode (default) is unchanged: `--enzyme` is required. In kmer mode it is not, and
-/// passing it anyway is a warning, not an error.
-fn marker_source_for_build(opts: &HashMap<String, String>) -> Result<MarkerSource, String> {
-    match opts.get("marker-source").map(String::as_str) {
-        None | Some("enzyme") => Ok(MarkerSource::Enzyme(enzyme_set(opts)?)),
-        Some("kmer") => {
-            let (k, scale) = kmer_params(opts)?;
-            if let Some(e) = opts.get("enzyme") {
+pub(crate) fn marker_source_for_build(
+    marker_source: &str,
+    enzyme: Option<&str>,
+    kmer_size: usize,
+    sketch_scale: u64,
+) -> Result<MarkerSource, String> {
+    match marker_source {
+        "enzyme" => {
+            let Some(spec) = enzyme else {
+                return Err("missing --enzyme".into());
+            };
+            Ok(MarkerSource::Enzyme(enzyme_set(spec)?))
+        }
+        "kmer" => {
+            if let Some(e) = enzyme {
                 eprintln!("warning: --enzyme {e} is ignored with --marker-source kmer");
             }
-            Ok(MarkerSource::Kmer { k, scale })
+            Ok(MarkerSource::Kmer {
+                k: kmer_size,
+                scale: sketch_scale,
+            })
         }
-        Some(x) => Err(format!("bad --marker-source {x} (want enzyme|kmer)")),
+        x => Err(format!("bad --marker-source {x} (want enzyme|kmer)")),
     }
 }
 
-/// Marker source for the sample side (`profile`): auto-detected from the DB header. A k-mer
-/// DB records `kmer<K>s<S>` in the enzyme position and forces k-mer digestion with those
-/// exact parameters (`--kmer-size`/`--sketch-scale` act as an override-check and error on
-/// mismatch); an enzyme DB forces enzyme digestion. Crossing the two is a hard error — the
-/// marker spaces are disjoint, so a mismatch would report silent garbage otherwise.
-fn resolve_sample_source(
+/// Marker source for the sample side (`profile`): auto-detected from the DB header.
+pub(crate) fn resolve_sample_source(
     db: &StrainDb,
-    opts: &HashMap<String, String>,
+    marker_source_arg: Option<&str>,
+    enzyme_arg: Option<&str>,
+    kmer_size_arg: Option<usize>,
+    sketch_scale_arg: Option<u64>,
 ) -> Result<MarkerSource, String> {
     let db_kmer = if db.enzymes.len() == 1 {
         parse_kmer_db_token(&db.enzymes[0])
     } else {
         None
     };
-    let want = opts.get("marker-source").map(String::as_str);
-    match (db_kmer, want) {
+    match (db_kmer, marker_source_arg) {
         (Some((k, scale)), None | Some("kmer")) => {
-            let (want_k, want_scale) = kmer_params(opts)?;
-            if opts.contains_key("kmer-size") && want_k != k {
-                return Err(format!(
-                    "--kmer-size {want_k} does not match the database (built with k={k})"
-                ));
+            if let Some(want_k) = kmer_size_arg {
+                if want_k != k {
+                    return Err(format!(
+                        "--kmer-size {want_k} does not match the database (built with k={k})"
+                    ));
+                }
             }
-            if opts.contains_key("sketch-scale") && want_scale != scale {
-                return Err(format!(
-                    "--sketch-scale {want_scale} does not match the database (built with scale={scale})"
-                ));
+            if let Some(want_scale) = sketch_scale_arg {
+                if want_scale != scale {
+                    return Err(format!(
+                        "--sketch-scale {want_scale} does not match the database (built with scale={scale})"
+                    ));
+                }
             }
-            if let Some(e) = opts.get("enzyme") {
+            if let Some(e) = enzyme_arg {
                 eprintln!("warning: --enzyme {e} is ignored: the DB is a k-mer sketch (k={k}, scale={scale})");
             }
             Ok(MarkerSource::Kmer { k, scale })
@@ -364,16 +217,13 @@ fn resolve_sample_source(
             db.enzymes.join("+")
         )),
         (None, None | Some("enzyme")) => {
-            if opts.contains_key("kmer-size") || opts.contains_key("sketch-scale") {
-                eprintln!(
-                    "warning: --kmer-size/--sketch-scale are ignored for an enzyme-tag database"
-                );
-            }
-            // Enzyme set: prefer the DB's recorded set (guarantees a match); else require --enzyme.
             let set: Vec<&Enzyme> = if !db.enzymes.is_empty() {
                 parse_enzyme_set(&db.enzymes.join(",")).ok_or("DB records an unknown enzyme")?
             } else {
-                enzyme_set(opts)?
+                let Some(spec) = enzyme_arg else {
+                    return Err("missing --enzyme".into());
+                };
+                enzyme_set(spec)?
             };
             Ok(MarkerSource::Enzyme(set))
         }
@@ -381,15 +231,14 @@ fn resolve_sample_source(
     }
 }
 
-/// Digest every FASTA genome in `dir` → `GenomeRec` (name, contig count, single-copy tag
-/// markers), in parallel across genomes (the dominant build cost).
-fn digest_genome_dir(dir: &Path, source: &MarkerSource) -> Result<Vec<GenomeRec>, String> {
+/// Digest every FASTA genome in `dir` → `GenomeRec`, in parallel across genomes.
+pub(crate) fn digest_genome_dir(
+    dir: &Path,
+    source: &MarkerSource,
+) -> Result<Vec<GenomeRec>, String> {
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        // `.fna.gz` included: RefSeq/ENA assemblies ship gzipped, and decompressing a whole
-        // reference panel just to build a DB is pure friction. FASTA only — a stray read file
-        // in this directory must not be digested as though it were a reference genome.
         if path.is_file() && is_fasta_path(&path) {
             paths.push(path);
         }
@@ -397,10 +246,8 @@ fn digest_genome_dir(dir: &Path, source: &MarkerSource) -> Result<Vec<GenomeRec>
     if paths.is_empty() {
         return Err("no FASTA genomes (.fa/.fasta/.fna, optionally .gz) found".into());
     }
-    paths.sort(); // deterministic genome order regardless of threading
+    paths.sort();
     let results: Vec<Result<GenomeRec, String>> = par_map(&paths, |path| {
-        // `fastx_stem`, not `file_stem`: the latter leaves `X.fna.gz` named `X.fna`, so the same
-        // genome would get a different identifier depending only on whether it was compressed.
         let name = fastx_stem(path);
         let seqs = read_fastx(path).map_err(|e| e.to_string())?;
         let n_contigs = seqs.len();
@@ -417,18 +264,10 @@ fn digest_genome_dir(dir: &Path, source: &MarkerSource) -> Result<Vec<GenomeRec>
 }
 
 /// Parse `--max-contigs` / `--min-tag-fraction` into a `QualityFilter`.
-fn parse_quality_filter(opts: &HashMap<String, String>) -> Result<QualityFilter, String> {
-    let max_contigs = match opts.get("max-contigs") {
-        Some(s) => Some(s.parse().map_err(|_| "bad --max-contigs (want integer)")?),
-        None => None,
-    };
-    let min_tag_fraction = match opts.get("min-tag-fraction") {
-        Some(s) => Some(
-            s.parse()
-                .map_err(|_| "bad --min-tag-fraction (want 0..1)")?,
-        ),
-        None => None,
-    };
+pub(crate) fn parse_quality_filter(
+    max_contigs: Option<usize>,
+    min_tag_fraction: Option<f64>,
+) -> Result<QualityFilter, String> {
     Ok(QualityFilter {
         max_contigs,
         min_tag_fraction,
@@ -436,16 +275,15 @@ fn parse_quality_filter(opts: &HashMap<String, String>) -> Result<QualityFilter,
     })
 }
 
-/// Digest a genome dir, apply the assembly-quality filter, print the report, and return the
-/// kept `(name, markers)`. Variable assembly completeness biases Jaccard clustering toward
-/// spurious splits; flagging is always on, dropping happens only when a threshold is set.
-fn digest_and_filter(
+/// Digest a genome dir, apply the assembly-quality filter, print the report, and return the kept recs.
+pub(crate) fn digest_and_filter(
     dir: &Path,
     source: &MarkerSource,
-    opts: &HashMap<String, String>,
+    max_contigs: Option<usize>,
+    min_tag_fraction: Option<f64>,
 ) -> Result<Vec<GenomeRec>, String> {
     let genomes = digest_genome_dir(dir, source)?;
-    let filt = parse_quality_filter(opts)?;
+    let filt = parse_quality_filter(max_contigs, min_tag_fraction)?;
     let rep = quality::apply(genomes, &filt);
     println!(
         "quality: {} genomes, median single-copy {} = {}",
@@ -469,1441 +307,7 @@ fn digest_and_filter(
     Ok(rep.kept)
 }
 
-fn cmd_build(opts: &HashMap<String, String>) -> Result<(), String> {
-    let source = marker_source_for_build(opts)?;
-    let genomes = PathBuf::from(req(opts, "genomes")?);
-    let out = PathBuf::from(req(opts, "out")?);
-
-    let recs = digest_and_filter(&genomes, &source, opts)?;
-    for r in &recs {
-        let what = match source {
-            MarkerSource::Enzyme(_) => "tag markers",
-            MarkerSource::Kmer { .. } => "k-mer markers",
-        };
-        println!("  {}: {} single-copy {}", r.name, r.markers.len(), what);
-    }
-    let mut db = StrainDb::build(recs.into_iter().map(|r| (r.name, r.markers)).collect());
-    db.enzymes = source.db_token();
-    db.save(&out).map_err(|e| e.to_string())?;
-    print_stats(&db);
-    println!("saved DB ({}) -> {}", db.enzymes.join("+"), out.display());
-    Ok(())
-}
-
-/// Build a within-species Cluster Search Tree DB from genomes (StrainScan Layer-1/2 step).
-fn cmd_cluster(opts: &HashMap<String, String>) -> Result<(), String> {
-    let source = marker_source_for_build(opts)?;
-    let genomes = PathBuf::from(req(opts, "genomes")?);
-    let out = PathBuf::from(req(opts, "out")?);
-    let similarity = opts
-        .get("similarity")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SIMILARITY);
-
-    let containment = opts.contains_key("containment");
-    let recs = digest_and_filter(&genomes, &source, opts)?;
-    let n_genomes = recs.len();
-    let cst = SpeciesCst::build(
-        recs.into_iter()
-            .map(|r| (r.name, r.markers, r.full_markers))
-            .collect(),
-        similarity,
-        containment,
-    );
-    let dist = if containment {
-        "max-containment"
-    } else {
-        "Jaccard"
-    };
-    let method = if n_genomes > MINHASH_ABOVE {
-        "MinHash"
-    } else {
-        "exact"
-    };
-    println!(
-        "clustered {} genomes into {} cluster(s) @ similarity {similarity} ({}, threads: {}, clustering: {}-{})",
-        cst.genome_names.len(),
-        cst.n_clusters(),
-        source.describe(),
-        num_threads(),
-        method,
-        dist
-    );
-    for (cid, members) in cst.clusters.iter().enumerate() {
-        let names: Vec<&str> = members
-            .iter()
-            .map(|&g| cst.genome_names[g].as_str())
-            .collect();
-        println!("  C{cid}: {}", names.join(", "));
-    }
-    let s = cst.marker_class_summary();
-    println!(
-        "  marker classes: species_core={}  shared_partial={}  cluster_specific={}  strain_specific={}",
-        s.get("species_core").unwrap_or(&0),
-        s.get("shared_partial").unwrap_or(&0),
-        s.get("cluster_specific").unwrap_or(&0),
-        s.get("strain_specific").unwrap_or(&0),
-    );
-
-    // Resolvability check: a cluster needs enough cluster-specific markers to be detectable.
-    let mut db = cst.cluster_db();
-    db.enzymes = source.db_token();
-    // Persist the Cluster Search Tree so `profile --layer1 cst` can descend it. The internal
-    // nodes' marker sets cannot be recovered from the cluster rows alone.
-    db.tree = Some(cst.build_tree());
-    let min_markers = Params::default().min_support_markers;
-    let mut resolvable = 0usize;
-    let with_what = match &source {
-        MarkerSource::Enzyme(_) => "with this enzyme set".to_string(),
-        MarkerSource::Kmer { k, scale } => format!("with this k-mer sketch (k={k}, scale={scale})"),
-    };
-    for cid in 0..db.n_strains() {
-        let n_spec = db.unique_marker_count(cid);
-        if n_spec >= min_markers {
-            resolvable += 1;
-        } else {
-            println!(
-                "  ⚠ C{cid} has only {n_spec} cluster-specific markers (< {min_markers}); \
-                 not reliably resolvable {with_what}."
-            );
-        }
-    }
-    if resolvable == 0 {
-        match &source {
-            MarkerSource::Enzyme(set) => println!(
-                "  ✗ NOT DOABLE at strain/cluster level for this species with enzyme(s) {}. \
-                 The species can still be detected (Layer-1); for finer resolution use more \
-                 enzymes (--enzyme all) on a conventional metagenome.",
-                enzyme_names(set).join("+")
-            ),
-            MarkerSource::Kmer { .. } => println!(
-                "  ✗ NOT DOABLE at strain/cluster level for this species {with_what}. \
-                 The species can still be detected (Layer-1); for finer resolution use a \
-                 smaller k or a denser sketch (lower --sketch-scale)."
-            ),
-        }
-    }
-
-    // Write membership sidecar (genome -> cluster) for benchmark truth remapping.
-    let members_path = out.with_extension("members.tsv");
-    {
-        use std::io::Write;
-        let mut w = std::fs::File::create(&members_path).map_err(|e| e.to_string())?;
-        writeln!(w, "#genome\tcluster").map_err(|e| e.to_string())?;
-        for (cid, members) in cst.clusters.iter().enumerate() {
-            for &g in members {
-                writeln!(w, "{}\tC{cid}", cst.genome_names[g]).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-
-    db.save(&out).map_err(|e| e.to_string())?;
-    println!(
-        "saved cluster DB -> {} ({} clusters, {} resolvable); membership -> {}",
-        out.display(),
-        db.n_strains(),
-        resolvable,
-        members_path.display()
-    );
-    Ok(())
-}
-
-/// Measure whether a hierarchical Cluster Search Tree could carry signal on this panel.
-///
-/// StrainScan stores, at every internal node, the markers core to that subtree and found nowhere
-/// else, and descends the tree by testing those sets. It uses full k-mer sets, where such a node
-/// holds tens of thousands of k-mers; 2bRAD tags are ~76-116x sparser, so the same nodes might be
-/// empty and the descent would degenerate into enumerating every leaf. Rather than argue from the
-/// mechanism, measure it: run this on a real panel before committing to the port.
-fn cmd_diagnose_tree(opts: &HashMap<String, String>) -> Result<(), String> {
-    let source = marker_source_for_build(opts)?;
-    let genomes = PathBuf::from(req(opts, "genomes")?);
-    let similarity = opts
-        .get("similarity")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SIMILARITY);
-
-    let recs = digest_and_filter(&genomes, &source, opts)?;
-    let n = recs.len();
-    if n < 2 {
-        return Err("need at least 2 genomes to form a hierarchy".into());
-    }
-    let cst = SpeciesCst::build(
-        recs.into_iter()
-            .map(|r| (r.name, r.markers, r.full_markers))
-            .collect(),
-        similarity,
-        opts.contains_key("containment"),
-    );
-    println!(
-        "panel: {} genomes -> {} clusters @ similarity {similarity} ({})",
-        n,
-        cst.n_clusters(),
-        source.describe()
-    );
-
-    let stats = cst.hierarchy_stats();
-    println!("\n#node\tmembers\tmerge_similarity\tcore\tgroup_specific");
-    for s in &stats {
-        println!(
-            "N{}\t{}\t{:.4}\t{}\t{}",
-            s.node_id, s.n_members, s.merge_similarity, s.core, s.group_specific
-        );
-    }
-
-    // Second measurement, and the one that decides whether the tree has anything to DO.
-    //
-    // A tree can only rescue a cluster whose own unique markers fall below the support floor —
-    // that is the single case where pooling an ancestor's markers changes the outcome. Node sets
-    // being non-empty (above) is necessary but not sufficient: if every cluster already clears
-    // the floor on its own markers, the descent will reach the same leaves the flat path does and
-    // the whole port is inert on this panel.
-    //
-    // There is a structural reason to expect exactly that. Clustering at similarity tau
-    // guarantees every surviving cluster differs from its nearest neighbour by more than
-    // (1-tau) of the marker union — at 0.95 and ~11 000 markers that is ~550 markers, two orders
-    // of magnitude above a floor of 10. Genomes similar enough to have few unique markers are
-    // merged into one cluster before they can become separate leaves.
-    let cdb = cst.cluster_db();
-    let floor = Params::default().min_support_markers;
-    let mut uniq_counts: Vec<usize> = (0..cdb.n_strains())
-        .map(|j| cdb.unique_marker_count(j))
-        .collect();
-    uniq_counts.sort_unstable();
-    let below = uniq_counts.iter().filter(|&&u| u < floor).count();
-    println!("\n#cluster_unique_markers");
-    println!(
-        "min={} median={} max={}   below the support floor of {}: {}/{}",
-        uniq_counts.first().copied().unwrap_or(0),
-        uniq_counts.get(uniq_counts.len() / 2).copied().unwrap_or(0),
-        uniq_counts.last().copied().unwrap_or(0),
-        floor,
-        below,
-        uniq_counts.len()
-    );
-    if below == 0 {
-        println!("  -> every cluster already clears the floor on its own markers, so tree pooling");
-        println!("     has nothing to rescue here and --layer1 cst will reach the same leaves.");
-    } else {
-        println!(
-            "  -> {below} cluster(s) are invisible to the flat path and only reachable by pooling."
-        );
-    }
-
-    // Verdict. The interesting nodes are the ones the tree would actually have to resolve —
-    // those whose children merged BELOW the clustering threshold, i.e. genuinely distinct
-    // clusters. Nodes above it would already have been collapsed into one leaf.
-    let mut resolving: Vec<usize> = stats
-        .iter()
-        .filter(|s| s.merge_similarity < similarity)
-        .map(|s| s.group_specific)
-        .collect();
-    resolving.sort_unstable();
-    println!("\n--- verdict ---");
-    if resolving.is_empty() {
-        println!("no internal node merges below the clustering threshold: the panel is a single cluster,");
-        println!("so a tree has nothing to resolve here. Try a more diverse panel.");
-        return Ok(());
-    }
-    let med = resolving[resolving.len() / 2];
-    let min = resolving[0];
-    println!(
-        "{} internal node(s) below the clustering threshold; group-specific markers: min={} median={} max={}",
-        resolving.len(),
-        min,
-        med,
-        resolving[resolving.len() - 1]
-    );
-    // StrainScan's default minimum is 1000 k-mers per node, but it stores both strands as
-    // separate ids, so that is 500 canonical k-mers; rescaled by ~76-116x sparsity the 2bRAD
-    // equivalent is single digits. 25 is a stricter, statistically motivated floor: it is the
-    // smallest panel at which a coverage fraction can distinguish 0.1 from 0.3.
-    const MINK: usize = 25;
-    if med >= 4 * MINK {
-        println!(
-            "VERDICT: tree is viable here (median {med} >= {}). Node sets carry real signal.",
-            4 * MINK
-        );
-    } else if med >= MINK {
-        println!(
-            "VERDICT: marginal (median {med} in [{MINK}, {})). Viable but with little headroom.",
-            4 * MINK
-        );
-    } else {
-        println!("VERDICT: NOT viable (median {med} < {MINK}). Internal nodes are too sparse to");
-        println!("descend on; invest in the shared-marker regression instead of the tree.");
-    }
-    Ok(())
-}
-
-fn cmd_evaluate(opts: &HashMap<String, String>) -> Result<(), String> {
-    let pred_text = std::fs::read_to_string(req(opts, "pred")?).map_err(|e| e.to_string())?;
-    let truth_text = std::fs::read_to_string(req(opts, "truth")?).map_err(|e| e.to_string())?;
-    let present = opts
-        .get("present")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.01);
-    let pred = parse_abundance_tsv(&pred_text);
-    let truth = parse_abundance_tsv(&truth_text);
-    let m = evaluate(&pred, &truth, present);
-    println!(
-        "TP={} FP={} FN={}  precision={:.3} recall={:.3} F1={:.3}  L1={:.3} Bray-Curtis={:.3}",
-        m.tp, m.fp, m.fn_, m.precision, m.recall, m.f1, m.l1, m.bray_curtis
-    );
-    Ok(())
-}
-
-/// Parse the Layer-2 tuning flags shared by `profile` and `multi-profile`.
-fn parse_params(opts: &HashMap<String, String>) -> Result<Params, String> {
-    let mut p = Params::default();
-    if let Some(v) = opts.get("min-support") {
-        p.min_support_markers = v.parse().map_err(|_| "bad --min-support")?;
-    }
-    if let Some(v) = opts.get("min-coverage") {
-        p.min_coverage = v.parse().map_err(|_| "bad --min-coverage (want 0..1)")?;
-    }
-    if let Some(v) = opts.get("min-abundance") {
-        p.min_rel_abundance = v.parse().map_err(|_| "bad --min-abundance (want 0..1)")?;
-    }
-    if let Some(v) = opts.get("trace-gap") {
-        p.trace_gap = v.parse().map_err(|_| "bad --trace-gap (want ratio >= 1)")?;
-    }
-    if let Some(v) = opts.get("trace-floor") {
-        p.trace_floor = v.parse().map_err(|_| "bad --trace-floor (want 0..1)")?;
-    }
-    // `--fixed-gate` turns both adaptations off (backwards compatible); the two halves can
-    // also be controlled independently, which is what calibrating a large panel needs.
-    match opts.get("layer1").map(String::as_str) {
-        None | Some("auto") => {}
-        Some("unique") => p.layer1 = Layer1::Unique,
-        Some("cst") => p.layer1 = Layer1::Cst,
-        Some(x) => return Err(format!("bad --layer1 {x} (want auto|unique|cst)")),
-    }
-    match opts.get("layer2").map(String::as_str) {
-        None | Some("depth") => {}
-        Some("enet") => p.layer2 = Layer2::Enet,
-        Some(x) => return Err(format!("bad --layer2 {x} (want depth|enet)")),
-    }
-    if let Some(v) = opts.get("enet-alpha") {
-        p.enet_alpha = v.parse().map_err(|_| "bad --enet-alpha")?;
-    }
-    if let Some(v) = opts.get("min-consistency") {
-        p.min_consistency = v.parse().map_err(|_| "bad --min-consistency (want 0..1)")?;
-    }
-    if opts.contains_key("fixed-gate") {
-        p.adaptive_singleton = false;
-        p.adaptive_floor = false;
-    }
-    if opts.contains_key("no-adaptive-singleton") {
-        p.adaptive_singleton = false;
-    }
-    if opts.contains_key("no-adaptive-floor") {
-        p.adaptive_floor = false;
-    }
-    Ok(p)
-}
-
-fn cmd_profile(opts: &HashMap<String, String>) -> Result<(), String> {
-    let db = StrainDb::load(Path::new(req(opts, "db")?)).map_err(|e| e.to_string())?;
-
-    // Marker source: auto-detected from the DB header (a `kmer<K>s<S>` token selects the
-    // k-mer path with the DB's own parameters); crossing enzyme reads with a k-mer DB or
-    // vice versa is a hard error.
-    let source = resolve_sample_source(&db, opts)?;
-
-    let reads = reads_path(opts)?;
-    let counts = source.sample_counts(&reads)?;
-    println!(
-        "sample: {} distinct {} ({}, threads: {})",
-        counts.len(),
-        match source {
-            MarkerSource::Enzyme(_) => "tag markers",
-            MarkerSource::Kmer { .. } => "k-mer markers",
-        },
-        source.describe(),
-        num_threads()
-    );
-
-    let params = parse_params(opts)?;
-    // Never choose a path silently: a run that auto-enabled the tree and one that did not are
-    // different algorithms, and the output has to say which was used.
-    let chosen = resolve_layer1(&db, &params);
-    if params.layer1 == Layer1::Auto {
-        match tree_utility(&db, params.min_support_markers) {
-            Some(u) => println!(
-                "layer1: {} (auto — {} cluster(s) below the support floor, {} informative internal node(s), {} fallback node(s))",
-                if chosen == Layer1::Cst { "cst" } else { "unique" },
-                u.rescuable,
-                u.informative_nodes,
-                u.fallback_nodes
-            ),
-            None => println!("layer1: unique (auto — this DB carries no tree)"),
-        }
-    }
-    let calls = profile(&db, &counts, &params);
-
-    if calls.is_empty() {
-        match source {
-            MarkerSource::Enzyme(_) => println!(
-                "  (no strain/cluster resolved — insufficient strain-specific 2b tags for this \
-                 enzyme set; the species may still be present at Layer-1)"
-            ),
-            MarkerSource::Kmer { .. } => println!(
-                "  (no strain/cluster resolved — insufficient strain-specific k-mer markers for \
-                 this sketch; the species may still be present at Layer-1)"
-            ),
-        }
-    } else {
-        report(&calls);
-    }
-
-    if let Some(out) = opts.get("out") {
-        write_pred_tsv(Path::new(out), &calls).map_err(|e| e.to_string())?;
-        println!("predictions -> {out}");
-    }
-    Ok(())
-}
-
-/// Layer-1 outcome for one species in a multi-species sample.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SpeciesTier {
-    /// Enough species-specific marker evidence to attempt within-species strain resolution.
-    Resolved,
-    /// Present, but below the evidence needed to resolve strains at this depth.
-    DetectedNotResolved,
-    /// Not enough evidence to call the species present.
-    Absent,
-}
-
-/// Classify a species from ABSOLUTE species-specific marker evidence (never relative abundance).
-///
-/// `present` = its species-specific markers observed in the sample; `total` = its
-/// species-specific markers that exist in the DB; `detect`/`floor` are absolute thresholds and
-/// `frac` is the breadth fraction.
-///
-/// `reachable` is the fraction of the panel that *can* be observed at this species' estimated
-/// depth (`1 − e^(−λ)`), and both gates are scaled by it. Without that scaling the fixed floor
-/// of 200 markers is unreachable by construction in low-input or high-host samples: at 0.05×
-/// depth only ~5% of any panel is visible, so a genuinely present species is filed as absent no
-/// matter how clean the data is. The gate never falls below `detect`, which keeps random
-/// sequencing errors — which produce scattered tags, not repeated hits on one species' panel —
-/// from manufacturing calls. Pure + tested.
-/// The adaptive relaxation is bounded: the floor is never scaled below this fraction of its
-/// configured value.
-///
-/// Without a bound the scaling cancels out and stops being a gate at all. The observed count is
-/// itself proportional to the reachable fraction (`present ≈ total·r` under Poisson sampling),
-/// so testing `present ≥ floor·r` reduces to `total ≥ floor` — true for every species with a
-/// panel above the floor, at every depth, leaving `detect` (10 markers) as the only real
-/// threshold. Clamping the relaxation keeps a genuine floor at low depth while still recovering
-/// species that an unscaled 200-marker bar makes unreachable by construction.
-const MIN_FLOOR_FRACTION: f64 = 0.25;
-
-fn species_tier(
-    present: usize,
-    total: usize,
-    detect: usize,
-    floor: usize,
-    frac: f64,
-    reachable: f64,
-) -> SpeciesTier {
-    let r = reachable.clamp(0.0, 1.0).max(MIN_FLOOR_FRACTION);
-    let frac_gate = (frac.max(0.0) * total as f64 * r).ceil() as usize;
-    let scaled_floor = (floor as f64 * r).ceil() as usize;
-    let resolve_gate = scaled_floor.max(frac_gate).max(detect).max(1);
-    let detect_gate = detect.min(resolve_gate);
-    if present >= resolve_gate {
-        SpeciesTier::Resolved
-    } else if present >= detect_gate {
-        SpeciesTier::DetectedNotResolved
-    } else {
-        SpeciesTier::Absent
-    }
-}
-
-/// Per-species Layer-1 result carried out of the parallel map.
-struct SpeciesResult {
-    species: String,
-    present_specific: usize,
-    total_specific: usize,
-    /// Estimated per-tag depth over this species' species-specific markers (zero-inclusive).
-    lambda: f64,
-    tier: SpeciesTier,
-    /// Which Layer-1 ran for this species, and what the database said. `multi-profile` makes
-    /// this decision per species, so a single global line cannot report it — without this the
-    /// only way to tell which species `auto` sent down the tree was to diff whole runs.
-    layer1: Layer1,
-    tree: Option<strain2bscan::identify::TreeUtility>,
-    calls: Vec<StrainCall>,
-}
-
-/// Collect and load every per-species DB in `--dbs <dir>`. An unreadable directory entry (e.g.
-/// a broken symlink on HPC) or an unloadable DB is a HARD error: the old `e.ok()` /
-/// `unwrap_or_default()` fallbacks silently dropped the species from the panel — reporting it
-/// as "not present" and bypassing the format validation in `StrainDb::load`.
-fn load_species_dbs(dbs_dir: &Path) -> Result<Vec<(String, StrainDb)>, String> {
-    let mut db_paths: Vec<PathBuf> = std::fs::read_dir(dbs_dir)
-        .map_err(|e| format!("cannot list DB dir {}: {e}", dbs_dir.display()))?
-        .map(|e| {
-            e.map(|e| e.path()).map_err(|err| {
-                format!(
-                    "cannot read an entry of DB dir {}: {err}",
-                    dbs_dir.display()
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|p| {
-            p.extension().and_then(|x| x.to_str()) == Some("tsv")
-                && p.file_name()
-                    .and_then(|x| x.to_str())
-                    .is_some_and(|n| !n.contains(".members."))
-        })
-        .collect();
-    db_paths.sort();
-    if db_paths.is_empty() {
-        return Err("no *.tsv species DBs found in --dbs dir".into());
-    }
-    par_map(&db_paths, |path| {
-        let sp = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        StrainDb::load(path)
-            .map(|db| (sp, db))
-            .map_err(|e| format!("failed to load species DB {}: {e}", path.display()))
-    })
-    .into_iter()
-    .collect()
-}
-
-/// The three-tier species-gate thresholds (`--min-species-markers` /
-/// `--min-species-marker-frac` / `--min-species-detect`), parsed once per run so that every
-/// sample in a `batch` is gated identically.
-#[derive(Clone, Copy)]
-struct SpeciesGate {
-    min_markers: usize,
-    min_frac: f64,
-    min_detect: usize,
-}
-
-fn species_gate(opts: &HashMap<String, String>) -> SpeciesGate {
-    SpeciesGate {
-        min_markers: opts
-            .get("min-species-markers")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(200),
-        min_frac: opts
-            .get("min-species-marker-frac")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0),
-        min_detect: opts
-            .get("min-species-detect")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10),
-    }
-}
-
-/// A loaded multi-species panel: the per-species DBs (each already restricted to its
-/// panel-specific markers unless `--no-cross-species-filter`), the marker source their
-/// headers imply, and each species' panel-specific marker set. Loading a panel is the
-/// expensive part of multi-species profiling, so it happens ONCE per run — `batch` exists
-/// to profile many samples against one panel.
-struct Panel {
-    loaded: Vec<(String, StrainDb)>,
-    source: MarkerSource,
-    specific_sets: Vec<FxHashSet<Marker>>,
-}
-
-/// Collect + load the per-species DBs in `--dbs <dir>`, decide the sample marker source from
-/// their headers, and compute (and apply) the cross-species marker restriction.
-fn load_panel(opts: &HashMap<String, String>) -> Result<Panel, String> {
-    let dbs_dir = PathBuf::from(req(opts, "dbs")?);
-
-    // 1) collect + load per-species DBs (before digesting, so the DB headers decide which
-    //    marker source the sample needs)
-    let mut loaded = load_species_dbs(&dbs_dir)?;
-
-    // 2) The sample is digested ONCE for the whole panel, so every DB must live in the same
-    //    marker space. A k-mer DB records `kmer<K>s<S>` in its header; a panel mixing k-mer
-    //    and enzyme DBs (or k-mer DBs built with different K/S) cannot be profiled in one
-    //    pass — that is a hard error, not a silent empty result.
-    let kmer_of = |db: &StrainDb| {
-        if db.enzymes.len() == 1 {
-            parse_kmer_db_token(&db.enzymes[0])
-        } else {
-            None
-        }
-    };
-    let n_kmer = loaded
-        .iter()
-        .filter(|(_, db)| kmer_of(db).is_some())
-        .count();
-    let source: MarkerSource = if n_kmer == 0 {
-        if opts.get("marker-source").is_some_and(|m| m == "kmer") {
-            return Err(
-                "--marker-source kmer but every DB in --dbs is an enzyme-tag database; \
-                 the marker spaces are disjoint"
-                    .into(),
-            );
-        }
-        MarkerSource::Enzyme(enzyme_set(opts)?)
-    } else if n_kmer != loaded.len() {
-        return Err(format!(
-            "mixed panel: {} k-mer DB(s) and {} enzyme-tag DB(s) in --dbs; a sample can only \
-             be digested one way per run, so profile k-mer and enzyme panels separately",
-            n_kmer,
-            loaded.len() - n_kmer
-        ));
-    } else {
-        let (k, scale) = kmer_of(&loaded[0].1).unwrap();
-        if let Some((sp, _)) = loaded
-            .iter()
-            .find(|(_, db)| kmer_of(db) != Some((k, scale)))
-        {
-            return Err(format!(
-                "k-mer DBs in --dbs disagree on k/scale: '{sp}' was not built with \
-                 k={k}, scale={scale}; rebuild the panel with one parameter set"
-            ));
-        }
-        let (want_k, want_scale) = kmer_params(opts)?;
-        if opts.contains_key("kmer-size") && want_k != k {
-            return Err(format!(
-                "--kmer-size {want_k} does not match the panel (built with k={k})"
-            ));
-        }
-        if opts.contains_key("sketch-scale") && want_scale != scale {
-            return Err(format!(
-                "--sketch-scale {want_scale} does not match the panel (built with scale={scale})"
-            ));
-        }
-        if let Some(e) = opts.get("enzyme") {
-            eprintln!("warning: --enzyme {e} is ignored: the panel is a k-mer sketch (k={k}, scale={scale})");
-        }
-        MarkerSource::Kmer { k, scale }
-    };
-
-    // Layer-1 species gate (breadth-aware, three-tier). Strain markers are unique only
-    //    *within* a species, so an absent species can be spuriously hit by a present relative's
-    //    shared tags. We derive species-specific markers — tags carried by exactly ONE species
-    //    across the panel (Strain2bScan's own species layer, same tag space as Fast2bRAD-M) —
-    //    and decide per species from ABSOLUTE marker evidence, never relative abundance:
-    //      total_specific   = the species' species-specific markers that exist in the DB
-    //      present_specific = those observed in this sample (count >= 2)
-    //    resolve_gate = max(min_species_markers, ceil(frac * total_specific)); the fraction term
-    //    makes the bar comparable across species of very different panel sizes and maps to a
-    //    minimum marker-panel coverage. detect_gate = min(min_species_detect, resolve_gate).
-    //    Three outcomes: >= resolve_gate -> strain-resolved (Layer-2); >= detect_gate ->
-    //    detected-not-resolvable (species-level only); else absent. All inputs come from
-    //    Strain2bScan's own DBs + one digest of the raw reads — no external abundance needed.
-    //    Defaults tuned on a 40-species panel (precision ~0.94 @ recall 1.0); calibrate per
-    //    enzyme set and depth (the thresholds are parsed once per run in `species_gate`).
-    let mut species_degree: FxHashMap<Marker, u32> = FxHashMap::default();
-    for (_, db) in &loaded {
-        for &m in db.marker_degree.keys() {
-            *species_degree.entry(m).or_insert(0) += 1;
-        }
-    }
-
-    // Per species: the markers specific to it across the WHOLE panel (species degree == 1).
-    let specific_sets: Vec<FxHashSet<Marker>> = loaded
-        .iter()
-        .map(|(_, db)| {
-            db.marker_degree
-                .keys()
-                .copied()
-                .filter(|m| species_degree.get(m).copied() == Some(1))
-                .collect()
-        })
-        .collect();
-
-    // Restrict detection AND quantification to those markers.
-    //
-    // Cluster-uniqueness is only defined within one species DB, so a tag can be unique to a
-    // cluster here and still occur in a congener's genomes. When that congener is co-present —
-    // S. aureus/S. epidermidis, the three streptococci, the two lactobacilli in MSA-1002, and
-    // routinely in saliva — its reads land on that tag and inflate this cluster's depth. Using
-    // the cross-species evidence for the species gate but not for quantification leaves exactly
-    // that error in the abundances. `--no-cross-species-filter` disables this for comparison.
-    let cross_species_filter = !opts.contains_key("no-cross-species-filter");
-    if cross_species_filter {
-        let (mut before, mut after) = (0usize, 0usize);
-        for ((_, db), specific) in loaded.iter_mut().zip(&specific_sets) {
-            before += db.marker_degree.len();
-            db.restrict_to(specific);
-            after += specific.len();
-        }
-        println!(
-            "cross-species filter: {after}/{before} markers usable for quantification ({:.1}% shared with another species in the panel, excluded)",
-            if before > 0 {
-                100.0 * (before - after) as f64 / before as f64
-            } else {
-                0.0
-            }
-        );
-    }
-    let loaded = loaded;
-    Ok(Panel {
-        loaded,
-        source,
-        specific_sets,
-    })
-}
-
-/// One output row of a multi-species profile: one resolved cluster of one species, in the
-/// `--out` column order. Owned rather than borrowed so `batch` can hold every sample's rows
-/// at once; `batch` prepends its `sample` column when writing.
-struct ProfileRow {
-    species: String,
-    call: StrainCall,
-    global_abundance: f64,
-    sample_fraction: f64,
-}
-
-/// Everything one sample yields against the panel, before any reporting.
-struct SampleProfile {
-    per_species: Vec<SpeciesResult>,
-    /// Rows sorted by species, then by descending within-species abundance.
-    rows: Vec<ProfileRow>,
-    /// Total tag observations in the sample (the `sample_fraction` denominator).
-    total_tags: u64,
-}
-
-/// Gate + strain-profile every species of the panel against ONE sample's tag counts, then
-/// quantify (steps 4-5 of the multi-species pipeline). Shared by `multi-profile` (one
-/// sample, full stdout report) and `batch` (many samples, rows only).
-fn profile_sample(
-    panel: &Panel,
-    counts: &MarkerCounts,
-    gate: &SpeciesGate,
-    params: &Params,
-    opts: &HashMap<String, String>,
-) -> Result<SampleProfile, String> {
-    let loaded = &panel.loaded;
-    let specific_sets = &panel.specific_sets;
-    let gate = *gate;
-
-    // 4) gate + strain-profile each species, in parallel.
-    //    `--min-abundance` applies WITHIN a species, matching the primary output column: it
-    //    decides which clusters of a present species are real. Whether the *species* is present
-    //    at all is the Layer-1 species gate's decision, not this filter's.
-    let order: Vec<usize> = (0..loaded.len()).collect();
-    let mut per_species: Vec<SpeciesResult> = par_map(&order, |&i| {
-        let (species, db) = &loaded[i];
-        let specific = &specific_sets[i];
-        let total_specific = specific.len();
-        // Zero-inclusive mean over the species-specific panel — an absolute depth estimate
-        // that does not presuppose the species passed any gate (so it is not circular).
-        let observed: u64 = specific
-            .iter()
-            .map(|m| counts.get(m).copied().unwrap_or(0) as u64)
-            .sum();
-        let lambda = if total_specific > 0 {
-            observed as f64 / total_specific as f64
-        } else {
-            0.0
-        };
-        let min_count = if params.adaptive_singleton {
-            strain2bscan::identify::min_count_for(lambda)
-        } else {
-            2
-        };
-        let present_specific = specific
-            .iter()
-            .filter(|m| counts.get(*m).copied().unwrap_or(0) >= min_count)
-            .count();
-        let reachable = if params.adaptive_floor {
-            detectable_fraction(lambda)
-        } else {
-            1.0
-        };
-        let tier = species_tier(
-            present_specific,
-            total_specific,
-            gate.min_detect,
-            gate.min_markers,
-            gate.min_frac,
-            reachable,
-        );
-        let calls = if tier == SpeciesTier::Resolved {
-            profile(db, counts, params)
-        } else {
-            Vec::new()
-        };
-        let layer1 = resolve_layer1(db, params);
-        let tree = tree_utility(db, params.min_support_markers);
-        SpeciesResult {
-            species: species.clone(),
-            present_specific,
-            total_specific,
-            lambda,
-            layer1,
-            tree,
-            tier,
-            calls,
-        }
-    });
-
-    // 5) Quantification. Two scopes, both reported:
-    //
-    //    `abundance`        — WITHIN-species (sums to 1.0 per species). This is the primary
-    //                         number and the one Layer-2 is actually answering: given that this
-    //                         species is present, how is it split across strains/clusters?
-    //                         Species-level abundance is Fast2bRAD-M's job, not this layer's.
-    //    `global_abundance` — cross-species, derived from the absolute `depth`. Provided so a
-    //                         community composition can be plotted without re-deriving it:
-    //                         per-species fractions cannot be concatenated into one, because
-    //                         each species sums to 1.0 independently and a 10x-more-abundant
-    //                         species would otherwise look identical to a rare one.
-    //
-    //    `depth` is reads-per-tag on single-copy markers (one copy per cell), so it is
-    //    comparable between species and these are cell fractions.
-    //
-    //    IMPORTANT: the denominator spans only the clusters actually emitted. Species that were
-    //    detected but not strain-resolvable, and clusters dropped by --min-abundance, carry real
-    //    biomass that is NOT in it, so `global_abundance` is a composition of the strain-resolved
-    //    fraction of the sample, not of the whole community. The summary line below reports how
-    //    many species fell outside it; use `depth` directly if you need absolute quantities.
-    // `--min-global-abundance` — a TRACE filter, and the only one that can remove a spurious
-    // *species*.
-    //
-    // `--min-abundance` is within-species, so a species contributing a single cluster always has
-    // abundance 1.0 there and can never be filtered by it, however little DNA it represents.
-    // Trace cross-contamination between multiplexed libraries (index hopping typically leaves
-    // 0.01–0.1% of one library in another) therefore survives every marker-evidence gate — and
-    // correctly so, since the reads really are present and really do hit that species' specific
-    // markers. The gates answer "is there evidence", which is a different question from "is
-    // there enough of it to call the organism a community member".
-    //
-    // Separating those needs an abundance scale, not a stricter gate: on a defined mock the true
-    // members sit ~3 orders of magnitude above the contaminant trace, so any cut inside that gap
-    // is stable. Default 0 (report everything, let the caller decide).
-    let min_global: f64 = opts
-        .get("min-global-abundance")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
-    if min_global > 0.0 {
-        let total: f64 = per_species
-            .iter()
-            .flat_map(|r| r.calls.iter())
-            .map(|c| c.depth)
-            .sum();
-        if total > 0.0 {
-            for r in &mut per_species {
-                r.calls.retain(|c| c.depth / total >= min_global);
-            }
-            // A species whose clusters were all trace-level is no longer strain-resolved.
-            for r in &mut per_species {
-                if r.tier == SpeciesTier::Resolved && r.calls.is_empty() {
-                    r.tier = SpeciesTier::DetectedNotResolved;
-                }
-            }
-            // Within-species abundance must be renormalized over the survivors.
-            for r in &mut per_species {
-                let kept: f64 = r.calls.iter().map(|c| c.rel_abundance).sum();
-                if kept > 0.0 {
-                    for c in &mut r.calls {
-                        c.rel_abundance /= kept;
-                    }
-                }
-            }
-        }
-    }
-
-    let depth_sum: f64 = per_species
-        .iter()
-        .flat_map(|r| r.calls.iter())
-        .map(|c| c.depth)
-        .sum();
-    let global_of = |c: &StrainCall| {
-        if depth_sum > 0.0 {
-            c.depth / depth_sum
-        } else {
-            0.0
-        }
-    };
-
-    // `sample_fraction` — share of ALL tag observations in the sample.
-    //
-    // `global_abundance`'s denominator is whatever this run happened to resolve, so it is not
-    // comparable between samples: change the depth, the reference panel, or the number of
-    // unknown organisms present, and the denominator moves. In a defined mock (membership known,
-    // everything detectable) that is harmless; in a real sample, where most of the community may
-    // have no reference at all, it silently rescales everything.
-    //
-    // This column uses a sample-intrinsic denominator instead — the total tag observations —
-    // which is fixed by the sequencing, not by how well profiling went. A cluster's numerator is
-    // its estimated tag mass, `depth * n_markers` (per-tag depth times how many tags it carries;
-    // the units of `depth` alone are reads-per-tag, which cannot be compared against a read
-    // total). Clusters sharing a tag each contribute their own depth to it, so the shares add up
-    // without double counting. The remainder is reported as unclassified.
-    let total_tags: u64 = counts.values().map(|&c| c as u64).sum();
-    let mass_of = |c: &StrainCall| c.depth * c.n_markers as f64;
-    let sample_fraction_of = |c: &StrainCall| {
-        if total_tags > 0 {
-            mass_of(c) / total_tags as f64
-        } else {
-            0.0
-        }
-    };
-
-    // Output rows, grouped by species, most abundant cluster first within each.
-    let mut rows: Vec<ProfileRow> = per_species
-        .iter()
-        .flat_map(|r| {
-            r.calls.iter().map(move |c| ProfileRow {
-                species: r.species.clone(),
-                call: c.clone(),
-                global_abundance: global_of(c),
-                sample_fraction: sample_fraction_of(c),
-            })
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        a.species.cmp(&b.species).then(
-            b.call
-                .rel_abundance
-                .partial_cmp(&a.call.rel_abundance)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    });
-
-    Ok(SampleProfile {
-        per_species,
-        rows,
-        total_tags,
-    })
-}
-
-/// Multi-species strain profiling: digest the sample reads ONCE, then match the shared tag
-/// counts against every per-species cluster DB in `--dbs <dir>`, in parallel across species.
-/// This is the scalability advantage over running a full k-mer profiler once per species
-/// (which re-counts k-mers every time).
-fn cmd_multi_profile(opts: &HashMap<String, String>) -> Result<(), String> {
-    let reads = reads_path(opts)?;
-    let panel = load_panel(opts)?;
-    let gate = species_gate(opts);
-    let params = parse_params(opts)?;
-
-    // Digest the sample reads ONCE (streamed: peak memory is one batch, not the whole file).
-    let counts = panel.source.sample_counts(&reads)?;
-
-    match &panel.source {
-        MarkerSource::Enzyme(_) => println!(
-            "sample: {} distinct tag markers; {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
-            counts.len(),
-            panel.loaded.len(),
-            gate.min_markers,
-            gate.min_frac * 100.0,
-            gate.min_detect,
-            num_threads()
-        ),
-        MarkerSource::Kmer { .. } => println!(
-            "sample: {} distinct k-mer markers ({}); {} species DBs; resolve-gate≥max({}, {:.0}%×panel), detect-gate≥{} (threads: {})",
-            counts.len(),
-            panel.source.describe(),
-            panel.loaded.len(),
-            gate.min_markers,
-            gate.min_frac * 100.0,
-            gate.min_detect,
-            num_threads()
-        ),
-    }
-
-    let result = profile_sample(&panel, &counts, &gate, &params, opts)?;
-
-    // 6) report, grouped by species, most abundant cluster first within each
-    // Append-only column order: the first six match what `multi-profile` wrote before the
-    // accuracy rewrite, so positional readers keep working; new columns go on the end.
-    println!(
-        "#species\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction"
-    );
-    for r in &result.rows {
-        let c = &r.call;
-        println!(
-            "  {}\t{}\t{:.6}\t{:.2}\t{:.0}\t{:.3}\t{:.6}\t{:.6}",
-            r.species,
-            c.name,
-            c.rel_abundance,
-            c.coverage,
-            c.support,
-            c.depth,
-            r.global_abundance,
-            r.sample_fraction
-        );
-    }
-
-    let (mut n_resolved, mut n_detected) = (0usize, 0usize);
-    for r in &result.per_species {
-        match r.tier {
-            SpeciesTier::Resolved => {
-                n_resolved += 1;
-                // Per-species, because the decision is per-species. Printed for every resolved
-                // species whether or not the tree was taken, so a run where `auto` declined can
-                // be told apart from one where there was no tree to take.
-                if params.layer1 == Layer1::Auto {
-                    match r.tree {
-                        Some(u) => println!(
-                            "  {}\tlayer1={} (auto — {} cluster(s) below the support floor, {} informative internal node(s), {} fallback node(s))",
-                            r.species,
-                            if r.layer1 == Layer1::Cst { "cst" } else { "unique" },
-                            u.rescuable,
-                            u.informative_nodes,
-                            u.fallback_nodes
-                        ),
-                        None => println!(
-                            "  {}\tlayer1=unique (auto — this DB carries no tree)",
-                            r.species
-                        ),
-                    }
-                }
-                if r.calls.is_empty() {
-                    println!(
-                        "  {}\t[strain-resolved, no cluster above threshold]\tmarkers={}/{} (depth {:.2}x)",
-                        r.species, r.present_specific, r.total_specific, r.lambda
-                    );
-                }
-            }
-            SpeciesTier::DetectedNotResolved => {
-                n_detected += 1;
-                let breadth = if r.total_specific > 0 {
-                    100.0 * r.present_specific as f64 / r.total_specific as f64
-                } else {
-                    0.0
-                };
-                println!(
-                    "  {}\t[detected, not strain-resolvable]\tmarkers={}/{} ({:.1}%, depth {:.2}x)",
-                    r.species, r.present_specific, r.total_specific, breadth, r.lambda
-                );
-            }
-            SpeciesTier::Absent => {}
-        }
-    }
-    println!(
-        "summary: {}/{} species strain-resolved ({} strain calls), {} detected-not-resolvable, {} absent",
-        n_resolved,
-        panel.loaded.len(),
-        result.rows.len(),
-        n_detected,
-        panel.loaded.len() - n_resolved - n_detected
-    );
-    // How much of the sequencing the strain calls actually account for. The remainder is
-    // unresolved species, organisms with no reference in the panel, host DNA and sequencing
-    // error — real signal that `global_abundance`'s denominator silently omits.
-    let mass_of = |c: &StrainCall| c.depth * c.n_markers as f64;
-    let classified: f64 = result.rows.iter().map(|r| mass_of(&r.call)).sum();
-    if result.total_tags > 0 {
-        let pct = 100.0 * classified / result.total_tags as f64;
-        println!(
-            "coverage of sample: strain calls account for {:.1}% of {} tag observations ({:.1}% unclassified — unresolved species, no reference, host, error)",
-            pct.min(100.0),
-            result.total_tags,
-            (100.0 - pct).max(0.0)
-        );
-    }
-
-    if let Some(out) = opts.get("out") {
-        use std::io::Write;
-        let mut w = std::fs::File::create(out).map_err(|e| e.to_string())?;
-        writeln!(
-            w,
-            "#species\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction\tn_markers"
-        )
-        .map_err(|e| e.to_string())?;
-        for r in &result.rows {
-            let c = &r.call;
-            writeln!(
-                w,
-                "{}\t{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{:.6}\t{:.6}\t{}",
-                r.species,
-                c.name,
-                c.rel_abundance,
-                c.coverage,
-                c.support,
-                c.depth,
-                r.global_abundance,
-                r.sample_fraction,
-                c.n_markers
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        println!("predictions -> {out}");
-    }
-    Ok(())
-}
-
-/// One row of the `batch` manifest.
-struct ManifestSample {
-    name: String,
-    reads1: PathBuf,
-    /// `None` = single-end (the `reads2` column was empty or absent).
-    reads2: Option<PathBuf>,
-}
-
-/// Read the batch manifest: a CSV with header `sample,reads1[,reads2]`. Relative read paths
-/// resolve against the manifest's own directory, so a manifest is relocatable. Every problem
-/// — bad header, wrong field count, empty sample name, duplicate names, a missing reads
-/// file — is a HARD error naming the manifest line: a skipped sample would silently vanish
-/// from the merged table, and this codebase has already been bitten by that bug class once.
-fn read_manifest(path: &Path) -> Result<Vec<ManifestSample>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read manifest {}: {e}", path.display()))?;
-    // `parent` of a bare filename is "", which joins as a no-op — relative paths then resolve
-    // against the working directory, exactly where the manifest was found.
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut lines = text.lines();
-
-    let header = lines
-        .next()
-        .ok_or_else(|| format!("manifest {} is empty", path.display()))?;
-    let cols: Vec<&str> = header.split(',').map(str::trim).collect();
-    if cols.len() < 2 || cols[0] != "sample" || cols[1] != "reads1" {
-        return Err(format!(
-            "manifest {}: header must be `sample,reads1[,reads2]`, got `{header}`",
-            path.display()
-        ));
-    }
-    if cols.len() > 2 && cols[2] != "reads2" {
-        return Err(format!(
-            "manifest {}: third column must be `reads2`, got `{}`",
-            path.display(),
-            cols[2]
-        ));
-    }
-
-    let resolve = |p: &str| {
-        let q = Path::new(p);
-        if q.is_absolute() {
-            q.to_path_buf()
-        } else {
-            dir.join(q)
-        }
-    };
-    let mut samples = Vec::new();
-    for (i, line) in lines.enumerate() {
-        let lineno = i + 2; // 1-based, past the header
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let f: Vec<&str> = line.split(',').map(str::trim).collect();
-        if !(2..=3).contains(&f.len()) {
-            return Err(format!(
-                "manifest {} line {lineno}: want `sample,reads1[,reads2]` (2-3 fields), got {} field(s)",
-                path.display(),
-                f.len()
-            ));
-        }
-        if f[0].is_empty() {
-            return Err(format!(
-                "manifest {} line {lineno}: empty sample name",
-                path.display()
-            ));
-        }
-        if f[1].is_empty() {
-            return Err(format!(
-                "manifest {} line {lineno} (sample '{}'): empty reads1",
-                path.display(),
-                f[0]
-            ));
-        }
-        let reads1 = resolve(f[1]);
-        let reads2 = match f.get(2) {
-            Some(&p) if !p.is_empty() => Some(resolve(p)),
-            _ => None,
-        };
-        for p in [&reads1].into_iter().chain(reads2.iter()) {
-            if !p.is_file() {
-                return Err(format!(
-                    "manifest {} line {lineno} (sample '{}'): reads file not found: {}",
-                    path.display(),
-                    f[0],
-                    p.display()
-                ));
-            }
-            // A file the reader would misparse is as much a broken manifest entry as a
-            // missing one, and fails the same way: silently, with plausible-looking output.
-            if !is_fastx_path(p) {
-                return Err(format!(
-                    "manifest {} line {lineno} (sample '{}'): unrecognized sequence format: {} \
-                     — {FASTX_HINT}.",
-                    path.display(),
-                    f[0],
-                    p.display()
-                ));
-            }
-        }
-        if samples.iter().any(|s: &ManifestSample| s.name == f[0]) {
-            return Err(format!(
-                "manifest {} line {lineno}: duplicate sample name '{}'",
-                path.display(),
-                f[0]
-            ));
-        }
-        samples.push(ManifestSample {
-            name: f[0].to_string(),
-            reads1,
-            reads2,
-        });
-    }
-    if samples.is_empty() {
-        return Err(format!("manifest {}: no samples", path.display()));
-    }
-    Ok(samples)
-}
-
-/// Batch multi-species profiling: the panel is loaded ONCE, then every sample in the
-/// manifest is digested and profiled against it, writing one merged long table — the
-/// `multi-profile --out` columns with a leading `sample` column (append-only contract: the
-/// existing columns keep their order, `sample` goes in front). A sample's rows are
-/// field-identical to what `multi-profile --out` writes for it; paired-end R1+R2 are counted
-/// as one sample, exactly equivalent to digesting `cat R1 R2`.
-fn cmd_batch(opts: &HashMap<String, String>) -> Result<(), String> {
-    let manifest = PathBuf::from(req(opts, "manifest")?);
-    let out = PathBuf::from(req(opts, "out")?);
-    let panel = load_panel(opts)?;
-    let gate = species_gate(opts);
-    let params = parse_params(opts)?;
-    let samples = read_manifest(&manifest)?;
-
-    use std::io::Write;
-    let mut w = std::io::BufWriter::new(std::fs::File::create(&out).map_err(|e| e.to_string())?);
-    writeln!(
-        w,
-        "#sample\tspecies\tcluster\tabundance\tcoverage\tsupport\tdepth\tglobal_abundance\tsample_fraction\tn_markers"
-    )
-    .map_err(|e| e.to_string())?;
-
-    for (i, s) in samples.iter().enumerate() {
-        eprintln!(
-            "[batch {}/{}] sample {}: {}",
-            i + 1,
-            samples.len(),
-            s.name,
-            match &s.reads2 {
-                Some(r2) => format!("{} + {}", s.reads1.display(), r2.display()),
-                None => s.reads1.display().to_string(),
-            }
-        );
-        let counts = panel
-            .source
-            .sample_counts_paired(&s.reads1, s.reads2.as_deref())
-            .map_err(|e| format!("sample '{}': {e}", s.name))?;
-        let result = profile_sample(&panel, &counts, &gate, &params, opts)?;
-        eprintln!(
-            "[batch {}/{}] sample {}: {} distinct markers, {} strain call(s)",
-            i + 1,
-            samples.len(),
-            s.name,
-            counts.len(),
-            result.rows.len()
-        );
-        for r in &result.rows {
-            let c = &r.call;
-            writeln!(
-                w,
-                "{}\t{}\t{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{:.6}\t{:.6}\t{}",
-                s.name,
-                r.species,
-                c.name,
-                c.rel_abundance,
-                c.coverage,
-                c.support,
-                c.depth,
-                r.global_abundance,
-                r.sample_fraction,
-                c.n_markers
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
-    w.flush().map_err(|e| e.to_string())?;
-    println!(
-        "predictions ({} samples) -> {}",
-        samples.len(),
-        out.display()
-    );
-    Ok(())
-}
-
-fn cmd_info(opts: &HashMap<String, String>) -> Result<(), String> {
-    let db = StrainDb::load(Path::new(req(opts, "db")?)).map_err(|e| e.to_string())?;
-    let kmer = if db.enzymes.len() == 1 {
-        parse_kmer_db_token(&db.enzymes[0])
-    } else {
-        None
-    };
-    match kmer {
-        Some((k, scale)) => println!(
-            "marker source: k-mer sketch (k={k}, sketch scale={scale}; DB token: {})",
-            db.enzymes[0]
-        ),
-        None => println!(
-            "enzymes: {}",
-            if db.enzymes.is_empty() {
-                "(unspecified)".into()
-            } else {
-                db.enzymes.join("+")
-            }
-        ),
-    }
-    print_stats(&db);
-    for (i, name) in db.strain_names.iter().enumerate() {
-        println!(
-            "  [{i}] {name}: {} markers ({} unique)",
-            db.strain_markers[i].len(),
-            db.unique_marker_count(i)
-        );
-    }
-    Ok(())
-}
-
-/// In-memory conspecific demo (no files needed): shows the ported Layer-2 resolving a
-/// 70/30 mixture of 2 near-identical strains while the naive scorer over-calls all 4.
-fn cmd_demo() -> Result<(), String> {
-    let core: Vec<Marker> = (0..200).collect();
-    let mut strains = Vec::new();
-    for s in 0..4u64 {
-        let mut m = core.clone();
-        m.extend((0..50).map(|i| 1_000_000 + s * 50 + i));
-        strains.push((format!("strain{s}"), m));
-    }
-    let db = StrainDb::build(strains);
-
-    let mixture = [(0usize, 0.7f64), (2, 0.3)];
-    let mut present: HashMap<Marker, f64> = HashMap::new();
-    for &(j, ab) in &mixture {
-        for &m in &db.strain_markers[j] {
-            *present.entry(m).or_insert(0.0) += ab;
-        }
-    }
-    let mut counts = MarkerCounts::default();
-    for (m, frac) in present {
-        let c = (30.0 * frac).round() as u32;
-        if c > 0 {
-            counts.insert(m, c);
-        }
-    }
-    for e in 0..50u64 {
-        counts.insert(9_000_000 + e, 1);
-    }
-
-    println!("== Demo: 4 conspecific strains (200 shared + 50 private each) ==");
-    println!("truth: strain0=0.70, strain2=0.30\n");
-    println!("[ported StrainScan Layer-2]");
-    report(&profile(&db, &counts, &Params::default()));
-    let naive = naive_profile(&db, &counts, 1240.0);
-    println!(
-        "\n[naive strainscan-rust-style scoring]  -> calls {} strains: {:?}  (over-call: shared core alone clears the threshold)",
-        naive.len(),
-        naive.iter().map(|&j| db.strain_names[j].clone()).collect::<Vec<_>>()
-    );
-    Ok(())
-}
-
-/// CST demo: a species with 4 genomes forming 2 clusters. Shows single-linkage clustering,
-/// marker classification, and cluster-resolution profiling of a 70/30 cluster mixture.
-fn cmd_cst_demo() -> Result<(), String> {
-    let core: Vec<Marker> = (0..200).collect();
-    let clu_a: Vec<Marker> = (200..240).collect();
-    let clu_b: Vec<Marker> = (300..340).collect();
-    let mk = |name: &str, extra: &[Marker], base: Marker| {
-        let mut v = core.clone();
-        v.extend_from_slice(extra);
-        v.extend((0..3).map(|i| base + i));
-        (name.to_string(), v.clone(), v) // (name, single-copy, full) — no multi-copy here
-    };
-    let genomes = vec![
-        mk("g0", &clu_a, 1000),
-        mk("g1", &clu_a, 1100),
-        mk("g2", &clu_b, 2000),
-        mk("g3", &clu_b, 2100),
-    ];
-
-    println!("== CST demo: 1 species, 4 genomes (g0/g1 ~identical, g2/g3 ~identical) ==");
-    let cst = SpeciesCst::build(genomes, DEFAULT_SIMILARITY, false);
-    println!("single-linkage @ 0.95 -> {} clusters:", cst.n_clusters());
-    for (cid, members) in cst.clusters.iter().enumerate() {
-        let names: Vec<&str> = members
-            .iter()
-            .map(|&g| cst.genome_names[g].as_str())
-            .collect();
-        println!("  C{cid}: {}", names.join(", "));
-    }
-    let s = cst.marker_class_summary();
-    println!(
-        "marker classes: species_core={} cluster_specific={} strain_specific={}",
-        s.get("species_core").unwrap_or(&0),
-        s.get("cluster_specific").unwrap_or(&0),
-        s.get("strain_specific").unwrap_or(&0),
-    );
-
-    let db = cst.cluster_db();
-    let mut present: HashMap<Marker, f64> = HashMap::new();
-    for (cid, ab) in [(0usize, 0.7f64), (1, 0.3)] {
-        for &m in &db.strain_markers[cid] {
-            *present.entry(m).or_insert(0.0) += ab;
-        }
-    }
-    let mut counts = MarkerCounts::default();
-    for (m, frac) in present {
-        let c = (30.0 * frac).round() as u32;
-        if c > 0 {
-            counts.insert(m, c);
-        }
-    }
-    println!("\nprofiling cluster mixture truth C0=0.70, C1=0.30:");
-    report(&profile(&db, &counts, &Params::default()));
-    Ok(())
-}
-
-fn report(calls: &[StrainCall]) {
-    if calls.is_empty() {
-        println!("  (no strains passed thresholds)");
-        return;
-    }
-    for c in calls {
-        println!(
-            "  {:<12} abundance={:>6.2}%  depth={:>7.3}x  coverage={:>6.2}%  support={:.0}",
-            c.name,
-            c.rel_abundance * 100.0,
-            c.depth,
-            c.coverage * 100.0,
-            c.support
-        );
-    }
-}
-
-/// Write predictions as `name<TAB>abundance<TAB>coverage<TAB>support<TAB>depth<TAB>n_markers`.
-///
-/// Column order is **append-only**: the first five columns are exactly those written before the
-/// accuracy rewrite, so scripts that index positionally keep working. Inserting `depth` in the
-/// middle silently shifts `coverage` and `support` by one, which does not fail loudly — it just
-/// makes every downstream number wrong.
-///
-/// `depth` is the absolute per-tag read depth; unlike `abundance` (normalized within this DB)
-/// it is comparable across separately-profiled species. `n_markers` is the cluster's tag count,
-/// needed to convert depth into a DNA-mass share.
-fn write_pred_tsv(path: &Path, calls: &[StrainCall]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut w = std::fs::File::create(path)?;
-    writeln!(
-        w,
-        "#cluster\tabundance\tcoverage\tsupport\tdepth\tn_markers"
-    )?;
-    for c in calls {
-        writeln!(
-            w,
-            "{}\t{:.6}\t{:.4}\t{:.0}\t{:.4}\t{}",
-            c.name, c.rel_abundance, c.coverage, c.support, c.depth, c.n_markers
-        )?;
-    }
-    Ok(())
-}
-
-fn print_stats(db: &StrainDb) {
+pub(crate) fn print_stats(db: &StrainDb) {
     let s = db.stats();
     println!(
         "  units={}  markers={}  unique={} ({:.1}%)  avg_markers/unit={:.0}",
@@ -1917,20 +321,8 @@ fn print_stats(db: &StrainDb) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        load_species_dbs, reads_path, resolve_sample_source, species_tier, MarkerSource,
-        SpeciesTier,
-    };
-    use std::collections::HashMap;
+    use super::{resolve_sample_source, MarkerSource};
     use strain2bscan::db::StrainDb;
-    use strain2bscan::identify::detectable_fraction;
-
-    fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
 
     fn kmer_db() -> StrainDb {
         let mut db = StrainDb::build(vec![
@@ -1950,235 +342,44 @@ mod tests {
         db
     }
 
-    /// `--reads` must name a format the reader can actually parse.
-    ///
-    /// The reader chooses FASTA or FASTQ by extension and falls back to FASTA, so a FASTQ
-    /// under any other name was read as a single enormous FASTA contig — no error, unbounded
-    /// memory, and reads spliced together across their header lines.
-    #[test]
-    fn reads_path_rejects_unrecognized_formats() {
-        for good in [
-            "s.fq",
-            "s.fastq",
-            "s.fq.gz",
-            "s.fastq.gz",
-            "s.FQ.GZ",
-            "s.fa",
-            "s.fasta",
-            "s.fna",
-            "s.fna.gz",
-        ] {
-            assert!(
-                reads_path(&opts(&[("reads", good)])).is_ok(),
-                "{good} must be accepted"
-            );
-        }
-        for bad in ["s.txt", "s.fastq.bz2", "s.bam", "s", "s.fq.zst"] {
-            let err = reads_path(&opts(&[("reads", bad)]))
-                .expect_err("{bad} must be rejected")
-                .to_string();
-            assert!(
-                err.contains("unrecognized sequence format"),
-                "{bad}: unexpected error {err}"
-            );
-        }
-        assert!(
-            reads_path(&opts(&[])).is_err(),
-            "a missing --reads must still error"
-        );
-    }
-
-    /// A k-mer DB must auto-detect: no flags needed, and the run inherits the DB's K and S.
     #[test]
     fn profile_auto_detects_kmer_db() {
-        let src = resolve_sample_source(&kmer_db(), &opts(&[])).unwrap();
+        let src = resolve_sample_source(&kmer_db(), None, None, None, None).unwrap();
         match src {
             MarkerSource::Kmer { k, scale } => assert_eq!((k, scale), (15, 1)),
             _ => panic!("k-mer DB must select the k-mer source"),
         }
-        // Explicitly naming the mode and the matching parameters is fine too.
-        let src = resolve_sample_source(
-            &kmer_db(),
-            &opts(&[
-                ("marker-source", "kmer"),
-                ("kmer-size", "15"),
-                ("sketch-scale", "1"),
-            ]),
-        )
-        .unwrap();
+        let src = resolve_sample_source(&kmer_db(), Some("kmer"), None, Some(15), Some(1)).unwrap();
         assert!(matches!(src, MarkerSource::Kmer { k: 15, scale: 1 }));
     }
 
-    /// CLI K/S against a k-mer DB act as an override-CHECK: a mismatch is a hard error.
     #[test]
     fn profile_rejects_kmer_param_mismatch() {
-        let err = resolve_sample_source(&kmer_db(), &opts(&[("kmer-size", "31")])).unwrap_err();
+        let err = resolve_sample_source(&kmer_db(), None, None, Some(31), None).unwrap_err();
         assert!(err.contains("does not match the database"), "{err}");
-        let err = resolve_sample_source(&kmer_db(), &opts(&[("sketch-scale", "100")])).unwrap_err();
+        let err = resolve_sample_source(&kmer_db(), None, None, None, Some(100)).unwrap_err();
         assert!(err.contains("does not match the database"), "{err}");
     }
 
-    /// Crossing the marker spaces — enzyme reads on a k-mer DB or k-mer reads on an enzyme
-    /// DB — must be a hard error, never silent garbage.
     #[test]
     fn profile_rejects_crossing_marker_spaces() {
-        let err =
-            resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "enzyme")])).unwrap_err();
+        let err = resolve_sample_source(&kmer_db(), Some("enzyme"), None, None, None).unwrap_err();
         assert!(err.contains("k-mer sketch"), "{err}");
-        let err =
-            resolve_sample_source(&enzyme_db(), &opts(&[("marker-source", "kmer")])).unwrap_err();
+        let err = resolve_sample_source(&enzyme_db(), Some("kmer"), None, None, None).unwrap_err();
         assert!(err.contains("disjoint marker spaces"), "{err}");
-        let err =
-            resolve_sample_source(&kmer_db(), &opts(&[("marker-source", "wat")])).unwrap_err();
+        let err = resolve_sample_source(&kmer_db(), Some("wat"), None, None, None).unwrap_err();
         assert!(err.contains("bad --marker-source"), "{err}");
     }
 
-    /// Enzyme mode is unchanged: the DB's recorded set wins, no k-mer flags involved.
     #[test]
     fn profile_enzyme_db_stays_on_enzyme_path() {
-        let src = resolve_sample_source(&enzyme_db(), &opts(&[])).unwrap();
+        let src = resolve_sample_source(&enzyme_db(), None, None, None, None).unwrap();
         match src {
             MarkerSource::Enzyme(set) => {
                 assert_eq!(set.len(), 1);
                 assert_eq!(set[0].name, "BcgI");
             }
             _ => panic!("enzyme DB must select the enzyme source"),
-        }
-    }
-
-    /// A DB that fails to load must abort the run with an error naming the file — never
-    /// degrade to an empty DB that silently reports the species as absent (the old
-    /// `StrainDb::load(path).unwrap_or_default()` behavior).
-    #[test]
-    fn multi_profile_panel_load_failure_propagates() {
-        let dir = std::env::temp_dir().join(format!("s2bs_panel_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let good = StrainDb::build(vec![
-            ("A".into(), vec![1, 2, 3, 10]),
-            ("B".into(), vec![1, 2, 3, 20]),
-        ]);
-        good.save(&dir.join("good.tsv")).unwrap();
-        // Header declares 5 strains / 5 counts but only one strain line is present.
-        std::fs::write(
-            dir.join("broken.tsv"),
-            b"#strain2bscan-db\t5\t\t1,1,1,1,1\nX\t1,2,3\n",
-        )
-        .unwrap();
-
-        let err = load_species_dbs(&dir).unwrap_err();
-        assert!(
-            err.contains("broken.tsv"),
-            "error must name the failing DB: {err}"
-        );
-
-        // An intact panel still loads, keyed by file stem.
-        std::fs::remove_file(dir.join("broken.tsv")).unwrap();
-        let loaded = load_species_dbs(&dir).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].0, "good");
-        assert_eq!(loaded[0].1.n_strains(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Ample depth: essentially the whole panel is reachable, so the gates are the original
-    /// absolute ones.
-    const FULL: f64 = 1.0;
-
-    #[test]
-    fn absolute_floor_gates_when_no_fraction() {
-        // frac = 0 -> resolve gate is the absolute floor (200); detect gate = min(10, 200) = 10.
-        assert_eq!(
-            species_tier(250, 5000, 10, 200, 0.0, FULL),
-            SpeciesTier::Resolved
-        );
-        assert_eq!(
-            species_tier(50, 5000, 10, 200, 0.0, FULL),
-            SpeciesTier::DetectedNotResolved
-        );
-        assert_eq!(
-            species_tier(5, 5000, 10, 200, 0.0, FULL),
-            SpeciesTier::Absent
-        );
-    }
-
-    #[test]
-    fn breadth_fraction_raises_the_bar_for_large_panels() {
-        // 10% of a 5000-marker panel = 500 > floor 200, so 300 observed is below the resolve gate
-        // even though it clears the absolute floor. This is the whole point of the breadth term.
-        assert_eq!(
-            species_tier(300, 5000, 10, 200, 0.10, FULL),
-            SpeciesTier::DetectedNotResolved
-        );
-        assert_eq!(
-            species_tier(600, 5000, 10, 200, 0.10, FULL),
-            SpeciesTier::Resolved
-        );
-    }
-
-    #[test]
-    fn small_panel_species_can_still_be_detected() {
-        // total 150 < floor 200 -> can never clear the resolve gate, but the detect gate
-        // (min(10, 200) = 10) still flags presence rather than dropping it silently.
-        assert_eq!(
-            species_tier(150, 150, 10, 200, 0.0, FULL),
-            SpeciesTier::DetectedNotResolved
-        );
-        assert_eq!(
-            species_tier(5, 150, 10, 200, 0.0, FULL),
-            SpeciesTier::Absent
-        );
-    }
-
-    /// At low depth only a few percent of any panel is observable, so an unscaled 200-marker
-    /// floor is unreachable by construction and a genuinely present species is filed as
-    /// unresolvable. The floor relaxes — but only to `MIN_FLOOR_FRACTION` of its configured
-    /// value (200 -> 50), never all the way down.
-    #[test]
-    fn low_depth_relaxes_the_floor_but_only_to_the_bound() {
-        let reachable = detectable_fraction(0.05);
-        assert!(reachable < 0.05);
-        // 60 observed markers: below the full-depth floor of 200 ...
-        assert_eq!(
-            species_tier(60, 5000, 10, 200, 0.0, FULL),
-            SpeciesTier::DetectedNotResolved
-        );
-        // ... but above the relaxed floor of 50 at low depth.
-        assert_eq!(
-            species_tier(60, 5000, 10, 200, 0.0, reachable),
-            SpeciesTier::Resolved
-        );
-    }
-
-    /// The relaxation must be **bounded**. Scaling the floor by the reachable fraction `r` alone
-    /// is self-cancelling: the observed count is itself ~ `total * r`, so `present >= floor * r`
-    /// reduces to `total >= floor` — independent of depth. That leaves `detect` (10 markers) as
-    /// the only real threshold, and a 20 000-marker panel hit by 40 stray tags would be declared
-    /// strain-resolvable. The bound keeps a genuine floor.
-    #[test]
-    fn adaptive_floor_does_not_cancel_itself_away() {
-        let r = detectable_fraction(0.002); // ~0.2% reachable
-                                            // 40 stray tags on a 20k panel: detected as present, but NOT strain-resolvable.
-        assert_eq!(
-            species_tier(40, 20_000, 10, 200, 0.0, r),
-            SpeciesTier::DetectedNotResolved
-        );
-        // The bounded floor is 50, so real evidence still resolves.
-        assert_eq!(
-            species_tier(50, 20_000, 10, 200, 0.0, r),
-            SpeciesTier::Resolved
-        );
-    }
-
-    /// The gate must never fall below the absolute detect floor, at any depth.
-    #[test]
-    fn adaptive_gate_never_falls_below_the_detect_floor() {
-        for lambda in [0.0, 1e-6, 0.001, 0.01] {
-            let r = detectable_fraction(lambda);
-            assert_eq!(species_tier(9, 5000, 10, 200, 0.0, r), SpeciesTier::Absent);
-            assert_eq!(
-                species_tier(10, 5000, 10, 200, 0.0, r),
-                SpeciesTier::DetectedNotResolved
-            );
         }
     }
 }

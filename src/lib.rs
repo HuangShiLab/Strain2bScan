@@ -15,11 +15,15 @@
 pub mod bench;
 pub mod cst;
 pub mod db;
+pub mod depth;
+pub mod detect;
+pub mod enet;
 pub mod enzymes;
 pub mod fxhash;
 pub mod identify;
 pub mod markers;
 pub mod parallel;
 pub mod quality;
+pub mod tree;
 
 pub use markers::{Marker, MarkerCounts};

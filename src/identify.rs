@@ -1,83 +1,40 @@
 //! StrainScan-style Layer-2 strain resolution + abundance, on 2bRAD-tag markers.
 //!
 //! 1. **Presence detection by unique markers.** A cluster/strain is called present iff enough
-//!    of its *unique* (cluster-specific) markers are observed. Restricting to single-cluster
-//!    markers makes detection immune to the shared-marker cross-talk that breaks a greedy
-//!    set-cover on conspecific panels.
+//!    of its *unique* (cluster-specific) markers are observed.
 //! 2. **Absolute depth from unique markers.** Each detected cluster's depth is the
-//!    **zero-inclusive** trimmed mean count over its unique-marker panel — see
-//!    [`unique_marker_depth`]. Getting this right matters at both scopes: the previous
-//!    median-over-detected estimator compressed the ratio between an abundant and a rare
-//!    cluster *within* a species too. Because it is absolute (reads per tag), it additionally
-//!    lets callers derive a cross-species composition when they want one.
+//!    **zero-inclusive** trimmed mean count over its unique-marker panel.
 //! 3. **Depth-adaptive gating.** The singleton filter and the coverage floor are functions of
-//!    the estimated depth rather than fixed constants, so low-input / high-host samples are
-//!    not silently thresholded away. See [`min_count_for`] and [`detectable_fraction`].
+//!    the estimated depth.
 //! 4. **Post-filter.** Drop calls below `min_rel_abundance`; renormalize.
-//!
-//! ## Why not a regression, as StrainScan uses
-//!
-//! A non-negative Elastic Net solver ([`nonneg_elastic_net`], StrainScan's
-//! `ElasticNet(positive=True)`) is provided but deliberately **not** on the main path. The
-//! reason is empirical, and it is the opposite of what one would expect.
-//!
-//! A regression fits over the *full* marker space, shared markers included, so it uses data this
-//! module discards — a real statistical-efficiency advantage. The natural assumption is that its
-//! L1 penalty also handles shadow clusters (see [`profile`]) by shrinking a weakly-supported
-//! component to zero. **It does not.** Run on the shadow scenario — a strain carrying all of
-//! cluster A's distinguishing loci and 30% of cluster B's, at 20x — the solver returns:
-//!
-//! ```text
-//!   alpha = 0      w_A = 18.36   w_B = 4.36    (w_B/w_A = 0.238)
-//!   alpha = 0.01   w_A = 18.20   w_B = 4.38    (0.241)
-//!   alpha = 0.10   w_A = 16.87   w_B = 4.48    (0.266)   <- stronger penalty is WORSE
-//! ```
-//!
-//! The shadow survives at every penalty, and raising alpha makes it worse: shrinking the
-//! dominant coefficient leaves residual on the shared core that the minor one absorbs. On the
-//! genuine counterpart (B truly present at 0.4x) the same penalty inflates `w_B` from 0.35 to
-//! 0.86 — so alpha degrades both cases at once.
-//!
-//! The structural reason: 300 markers at count 20 *is* strong evidence in a least-squares sense,
-//! and no penalty small enough to leave the real strains alone can remove it. More fundamentally,
-//! a least-squares objective sees only the mean — "300 markers at 20x" and "1000 markers at 6x"
-//! are the same number to it. What separates them is the **breadth** of the evidence, which the
-//! objective discards. That is exactly the quantity the depth–breadth consistency test in
-//! [`profile`] reads, and why it succeeds where the penalty cannot: on the same scenario it takes
-//! the shadow's share of the species from 28% (this module's estimator alone) or ~20% (the
-//! regression) to 0%.
-//!
-//! Abundance accuracy is otherwise a wash — on ATCC MSA-1002 the L1 error to truth is 0.434 here
-//! against 0.425 for StrainScan — so the regression's efficiency edge is offset by this module's
-//! robustness to outliers (winsorization), its absolute and cross-comparable units, and its
-//! immunity to cross-species cross-talk.
-//!
-//! One case would still favour a regression: a sample strain that is a genuine *mixture* of two
-//! references, which should be apportioned rather than called as one or both. If that turns up,
-//! the right scope is a **per-species** fit over the species-specific marker space — which does
-//! scale (20 clusters × 20 000 markers is ~3 MB), contrary to an earlier note here that judged
-//! it by a global matrix.
+
+// Re-export the items the rest of the crate uses through `strain2bscan::identify::*`.
+pub use crate::depth::{
+    detectable_fraction, min_count_for, strain_unique_coverage, support_count, unique_marker_depth,
+    PanelStats,
+};
+pub use crate::detect::{detect_present, panel_stats};
+pub use crate::enet::{
+    build_l2_design, l2_abundance, nonneg_elastic_net, pre_scan, subset_candidates, L2Design,
+    MIN_SUBSET_SHARE,
+};
+pub use crate::tree::{
+    descend_tree, descend_tree_inner, descend_tree_masked, resolve_layer1, tree_utility, TreeCall,
+    TreeUtility, MAX_FALLBACK_CLADE, MIN_NODE_MARKERS,
+};
 
 use crate::db::StrainDb;
+use crate::depth::{marker_panel_evidence, panel_stats as panel_stats_fn};
 use crate::markers::{Marker, MarkerCounts};
-
-/// Depth at or above which a genuine marker is essentially never observed exactly once, so
-/// `count == 1` can safely be attributed to sequencing error (StrainScan's singleton rule).
-pub const SINGLETON_SAFE_DEPTH: f64 = 3.0;
-
-/// Reciprocal of the fraction of **non-zero** observations winsorized before averaging, to keep
-/// collapsed repeats and contamination from inflating the depth estimate (top 1%).
-const TRIM_FRACTION: usize = 100;
 
 /// Which Layer-1 (presence detection) to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer1 {
-    /// Let the database decide — see [`tree_utility`]. The default.
+    /// Let the database decide.
     Auto,
     /// Score each cluster independently on its own cluster-unique markers.
     Unique,
-    /// Descend the Cluster Search Tree, pooling ancestor markers along the unique path
-    /// ([`descend_tree`]). Requires a database built by `cluster` with the tree persisted.
+    /// Descend the Cluster Search Tree.
     Cst,
 }
 
@@ -86,57 +43,33 @@ pub enum Layer1 {
 pub enum Layer2 {
     /// Zero-inclusive winsorized mean depth over each cluster's own unique markers.
     Depth,
-    /// StrainScan-style joint fit: residual pre-scan then non-negative ElasticNet over the
-    /// shared-marker design matrix ([`build_l2_design`]).
+    /// StrainScan-style joint fit over the shared-marker design matrix.
     Enet,
 }
 
 #[derive(Debug, Clone)]
 pub struct Params {
-    /// Min number of a strain's unique markers (passing the singleton policy) to call it
-    /// present (tag-unit support — StrainScan's `msn`; recalibrate on your data).
+    /// Min number of a strain's unique markers to call it present.
     pub min_support_markers: usize,
-    /// Min fraction of a strain's unique markers detected (StrainScan 0.7). An absolute floor —
-    /// see the comment in [`profile`] for why this one is deliberately not depth-scaled.
+    /// Min fraction of a strain's unique markers detected.
     pub min_coverage: f64,
-    /// Min relative abundance to keep a call, applied to the **within-species** fraction
-    /// [`profile`] computes (including under `multi-profile`). **Defaults to 0** — see
-    /// [`Params::default`] for why StrainScan's 0.02 is wrong here.
+    /// Min relative abundance to keep a call.
     pub min_rel_abundance: f64,
-    /// Min ratio between consecutive sorted abundances to cut the trace tail. A defined community
-    /// separates from cross-library trace by orders of magnitude, while a staggered community's
-    /// true members never separate from each other by more than their design ratio. Cutting at
-    /// the largest log-gap (only when it exceeds this value) removes the former without touching
-    /// the latter. 0 disables. See [`filter_by_trace_gap`].
+    /// Min ratio between consecutive sorted abundances to cut the trace tail.
     pub trace_gap: f64,
-    /// Absolute abundance floor applied after [`trace_gap`] filtering. Calls below this value are
-    /// dropped even when no gap was found. 0 disables.
+    /// Absolute abundance floor applied after [`filter_by_trace_gap`].
     pub trace_floor: f64,
-    /// Admit `count == 1` markers as evidence when the estimated depth is low enough that
-    /// genuine markers are mostly singletons (see [`min_count_for`]). Off ⇒ always `count >= 2`.
-    ///
-    /// Kept **separate** from [`Params::adaptive_floor`] because the two relaxations trade off
-    /// differently: admitting singletons buys real sensitivity on sparse 2bRAD panels, but on a
-    /// dense multi-enzyme digest against a large species panel it is also the main way an
-    /// absent species accumulates spurious evidence.
+    /// Admit `count == 1` markers as evidence when depth is low.
     pub adaptive_singleton: bool,
-    /// Minimum `coverage / (1 − e^(−depth))`. Rejects "shadow" clusters whose observed markers
-    /// are far deeper than their breadth allows — see the note in [`profile`]. Set to 0 to
-    /// disable. A genuinely present cluster scores ~1 at any depth.
+    /// Minimum `coverage / (1 − e^(−depth))`.
     pub min_consistency: f64,
-    /// Scale the Layer-1 species-marker floor down toward what is reachable at the estimated
-    /// depth. Off ⇒ the configured floor applies at every depth.
-    ///
-    /// ⚠️ This relaxation keys on the species' **own** estimated depth, so an *absent* species —
-    /// whose depth is near zero — receives the largest relaxation of all. That is backwards, and
-    /// it is why large panels lose specificity: see the note on `MIN_FLOOR_FRACTION` in `main`.
+    /// Scale the Layer-1 species-marker floor down toward what is reachable at depth.
     pub adaptive_floor: bool,
-    /// Presence detection to use. Defaults to [`Layer1::Unique`].
+    /// Presence detection to use.
     pub layer1: Layer1,
-    /// Abundance estimator to use. Defaults to [`Layer2::Depth`].
+    /// Abundance estimator to use.
     pub layer2: Layer2,
-    /// ElasticNet penalty for [`Layer2::Enet`]. 0 = pure non-negative least squares, which the
-    /// shadow experiment in the module docs found strictly better than any positive value.
+    /// ElasticNet penalty for [`Layer2::Enet`].
     pub enet_alpha: f64,
     pub enet_l1_ratio: f64,
 }
@@ -144,49 +77,11 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Params {
-            // Recalibrated for sparse 2bRAD markers (full-k-mer StrainScan uses msn*k≈1240
-            // k-mers; tag markers are ~50-100x sparser, so the floor is in *tag* units).
-            //
-            // 8, not 10, on measurement rather than on the round number. This gate is what sets
-            // the detection limit, because support tracks `panel * (1 - e^-lambda)` almost
-            // exactly and both factors are small here: the discriminating panel is a few dozen
-            // tags (median 53 over a 419-cluster C. acnes panel), and a strain at 5% of a
-            // sample sequenced to ~5x per tag sits at lambda ~= 0.27, where only ~24% of any
-            // panel is observable at all. ~35 markers x 24% ~= 8 observed against a floor of 10
-            // loses strains that are plainly present. Swept on that panel, 10 -> 8 lifts AUPR
-            // from 0.800 to 0.950 with precision unchanged at 1.000; below 8 precision starts
-            // to go (0.900 at 6, 0.780 at 4), so 8 is the last free step rather than a
-            // sensitivity/specificity trade.
             min_support_markers: 8,
             min_coverage: 0.1,
-            // 0, NOT StrainScan's 0.02 — and this must stay tied to the depth estimator.
-            //
-            // A 0.02 floor was survivable only while `depth` came from the median over
-            // *detected* markers, which inflates a rare cluster roughly to 1 read/tag no matter
-            // how rare it truly is. Removing that bias (see `unique_marker_depth`) made rare
-            // clusters report their real, correctly tiny share — and the unchanged 2% floor then
-            // deleted them. Measured on a 30x/0.5x mixture: the biased estimator reported the
-            // rare cluster at 3.23% (true 1.64%) and it survived; the unbiased one reports 1.57%
-            // and 0.02 drops the call entirely. Recall collapsed on exactly the samples full of
-            // rare strains — staggered mocks and high-host dilutions.
-            //
-            // On the original MSA-1002/1003 mocks a fixed floor bought precision with no FP
-            // change because those mocks had no cross-library trace. With MSA-1005/1007 the
-            // picture changes: a 0.001 floor removes ~97% of trace FP (mostly index-hopping
-            // signal from co-multiplexed mocks) but also deletes the rare tail of MSA-1003's
-            // staggered design. Use a per-sample adaptive gap instead (see `trace_gap`).
             min_rel_abundance: 0.0,
-            // Per-sample adaptive trace-tail removal. 0 disables; enable with `--trace-gap N`
-            // and `--trace-floor F`. On the four WMS mocks, `--trace-gap 10 --trace-floor 1e-4`
-            // removes ~92% of FP while keeping recall unchanged, because true communities are
-            // separated from trace by >10x but staggered mocks' rare true members are not.
             trace_gap: 0.0,
             trace_floor: 0.0,
-            // 0.5 was calibrated on synthetic shadows, which scored <= 0.897 and genuine clusters
-            // >= 0.949 across depths 0.3x-20x. On real mocks the two distributions overlap
-            // (trace contamination scores 0.73-0.93, and low-depth true clusters as low as 0.51),
-            // so this gate alone cannot separate them. It still rejects extreme shadows; raise it
-            // only if you can tolerate losing low-depth true positives.
             min_consistency: 0.5,
             adaptive_singleton: true,
             adaptive_floor: true,
@@ -206,188 +101,15 @@ pub struct StrainCall {
     pub support: f64,
     /// Fraction of the strain's unique markers detected in the sample (breadth).
     pub coverage: f64,
-    /// **Absolute** per-tag depth (reads per unique marker), zero-inclusive. Comparable across
-    /// species — this is the quantity cross-species composition is built from.
+    /// **Absolute** per-tag depth (reads per unique marker).
     pub depth: f64,
-    /// Total single-copy tags this cluster carries. `depth * n_markers` estimates the cluster's
-    /// share of the sample's tag observations, which is what lets a caller normalize against
-    /// **all** sequencing output rather than only the part that was resolved.
+    /// Total single-copy tags this cluster carries.
     pub n_markers: usize,
-    /// Relative abundance, normalized over whatever set the caller passed to
-    /// [`normalize_by_depth`] (within one species DB after [`profile`]).
+    /// Relative abundance, normalized over whatever set the caller passed.
     pub rel_abundance: f64,
 }
 
-/// Fraction of a marker panel that is *reachable* at per-tag depth `lambda`.
-///
-/// Under Poisson(λ) sampling a marker is seen at least once with probability `1 − e^(−λ)`, so
-/// at λ = 0.1 only 10% of a panel can be detected no matter how good the method is. Gating
-/// breadth against a fixed constant therefore rejects genuinely present low-abundance strains;
-/// gating against `min_coverage × detectable_fraction(λ)` asks the answerable question
-/// ("did we see what was reachable?").
-#[inline]
-pub fn detectable_fraction(lambda: f64) -> f64 {
-    if lambda <= 0.0 {
-        0.0
-    } else {
-        1.0 - (-lambda).exp()
-    }
-}
-
-/// Minimum per-marker count for a marker to count as evidence, given estimated depth.
-///
-/// At high depth, `count == 1` is dominated by sequencing error and is filtered. At low depth
-/// the opposite holds: under Poisson(λ) the share of *detected* markers seen exactly once is
-/// `λ / (e^λ − 1)` — 78% at λ = 0.5 — so the fixed `count >= 2` rule discards most of the
-/// signal precisely where signal is scarce. Admitting singletons there costs little precision
-/// because sequencing errors generate essentially random tags, which almost never coincide
-/// with a *specific* cluster's unique-marker panel; the `min_support_markers` floor still
-/// requires many independent hits on that one panel.
-#[inline]
-pub fn min_count_for(lambda: f64) -> u32 {
-    if lambda >= SINGLETON_SAFE_DEPTH {
-        2
-    } else {
-        1
-    }
-}
-
-/// One pass of per-cluster statistics over a marker panel.
-#[derive(Debug, Clone, Copy, Default)]
-struct PanelStats {
-    /// Panel size (unique markers, or all markers when the cluster has no unique ones).
-    panel: usize,
-    /// Markers with count >= 1.
-    detected1: usize,
-    /// Markers with count >= 2.
-    detected2: usize,
-    /// Zero-inclusive trimmed mean count — the absolute depth estimate.
-    depth: f64,
-}
-
-/// Compute panel size, detected counts (>=1 and >=2), and zero-inclusive winsorized depth over an
-/// arbitrary marker set.
-///
-/// This is the single implementation of the depth estimator: mean count over the whole panel
-/// (zeros included), with the top 1% of *non-zero* observations winsorized down to the 99th
-/// percentile. Keeping it in one place removes the divergence risk between the flat unique-marker
-/// path ([`panel_stats`]) and the tree-descent path ([`set_evidence`]).
-fn marker_panel_evidence(markers: &[Marker], counts: &MarkerCounts) -> PanelStats {
-    let panel = markers.len();
-    if panel == 0 {
-        return PanelStats::default();
-    }
-
-    // One pass: count markers seen once / twice, and collect only the non-zero counts for the
-    // winsorized depth estimate. Avoiding a full sort on the whole panel is a noticeable win when
-    // `panel_stats` is called once per cluster.
-    let mut detected1 = 0usize;
-    let mut detected2 = 0usize;
-    let mut nonzero: Vec<u32> = Vec::new();
-    for &m in markers {
-        let c = counts.get(&m).copied().unwrap_or(0);
-        if c >= 1 {
-            detected1 += 1;
-            nonzero.push(c);
-        }
-        if c >= 2 {
-            detected2 += 1;
-        }
-    }
-
-    // Depth = mean count over the WHOLE panel (zeros included — they are the evidence that the
-    // strain is rare), with the top 1% of *non-zero* observations winsorized down to the 99th
-    // percentile so collapsed repeats and contamination cannot inflate it.
-    //
-    // The cap is the element at position `detected1 - detected1/100 - 1` in the ascending non-zero
-    // array. That leaves at most `detected1/100` non-zero observations strictly above it.
-    let depth = if detected1 == 0 {
-        0.0
-    } else {
-        let trim = detected1 / TRIM_FRACTION;
-        let cap = if trim == 0 {
-            *nonzero.iter().max().unwrap() as u64
-        } else {
-            let k = detected1 - trim - 1;
-            *nonzero.select_nth_unstable(k).1 as u64
-        };
-        let sum: u64 = nonzero.iter().map(|&c| (c as u64).min(cap)).sum();
-        sum as f64 / panel as f64
-    };
-
-    PanelStats {
-        panel,
-        detected1,
-        detected2,
-        depth,
-    }
-}
-
-/// Compute [`PanelStats`] over cluster `j`'s **unique** markers.
-///
-/// A cluster with no unique markers (e.g. one whose tag set is a subset of another cluster's)
-/// returns an empty panel and is therefore never called. That is deliberate: its every marker
-/// is also carried by a co-present relative, so any "evidence" for it is that relative's reads.
-/// Measuring it over the shared set instead would report it at the relative's depth, which is
-/// exactly the shared-marker cross-talk this module exists to avoid. [`strain_unique_coverage`]
-/// keeps a full-marker-set fallback, but only for *reporting* coverage of a cluster that has
-/// already been called.
-fn panel_stats(db: &StrainDb, counts: &MarkerCounts, j: usize) -> PanelStats {
-    marker_panel_evidence(db.unique_markers(j), counts)
-}
-
-/// Robust per-strain absolute depth: the **zero-inclusive** trimmed mean count over the
-/// strain's unique-marker panel.
-///
-/// The previous estimator took the median over *detected* markers only, which is severely
-/// biased at low abundance: a strain covered at 0.05× has a handful of markers at count 1, so
-/// its median is 1 — the same value a strain at 1× reports. Ratios between abundant and rare
-/// strains were compressed toward uniform, flattening the whole composition. Averaging over
-/// the full panel (zeros included) makes the estimate proportional to true depth; trimming the
-/// top 1% keeps the robustness the median was there to provide.
-pub fn unique_marker_depth(db: &StrainDb, counts: &MarkerCounts, j: usize) -> f64 {
-    panel_stats(db, counts, j).depth
-}
-
-/// Coverage = fraction of a strain's unique markers detected (count >= 1).
-pub fn strain_unique_coverage(db: &StrainDb, counts: &MarkerCounts, j: usize) -> f64 {
-    let st = panel_stats(db, counts, j);
-    if st.panel == 0 {
-        0.0
-    } else {
-        st.detected1 as f64 / st.panel as f64
-    }
-}
-
-/// Detect present clusters/strains by their **unique** markers only.
-///
-/// Returns `(cluster_index, supporting_marker_count)`.
-pub fn detect_present(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<(usize, f64)> {
-    let mut out = Vec::new();
-    for j in 0..db.n_strains() {
-        let st = panel_stats(db, counts, j);
-        let min_count = if p.adaptive_singleton {
-            min_count_for(st.depth)
-        } else {
-            2
-        };
-        let detected = if min_count >= 2 {
-            st.detected2
-        } else {
-            st.detected1
-        };
-        if detected >= p.min_support_markers {
-            out.push((j, detected as f64));
-        }
-    }
-    out
-}
-
 /// Set `rel_abundance` from absolute `depth` over the given set of calls.
-///
-/// Call this over **all** calls from all species to get a cross-species composition; call it
-/// over one species' calls for a within-species composition. `depth` is in reads-per-tag and
-/// single-copy tags are one per cell, so the resulting fractions are cell fractions.
 pub fn normalize_by_depth(calls: &mut [StrainCall]) {
     let sum: f64 = calls.iter().map(|c| c.depth).sum();
     if sum > 0.0 {
@@ -395,10 +117,6 @@ pub fn normalize_by_depth(calls: &mut [StrainCall]) {
             c.rel_abundance = c.depth / sum;
         }
     } else if !calls.is_empty() {
-        // No depth evidence at all: fall back to uniform rather than emitting a column of
-        // zeros, so the documented "sums to 1.0" contract holds for any input. `profile` never
-        // reaches this (a call needs detected markers, which implies depth > 0); it exists for
-        // external callers.
         let share = 1.0 / calls.len() as f64;
         for c in calls.iter_mut() {
             c.rel_abundance = share;
@@ -423,11 +141,6 @@ pub fn filter_by_abundance(calls: &mut Vec<StrainCall>, min_rel: f64) {
 }
 
 /// Drop the trace tail below the largest abundance gap.
-///
-/// A defined community separates from cross-library trace by orders of magnitude; a staggered
-/// community never separates from itself by more than its design ratio. Cutting at the largest
-/// log-gap (only when it exceeds `min_ratio`) removes the former without touching the latter.
-/// An absolute `floor` is applied after the gap cut.
 pub fn filter_by_trace_gap(calls: &mut Vec<StrainCall>, min_ratio: f64, floor: f64) {
     if min_ratio > 0.0 && calls.len() >= 2 {
         calls.sort_by(|a, b| {
@@ -454,19 +167,8 @@ pub fn filter_by_trace_gap(calls: &mut Vec<StrainCall>, min_ratio: f64, floor: f
 }
 
 /// Profile one species DB: detect present clusters, estimate absolute depth, gate, and
-/// normalize **within this DB** (`rel_abundance` sums to 1.0 across the returned calls).
-///
-/// Within-species is the scope Layer-2 answers for: given that this species is present, how is
-/// it split across strains/clusters? Species-level abundance belongs to the species layer
-/// (Fast2bRAD-M), not here.
-///
-/// To build a **cross-species** composition, do **not** concatenate these fractions — each
-/// species sums to 1.0 independently, so a 10x-more-abundant species looks identical to a rare
-/// one. Pool the calls and renormalize on the absolute [`StrainCall::depth`] instead, via
-/// [`normalize_by_depth`] (which is what `multi-profile`'s `global_abundance` column reports).
+/// normalize **within this DB**.
 pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCall> {
-    // Layer-1 selects the candidate clusters; Layer-2 quantifies them. The two are independent
-    // so each can be A/B'd against the flat path on its own.
     let mut calls: Vec<StrainCall> = match resolve_layer1(db, p) {
         Layer1::Auto | Layer1::Unique => profile_unique(db, counts, p),
         Layer1::Cst => match &db.tree {
@@ -474,9 +176,6 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
                 .into_iter()
                 .filter(|c| c.desc_leaves.iter().all(|&l| l < db.n_strains()))
                 .map(|c| {
-                    // An internal node is reported under the names of the leaves it spans, so a
-                    // strain resolved only to a clade reads as `C1|C3` rather than being silently
-                    // attributed to one of them.
                     let name = c
                         .desc_leaves
                         .iter()
@@ -501,33 +200,17 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
                     }
                 })
                 .collect(),
-            // A database built before the tree existed, or by `build` rather than `cluster`.
-            // Degrade to the flat path rather than silently returning nothing.
             None => profile_unique(db, counts, p),
         },
     };
 
     if p.layer2 == Layer2::Enet {
         let called: Vec<usize> = calls.iter().map(|c| c.strain_index).collect();
-        // Feed the joint fit the clusters Layer-1 structurally CANNOT see, not just the ones
-        // it already called. Without this the whole layer is unreachable: its candidates came
-        // from Layer-1, which skips any cluster with an empty unique panel — exactly the
-        // clusters the shared-marker matrix exists to resolve. See [`subset_candidates`].
         let extra = subset_candidates(db, counts, &called, p);
         let idx: Vec<usize> = called.iter().chain(extra.iter()).copied().collect();
         if idx.len() > 1 {
             let design = build_l2_design(db, &idx, counts);
             let mut selected = pre_scan(&design, 15, p.min_support_markers);
-            // The pre-scan cannot select a subset candidate, and must not be asked to. It ranks
-            // columns by how many *residual* markers they explain — breadth — and consumes the
-            // winner's markers unconditionally. A cluster contained in one already chosen adds
-            // no new markers by definition, so its residual score is 0 on the very next
-            // iteration and it can never be picked, at any threshold. What distinguishes it is
-            // not breadth but DEPTH: the rows it shares with its superset read `w_A + w_B`
-            // while the superset-only rows read `w_A`, and that gap is invisible to a
-            // marker-counting heuristic. So these columns bypass the pre-scan and go straight
-            // into the fit, where the non-negative solve is free to give them zero weight if
-            // the depths do not in fact call for them — which is the test that suits them.
             for col in called.len()..idx.len() {
                 if !selected.contains(&col) {
                     selected.push(col);
@@ -541,17 +224,10 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
                     .zip(w.iter())
                     .map(|(&col, &depth)| (design.clusters[col], depth))
                     .collect();
-                // Clusters the pre-scan dropped explained nothing beyond what the winners
-                // already account for; keep only the selected ones, at their fitted depths.
                 calls.retain(|c| fitted.contains_key(&c.strain_index));
                 for c in calls.iter_mut() {
                     c.depth = fitted[&c.strain_index];
                 }
-                // Admit a subset candidate only if the fit gives it real mass. It has no
-                // unique evidence of its own by construction, so every marker supporting it is
-                // also a co-present relative's — the fitted weight is the ONLY thing
-                // distinguishing "genuinely there" from "the relative's reads". A relative
-                // floor, because the absolute scale is the sample's depth.
                 for &j in &extra {
                     let Some(&depth) = fitted.get(&j) else {
                         continue;
@@ -560,17 +236,18 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
                         continue;
                     }
                     let ms: Vec<Marker> = db.strain_markers[j].iter().copied().collect();
-                    let (panel, detected, _) = set_evidence(&ms, counts);
-                    if panel == 0 {
+                    let ev = marker_panel_evidence(&ms, counts);
+                    if ev.panel == 0 {
                         continue;
                     }
+                    let support = support_count(&ev, p.adaptive_singleton);
                     calls.push(StrainCall {
                         strain_index: j,
                         name: db.strain_names[j].clone(),
-                        support: detected as f64,
-                        coverage: detected as f64 / panel as f64,
+                        support: support as f64,
+                        coverage: ev.detected1 as f64 / ev.panel as f64,
                         depth,
-                        n_markers: panel,
+                        n_markers: db.strain_markers[j].len(),
                         rel_abundance: 0.0,
                     });
                 }
@@ -585,64 +262,21 @@ pub fn profile(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCa
 }
 
 /// The flat Layer-1: score each cluster independently on its own unique markers.
-fn profile_unique(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCall> {
+pub fn profile_unique(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<StrainCall> {
     let mut calls: Vec<StrainCall> = Vec::new();
     for j in 0..db.n_strains() {
-        let st = panel_stats(db, counts, j);
+        let st = panel_stats_fn(db, counts, j);
         if st.panel == 0 {
             continue;
         }
-        let min_count = if p.adaptive_singleton {
-            min_count_for(st.depth)
-        } else {
-            2
-        };
-        let support = if min_count >= 2 {
-            st.detected2
-        } else {
-            st.detected1
-        };
+        let support = support_count(&st, p.adaptive_singleton);
         if support < p.min_support_markers {
             continue;
         }
-        // Coverage (breadth) is gated against an ABSOLUTE floor, deliberately.
-        //
-        // Scaling this gate by `detectable_fraction(depth)` is tempting but provably inert:
-        // depth is estimated from the same panel whose breadth is being tested, and when every
-        // observed count is 0 or 1 (any depth below ~0.5) `depth <= coverage` identically, so
-        // `min_coverage * (1 - e^-depth) < coverage` always holds and the gate can never fire —
-        // including for a cluster whose panel was hit only by scattered error tags. This floor
-        // is the precision guard that stops a large, sparsely-hit panel from being called;
-        // low-depth recall is bought with the singleton policy ([`min_count_for`]) and the
-        // Layer-1 species gate instead. Lower `--min-coverage` to trade precision for recall.
         let coverage = st.detected1 as f64 / st.panel as f64;
         if coverage < p.min_coverage {
             continue;
         }
-        // Depth–breadth consistency: reject a cluster whose markers are too DEEP for how FEW of
-        // them were seen.
-        //
-        // This is the test that removes "shadow" clusters — the dominant false positive on real
-        // panels. When the strain in the sample is not exactly any reference but sits between two
-        // clusters, it carries all of cluster A's distinguishing loci and a fraction `f` of
-        // cluster B's. Cluster B is then called on real reads at the *sample strain's* full
-        // depth, but on only `f` of its panel. No coverage floor can catch this: measured on a
-        // shadow scenario, B showed coverage 0.350 while a genuinely present B at 0.4x showed
-        // 0.392 — indistinguishable. What differs is depth, 7.68x versus 0.44x.
-        //
-        // Under Poisson sampling a genuinely present cluster at depth λ must show breadth
-        // `1 − e^(−λ)`. So `coverage / (1 − e^(−depth))` is ~1 for a real cluster at any depth,
-        // and ~`f` for a shadow (its depth is `f × D`, large enough that the expected breadth is
-        // ~1, while the observed breadth is only `f`). Swept on synthetic data: real clusters
-        // scored 0.949–1.018 across depths 0.3x–20x, shadows scored 0.200/0.300/0.495/0.691/0.897
-        // at f = 0.2/0.3/0.5/0.7/0.9. Real shadows carry small `f` — the S. epidermidis shadow in
-        // MSA-1005 sat at ~7% of its true strain's abundance — so the default leaves wide margin
-        // on both sides.
-        //
-        // Note the graceful degradation: as `f` → 1 a shadow becomes indistinguishable from a
-        // genuine call, which is correct, because a strain carrying all of B's distinguishing
-        // loci *is* evidence for B. The test is also inert below ~0.5x depth, where
-        // `coverage ≈ 1 − e^(−depth)` holds for any cluster; a rare strain is never penalized.
         let expected_breadth = detectable_fraction(st.depth);
         if expected_breadth > 0.0 && coverage / expected_breadth < p.min_consistency {
             continue;
@@ -660,66 +294,7 @@ fn profile_unique(db: &StrainDb, counts: &MarkerCounts, p: &Params) -> Vec<Strai
     calls
 }
 
-/// Non-negative Elastic Net via cyclic coordinate descent with residual maintenance.
-/// Minimizes ½‖Xw − y‖² + α·l1·n·‖w‖₁ + ½·α·(1−l1)·n·‖w‖²  s.t. w ≥ 0.
-///
-/// Not used by [`profile`] — see the module docs for why.
-pub fn nonneg_elastic_net(
-    cols: &[Vec<f64>],
-    y: &[f64],
-    alpha: f64,
-    l1_ratio: f64,
-    max_iter: usize,
-    tol: f64,
-) -> Vec<f64> {
-    let k = cols.len();
-    let n = y.len();
-    let mut w = vec![0.0; k];
-    if n == 0 || k == 0 {
-        return w;
-    }
-    let mut r = y.to_vec(); // residual = y − Xw (w starts at 0)
-    let col_sq: Vec<f64> = cols.iter().map(|c| c.iter().map(|v| v * v).sum()).collect();
-    let l1 = alpha * l1_ratio * n as f64;
-    let l2 = alpha * (1.0 - l1_ratio) * n as f64;
-
-    for _ in 0..max_iter {
-        let mut max_dw = 0.0_f64;
-        for j in 0..k {
-            if col_sq[j] == 0.0 {
-                continue;
-            }
-            // rho = X_j·r + col_sq_j·w_j
-            let mut rho = col_sq[j] * w[j];
-            for i in 0..n {
-                rho += cols[j][i] * r[i];
-            }
-            // Non-negative soft-threshold update.
-            let num = rho - l1;
-            let wj = if num > 0.0 {
-                num / (col_sq[j] + l2)
-            } else {
-                0.0
-            };
-            let dw = wj - w[j];
-            if dw != 0.0 {
-                for i in 0..n {
-                    r[i] -= dw * cols[j][i];
-                }
-                w[j] = wj;
-                max_dw = max_dw.max(dw.abs());
-            }
-        }
-        if max_dw < tol {
-            break;
-        }
-    }
-    w
-}
-
-/// Naive baseline that mimics `strainscan-rust`: score every strain on **all** its
-/// markers (shared included), accept any whose total exceeds a single global-ish
-/// threshold, no unique-marker covering. Used by the demo to show over-calling.
+/// Naive baseline that mimics `strainscan-rust`: score every strain on **all** its markers.
 pub fn naive_profile(db: &StrainDb, counts: &MarkerCounts, min_score: f64) -> Vec<usize> {
     let mut out = Vec::new();
     for j in 0..db.n_strains() {
@@ -805,15 +380,6 @@ mod tests {
         assert_eq!(naive.len(), 4, "naive should over-call all 4: {naive:?}");
     }
 
-    /// Regression: the abundance floor must not delete a correctly-estimated rare cluster.
-    ///
-    /// This is the interaction that collapsed recall on staggered mocks and high-host samples.
-    /// StrainScan's 0.02 floor was calibrated against a *biased* depth estimator (median over
-    /// detected markers, which pins a rare cluster near 1 read/tag regardless of how rare it is).
-    /// Once the bias is removed the same floor cuts far deeper: here the rare cluster's true
-    /// share is 1/(30+1) = 3.2%, and at a 30:0.5 depth ratio the correct answer is ~1.6% — which
-    /// 0.02 would discard. Fixing an estimator without recalibrating the thresholds tuned to its
-    /// bias is the failure mode this test exists to catch.
     #[test]
     fn abundance_floor_does_not_delete_correctly_estimated_rare_clusters() {
         let a: Vec<Marker> = (10_000..11_000).collect();
@@ -825,13 +391,12 @@ mod tests {
 
         let mut counts = MarkerCounts::default();
         for &m in &a {
-            counts.insert(m, 30); // 30x
+            counts.insert(m, 30);
         }
         for &m in b.iter().take(400) {
-            counts.insert(m, 1); // ~0.4x, 40% breadth
+            counts.insert(m, 1);
         }
 
-        // Default params must keep both.
         let calls = profile(&db, &counts, &Params::default());
         let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
         assert!(
@@ -846,7 +411,6 @@ mod tests {
             rare.rel_abundance
         );
 
-        // The old floor is still available, and still removes it — opt-in, not the default.
         let strict = Params {
             min_rel_abundance: 0.02,
             ..Params::default()
@@ -860,7 +424,6 @@ mod tests {
 
     #[test]
     fn trace_gap_cuts_between_community_and_trace_without_hurting_staggered_mocks() {
-        // Case 1: a defined community with a clear gap to trace contaminants.
         let mut defined = vec![
             StrainCall {
                 strain_index: 0,
@@ -889,7 +452,6 @@ mod tests {
                 n_markers: 100,
                 rel_abundance: 0.09,
             },
-            // trace tail, >100x below the smallest true member
             StrainCall {
                 strain_index: 3,
                 name: "trace1".into(),
@@ -917,9 +479,6 @@ mod tests {
             "defined community: gap should drop trace tail"
         );
 
-        // Case 2: a staggered mock whose rarest true member is only 2x below the next.
-        // The largest gap is smaller than the threshold, so no knee cut; the floor alone
-        // must be small enough to keep the rarest true member.
         let mut staggered = vec![
             StrainCall {
                 strain_index: 0,
@@ -966,7 +525,6 @@ mod tests {
             "staggered mock: no 10x gap, all members kept"
         );
 
-        // Case 3: gap threshold disabled -> no change.
         let mut disabled = vec![
             StrainCall {
                 strain_index: 0,
@@ -995,13 +553,6 @@ mod tests {
         );
     }
 
-    /// A shadow cluster and a genuinely present rare cluster have the **same breadth** and differ
-    /// only in depth, so only the depth–breadth consistency test can separate them.
-    ///
-    /// Shadow: the sample strain carries 30% of cluster B's distinguishing loci, so those markers
-    /// appear at the sample strain's full 20x while the other 70% are absent — depth 6.0, breadth
-    /// 0.30, and an expected breadth at that depth of ~1.0.
-    /// Genuine: cluster B present at 0.33x — depth 0.33, breadth 0.33, expected breadth 0.28.
     #[test]
     fn shadow_clusters_are_rejected_but_genuine_rare_ones_are_kept() {
         let a: Vec<Marker> = (10_000..11_000).collect();
@@ -1024,7 +575,6 @@ mod tests {
             ..Params::default()
         };
 
-        // --- shadow: 30% of B's panel at the true strain's depth
         let mut shadow = MarkerCounts::default();
         for &m in &a {
             shadow.insert(m, 20);
@@ -1042,12 +592,9 @@ mod tests {
             vec!["A"],
             "default must reject the shadow"
         );
-        // Removing the shadow also repairs the true strain's abundance, which the shadow was
-        // taking a 28% share of.
         let calls = profile(&db, &shadow, &default);
         assert!((calls[0].rel_abundance - 1.0).abs() < 1e-9);
 
-        // --- genuine: B present at ~0.33x, i.e. the SAME breadth as the shadow
         let mut genuine = MarkerCounts::default();
         for &m in &a {
             genuine.insert(m, 20);
@@ -1064,17 +611,6 @@ mod tests {
         );
     }
 
-    /// **The reason the tree exists.** A leaf with too few markers of its own is invisible to the
-    /// flat unique-marker algorithm, but the tree can accept it by pooling the markers of every
-    /// ancestor whose sibling branch was never entered.
-    ///
-    /// Layout: 4 genomes forming ((A,B),(C,D)). A carries only 5 markers no one else has — below
-    /// `min_support_markers` — but the A/B ancestor has 100 group-specific markers, and the root
-    /// has 200 species-core markers. The sample contains A alone.
-    ///
-    /// Flat algorithm: A's own panel is 5 < 10, so A is never called.
-    /// Tree: B and C/D are ruled out on their own sets, so nothing was entered on either sibling
-    /// branch and A pools 5 + 100 + 200 = 305 markers, all observed.
     #[test]
     fn tree_pooling_recovers_a_leaf_the_flat_algorithm_misses() {
         use crate::cst::SpeciesCst;
@@ -1087,7 +623,7 @@ mod tests {
             v.extend(uniq);
             v
         };
-        let ga = mk(&ab, 1000..1005); // only 5 exclusive markers
+        let ga = mk(&ab, 1000..1005);
         let gb = mk(&ab, 1100..1200);
         let gc = mk(&cd, 1200..1300);
         let gd = mk(&cd, 1300..1400);
@@ -1099,13 +635,11 @@ mod tests {
         let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
         assert_eq!(cst.n_clusters(), 4, "each genome should be its own cluster");
 
-        // Sample: strain A only, at 20x.
         let mut counts = MarkerCounts::default();
         for &m in &ga {
             counts.insert(m, 20);
         }
 
-        // --- flat algorithm: A has 5 unique markers, below the support floor -> missed
         let db = cst.cluster_db();
         let p = Params {
             min_rel_abundance: 0.0,
@@ -1120,7 +654,6 @@ mod tests {
             "flat algorithm should miss the sparse leaf, got {flat:?}"
         );
 
-        // --- tree: pools ancestors whose siblings were never entered
         let tree = cst.build_tree();
         let calls = descend_tree(&tree, &counts, &p);
         assert_eq!(
@@ -1147,8 +680,6 @@ mod tests {
         assert!((call.depth - 20.0).abs() < 0.5, "depth {}", call.depth);
     }
 
-    /// Pooling must STOP once a sibling branch is entered: at that point the ancestor's markers
-    /// are shared between both branches and attributing them to one would double-count.
     #[test]
     fn tree_pooling_stops_when_the_sibling_branch_is_entered() {
         use crate::cst::SpeciesCst;
@@ -1173,7 +704,6 @@ mod tests {
         let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
         let tree = cst.build_tree();
 
-        // BOTH A and B present -> the A/B ancestor is entered from both sides.
         let mut counts = MarkerCounts::default();
         for &m in ga.iter().chain(gb.iter()) {
             counts.insert(m, 20);
@@ -1195,16 +725,10 @@ mod tests {
         }
     }
 
-    /// **The reason Layer-2 exists.** A cluster that is a strict subset of another has NO unique
-    /// markers, so the flat algorithm cannot see it at all — `panel == 0` and it is skipped.
-    /// The joint fit over shared markers recovers it exactly: the markers A and B share observe
-    /// `w_A + w_B`, the ones only A carries observe `w_A`, and the two together give `w_B`.
-    ///
-    /// Sample: A at 10x and B at 5x, B's marker set a strict subset of A's.
     #[test]
     fn joint_fit_recovers_a_subset_cluster_the_flat_path_cannot_see() {
         let a: Vec<Marker> = (10_000..11_000).collect();
-        let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
+        let b: Vec<Marker> = (10_000..10_500).collect();
         let db = StrainDb::build(vec![
             ("A".into(), a.clone()),
             ("B_subset".into(), b.clone()),
@@ -1217,11 +741,9 @@ mod tests {
 
         let mut counts = MarkerCounts::default();
         for &m in &a {
-            // shared rows see both strains; A-only rows see A alone
             counts.insert(m, if b.contains(&m) { 15 } else { 10 });
         }
 
-        // Flat path: B is invisible.
         let p = Params {
             min_rel_abundance: 0.0,
             ..Params::default()
@@ -1236,7 +758,6 @@ mod tests {
             "flat path cannot see the subset cluster"
         );
 
-        // Joint fit: both recovered, at the right depths.
         let design = build_l2_design(&db, &[0, 1], &counts);
         assert!(
             design.shared_fraction() > 0.4,
@@ -1248,17 +769,10 @@ mod tests {
         assert!((w[1] - 5.0).abs() < 0.05, "w_B = {} should be 5", w[1]);
     }
 
-    /// The same case as above, but through `profile()` — which is what the CLI actually calls.
-    ///
-    /// This is the test that was missing. `joint_fit_recovers_a_subset_cluster_the_flat_path_
-    /// cannot_see` hands `build_l2_design` the candidate list `[0, 1]` directly, so it proves
-    /// the maths while stepping over the wiring. Through `profile()` the list was always just
-    /// the clusters Layer-1 called, and Layer-1 skips an empty unique panel, so B never
-    /// reached the fit and `--layer2 enet` could not do the one thing it exists for.
     #[test]
     fn enet_reaches_the_subset_cluster_through_profile() {
         let a: Vec<Marker> = (10_000..11_000).collect();
-        let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
+        let b: Vec<Marker> = (10_000..10_500).collect();
         let db = StrainDb::build(vec![
             ("A".into(), a.clone()),
             ("B_subset".into(), b.clone()),
@@ -1299,7 +813,6 @@ mod tests {
             names.contains(&"B_subset"),
             "enet must now reach the subset cluster through profile(), got {names:?}"
         );
-        // w_A = 10, w_B = 5 -> B is a third of the fitted total.
         let b_call = calls.iter().find(|c| c.name == "B_subset").unwrap();
         assert!(
             (b_call.rel_abundance - 1.0 / 3.0).abs() < 0.05,
@@ -1308,14 +821,11 @@ mod tests {
         );
     }
 
-    /// A cluster with no unique markers that is NOT contained in what was called must stay out:
-    /// its own distinguishing markers went unobserved, and that is evidence of absence rather
-    /// than ambiguity for the fit to resolve.
     #[test]
     fn subset_candidates_reject_an_uncontained_cluster() {
         let a: Vec<Marker> = (10_000..11_000).collect();
         let mut c: Vec<Marker> = (10_000..10_400).collect();
-        c.extend(90_000..90_600); // 60% of C lies outside A
+        c.extend(90_000..90_600);
         let db = StrainDb::build(vec![("A".into(), a.clone()), ("C".into(), c)]);
 
         let mut counts = MarkerCounts::default();
@@ -1332,14 +842,10 @@ mod tests {
         );
     }
 
-    /// The pre-scan must consume the winner's markers so a near-duplicate cluster is not selected
-    /// on the same evidence. With unique-only markers this loop is a no-op — the sets are
-    /// disjoint, so consuming one leaves the others untouched — which is why it only becomes
-    /// meaningful once shared markers are in the matrix.
     #[test]
     fn pre_scan_consumes_the_winners_markers() {
         let a: Vec<Marker> = (10_000..11_000).collect();
-        let dup: Vec<Marker> = (10_000..10_990).collect(); // 99% the same as A
+        let dup: Vec<Marker> = (10_000..10_990).collect();
         let far: Vec<Marker> = (20_000..21_000).collect();
         let db = StrainDb::build(vec![
             ("A".into(), a.clone()),
@@ -1348,7 +854,7 @@ mod tests {
         ]);
         let mut counts = MarkerCounts::default();
         for &m in &a {
-            counts.insert(m, 20); // only A is present
+            counts.insert(m, 20);
         }
 
         let design = build_l2_design(&db, &[0, 1, 2], &counts);
@@ -1365,12 +871,6 @@ mod tests {
         assert!(!chosen.contains(&2), "the absent cluster explains nothing");
     }
 
-    /// A strain sitting BETWEEN two clusters must resolve to their shared ancestor, not vanish
-    /// and not be attributed to one of them.
-    ///
-    /// The sample strain carries the whole A/B clade's group-specific markers but only a third of
-    /// either leaf's distinguishing set, so neither child fires. Before internal-node reporting
-    /// the descent dropped the subtree and returned nothing at all — losing a real organism.
     #[test]
     fn intermediate_strain_resolves_to_the_clade_not_to_nothing() {
         use crate::cst::SpeciesCst;
@@ -1395,7 +895,6 @@ mod tests {
         let cst = SpeciesCst::build(genomes, crate::cst::DEFAULT_SIMILARITY, false);
         let tree = cst.build_tree();
 
-        // A strain between A and B: all of the clade's markers, a third of each leaf's.
         let mut counts = MarkerCounts::default();
         for &m in core.iter().chain(ab.iter()) {
             counts.insert(m, 20);
@@ -1428,7 +927,6 @@ mod tests {
             "the clade spanned must be exactly A and B"
         );
 
-        // And it surfaces through profile() under both leaf names rather than one of them.
         let mut db = cst.cluster_db();
         db.tree = Some(tree);
         let named: Vec<String> = profile(
@@ -1461,13 +959,6 @@ mod tests {
         assert!(profile(&db, &counts, &Params::default()).is_empty());
     }
 
-    /// The depth estimator must not compress the abundance ratio between an abundant and a
-    /// rare cluster. Cluster A is at 20 reads/tag (full breadth); cluster B is at 0.3
-    /// reads/tag, so 30% of its panel is seen, each exactly once.
-    ///
-    /// Truth: A = 20/20.3 = 98.5%, B = 0.3/20.3 = 1.48%.
-    /// Median-over-detected (the old estimator) reports A = 20, B = 1 → 95.2% / 4.8%, i.e. it
-    /// over-states the rare cluster by >3x. The zero-inclusive mean must recover ~1.5%.
     #[test]
     fn depth_estimator_does_not_flatten_rare_clusters() {
         let a: Vec<Marker> = (10_000..11_000).collect();
@@ -1495,15 +986,11 @@ mod tests {
         assert!((dbc.depth - 0.3).abs() < 1e-9, "B depth {}", dbc.depth);
         assert!(
             (dbc.rel_abundance - 0.3 / 20.3).abs() < 1e-6,
-            "B abundance {} should be ~1.5%, not the ~4.8% the median estimator gave",
+            "B abundance {} should be ~1.5%",
             dbc.rel_abundance
         );
     }
 
-    /// The outlier guard must **winsorize the top 1% of non-zero observations**, not discard
-    /// `panel/100` entries outright. Discarding deletes genuine signal once breadth drops below
-    /// ~10% and drives depth to exactly 0 at breadth <= 1% — the opposite of this estimator's
-    /// purpose, and invisible unless the test uses a sparse panel.
     #[test]
     fn sparse_panels_are_not_trimmed_into_underestimates() {
         let panel: Vec<Marker> = (10_000..11_000).collect();
@@ -1522,7 +1009,6 @@ mod tests {
         }
     }
 
-    /// Winsorizing must still neutralize a collapsed-repeat outlier.
     #[test]
     fn repeat_outliers_do_not_inflate_depth() {
         let panel: Vec<Marker> = (10_000..11_000).collect();
@@ -1531,19 +1017,15 @@ mod tests {
         for &m in &panel {
             counts.insert(m, 20);
         }
-        counts.insert(panel[0], 5_000); // one collapsed repeat
+        counts.insert(panel[0], 5_000);
         let got = unique_marker_depth(&db, &counts, 0);
         assert!((got - 20.0).abs() < 1e-9, "depth {got} should stay 20.0");
     }
 
-    /// A cluster whose markers are all shared with another cluster has NO unique markers, so it
-    /// must never be called: every read supporting it is equally explained by its relative.
-    /// Measuring such a cluster over the shared panel reports it at the relative's depth and
-    /// invents a phantom 50% call — the shared-marker cross-talk this module exists to prevent.
     #[test]
     fn cluster_with_no_unique_markers_is_never_called() {
         let a: Vec<Marker> = (10_000..11_000).collect();
-        let b: Vec<Marker> = (10_000..10_500).collect(); // strict subset of A
+        let b: Vec<Marker> = (10_000..10_500).collect();
         let db = StrainDb::build(vec![("A".into(), a.clone()), ("B_subset".into(), b)]);
         assert_eq!(
             db.unique_marker_count(1),
@@ -1553,7 +1035,7 @@ mod tests {
 
         let mut counts = MarkerCounts::default();
         for &m in &a {
-            counts.insert(m, 20); // only strain A is actually present
+            counts.insert(m, 20);
         }
         let p = Params {
             min_rel_abundance: 0.0,
@@ -1569,16 +1051,13 @@ mod tests {
         assert!((calls[0].rel_abundance - 1.0).abs() < 1e-9);
     }
 
-    /// The coverage floor is the precision guard against a large panel hit sparsely by stray
-    /// tags. It must stay absolute: scaling it by `detectable_fraction(depth)` is inert, because
-    /// depth <= coverage whenever every count is 0 or 1, so the gate can never fire.
     #[test]
     fn sparsely_hit_large_panel_is_rejected_by_the_coverage_floor() {
-        let panel: Vec<Marker> = (10_000..60_000).collect(); // 50k markers
+        let panel: Vec<Marker> = (10_000..60_000).collect();
         let db = StrainDb::build(vec![("GHOST".into(), panel.clone())]);
         let mut counts = MarkerCounts::default();
         for &m in panel.iter().take(1_500) {
-            counts.insert(m, 1); // 3% breadth of scattered singletons
+            counts.insert(m, 1);
         }
         let calls = profile(&db, &counts, &Params::default());
         assert!(
@@ -1587,8 +1066,6 @@ mod tests {
         );
     }
 
-    /// A cluster at depth 0.3 has essentially no markers at count >= 2, so the fixed
-    /// singleton filter makes it undetectable. Adaptive gating must recover it.
     #[test]
     fn adaptive_gating_recovers_low_depth_clusters() {
         let a: Vec<Marker> = (10_000..11_000).collect();
@@ -1625,8 +1102,6 @@ mod tests {
         assert_eq!(profile(&db, &counts, &adaptive).len(), 2);
     }
 
-    /// Cross-species normalization: two species DBs at 10x different depth must keep that 10x
-    /// once pooled — the regression that made every species sum to 1.0 independently.
     #[test]
     fn pooled_calls_preserve_cross_species_ratio() {
         let mk = |base: Marker| -> Vec<Marker> { (base..base + 500).collect() };
@@ -1656,7 +1131,6 @@ mod tests {
         normalize_by_depth(&mut pooled);
 
         let get = |n: &str| pooled.iter().find(|c| c.name == n).unwrap().rel_abundance;
-        // depths 40:20:4:2 → 60.6% : 30.3% : 6.1% : 3.0%
         assert!((get("A0") - 40.0 / 66.0).abs() < 1e-6);
         assert!((get("B1") - 2.0 / 66.0).abs() < 1e-6);
         let species_a: f64 = get("A0") + get("A1");
@@ -1667,15 +1141,6 @@ mod tests {
         );
     }
 
-    /// The `auto` rule's truth table, exhaustively. It is a pure function of three counts, and
-    /// it decides which ALGORITHM runs — the highest-leverage branch in the profiler — so it is
-    /// worth pinning outright rather than inferring from end-to-end runs.
-    ///
-    /// The two disjuncts encode the two distinct ways a tree can change an outcome:
-    ///   - pooling rescues a cluster whose own unique markers fall below the support floor,
-    ///     which needs both something to rescue AND an ancestor with markers to lend; and
-    ///   - a clade fallback catches a strain sitting between two informative children, which
-    ///     needs neither of those.
     #[test]
     fn auto_descends_only_when_the_tree_can_change_an_outcome() {
         let u = |rescuable, informative_nodes, fallback_nodes| TreeUtility {
@@ -1683,20 +1148,14 @@ mod tests {
             informative_nodes,
             fallback_nodes,
         };
-        // Pooling: needs a cluster to rescue *and* an ancestor able to lend.
         assert!(u(1, 1, 0).worth_descending());
         assert!(!u(1, 0, 0).worth_descending(), "nothing to pool from");
         assert!(!u(0, 1, 0).worth_descending(), "nothing to rescue");
-        // Clade fallback stands on its own — this is the case the rule originally missed, and
-        // it is why the flat path lost whole species that the tree recovered.
         assert!(u(0, 0, 1).worth_descending());
         assert!(u(0, 5, 2).worth_descending());
-        // Nothing at all.
         assert!(!u(0, 0, 0).worth_descending());
     }
 
-    /// A database with no tree must resolve to the flat path, not to nothing. Databases written
-    /// by `build`, or before trees were persisted, carry no tree at all.
     #[test]
     fn auto_falls_back_to_unique_without_a_tree() {
         let db = StrainDb::build(vec![
@@ -1708,7 +1167,6 @@ mod tests {
         assert_eq!(resolve_layer1(&db, &Params::default()), Layer1::Unique);
     }
 
-    /// An explicit `--layer1` must survive untouched: `auto` is a default, not an override.
     #[test]
     fn explicit_layer1_is_not_second_guessed_by_auto() {
         let db = StrainDb::build(vec![("A".into(), (0..500).collect::<Vec<Marker>>())]);
@@ -1721,9 +1179,6 @@ mod tests {
         }
     }
 
-    /// `rescuable` counts clusters against the support floor it is given, and reads the same
-    /// marker set the descent will score on. Getting this wrong in either direction silently
-    /// mis-routes every sample.
     #[test]
     fn tree_utility_counts_rescuable_against_the_support_floor() {
         use crate::cst::{SpeciesCst, DEFAULT_SIMILARITY};
@@ -1731,8 +1186,6 @@ mod tests {
         let genomes: Vec<(String, Vec<Marker>, Vec<Marker>)> = (0..4u64)
             .map(|i| {
                 let mut v = core.clone();
-                // g0 gets 3 private markers, the rest get 100 — so exactly one cluster sits
-                // below a floor between 4 and 100.
                 let n = if i == 0 { 3 } else { 100 };
                 v.extend(1000 + i * 1000..1000 + i * 1000 + n);
                 (format!("g{i}"), v.clone(), v)
@@ -1742,7 +1195,6 @@ mod tests {
         let mut db = cst.cluster_db();
         db.tree = Some(cst.build_tree());
 
-        // Unique-marker counts are 3 (g0) and 100 (g1..g3), one cluster each.
         assert_eq!(db.n_strains(), 4, "each genome should form its own cluster");
         assert_eq!(
             tree_utility(&db, 2).expect("tree present").rescuable,
@@ -1771,646 +1223,4 @@ mod tests {
             "w={w:?}"
         );
     }
-}
-
-// ===== Layer-1: Cluster Search Tree descent (StrainScan port) ==============
-
-use crate::cst::Cst;
-
-/// Minimum markers for a node's own set to be worth testing — and, crucially, to be trusted to
-/// rule its whole subtree OUT.
-///
-/// This must sit well ABOVE `min_support_markers`, not on the same scale as it. A node is
-/// allowed to veto its subtree when it is "informative", but it only fires when
-/// `support >= min_support_markers`. Set the two equal and a node holding exactly that many
-/// markers is trusted to prune while being unable to fire unless every single marker is seen at
-/// count >= 2 — one Poisson dropout and a present subtree is silently cut, with no escape
-/// hatch, because `informative` is true so the "cannot be tested, descend anyway" branch does
-/// not apply. Measured on the C. acnes panel: a node with 10 markers, 9 detected, coverage 0.90
-/// at depth 4.7x — overwhelming evidence of presence — failed by one marker and cut the 331-leaf
-/// subtree holding the answer.
-///
-/// Several times the support floor leaves room for dropout: against a floor of 8 a 30-marker
-/// node still clears it with nearly three quarters of its panel missing. Nodes below this are
-/// treated as untestable and the descent enters them, which costs work but cannot lose a true
-/// subtree. Keep this comfortably above `min_support_markers` if that floor is ever retuned.
-pub const MIN_NODE_MARKERS: usize = 30;
-
-/// Widest clade the internal-node fallback may report. Beyond this the call names so many
-/// clusters that it carries no strain-level information; reporting nothing is more honest and
-/// costs a false positive less.
-pub const MAX_FALLBACK_CLADE: usize = 8;
-
-/// What the tree stored in a database can actually do for it.
-///
-/// All numbers are read off the database, so the question `diagnose-tree` answers by hand
-/// before a run is answered automatically at profile time instead.
-#[derive(Debug, Clone, Copy)]
-pub struct TreeUtility {
-    /// Clusters whose own unique markers fall below the support floor. The flat path cannot
-    /// call these at all, so they are the ONLY clusters an ancestor's pooled markers can
-    /// rescue — if this is zero the descent reaches exactly the leaves the flat path does.
-    pub rescuable: usize,
-    /// Internal nodes carrying enough markers to be tested, i.e. to have anything to pool.
-    pub informative_nodes: usize,
-    /// Internal nodes where both children are themselves informative. These are the only
-    /// nodes that can produce a clade fallback call: a strain sitting between the two child
-    /// branches carries the parent's group-specific markers but too few of either child's.
-    pub fallback_nodes: usize,
-}
-
-impl TreeUtility {
-    /// Whether the tree is worth descending. Two independent reasons:
-    /// 1. Unique-path pooling can rescue clusters with too few unique markers of their own.
-    /// 2. A clade fallback can resolve an intermediate strain when both child branches are
-    ///    informative enough to be tested but neither fires on its own.
-    ///
-    /// On a dense panel the informative-node count can fail while fallback still helps, because
-    /// the parent's markers are group-specific even when the children's unique cores are small.
-    pub fn worth_descending(&self) -> bool {
-        (self.rescuable > 0 && self.informative_nodes > 0) || self.fallback_nodes > 0
-    }
-}
-
-/// Measure what the stored tree can do. `None` when the database carries no tree (built by
-/// `build` rather than `cluster`, or written before trees were persisted).
-pub fn tree_utility(db: &StrainDb, support_floor: usize) -> Option<TreeUtility> {
-    let tree = db.tree.as_ref()?;
-    let rescuable = (0..db.n_strains())
-        .filter(|&j| db.unique_marker_count(j) < support_floor)
-        .count();
-    // Count against the SAME marker set the descent will score on. Under `multi-profile` the
-    // database carries a cross-species mask, and a node whose markers are mostly shared with a
-    // congener has far less usable evidence than its raw set suggests — deciding on the raw
-    // count would enable the tree on nodes that cannot actually be tested.
-    let informative = |v: usize| {
-        tree.node_markers[v]
-            .iter()
-            .filter(|&&m| db.is_quantifiable(m))
-            .count()
-            >= MIN_NODE_MARKERS
-    };
-    let informative_nodes = (0..tree.n_nodes())
-        .filter(|&v| !tree.is_leaf(v) && informative(v))
-        .count();
-    let fallback_nodes = (0..tree.n_nodes())
-        .filter(|&v| {
-            !tree.is_leaf(v)
-                && informative(v)
-                && tree.children[v].is_some_and(|(a, b)| informative(a) && informative(b))
-        })
-        .count();
-    Some(TreeUtility {
-        rescuable,
-        informative_nodes,
-        fallback_nodes,
-    })
-}
-
-/// Resolve [`Layer1::Auto`] against the database. Explicit choices pass through untouched.
-pub fn resolve_layer1(db: &StrainDb, p: &Params) -> Layer1 {
-    match p.layer1 {
-        Layer1::Auto => match tree_utility(db, p.min_support_markers) {
-            Some(u) if u.worth_descending() => Layer1::Cst,
-            _ => Layer1::Unique,
-        },
-        explicit => explicit,
-    }
-}
-
-/// One leaf accepted by the tree descent.
-#[derive(Debug, Clone)]
-pub struct TreeCall {
-    /// The node the descent resolved to. Usually a leaf, but an **internal** node when the
-    /// strain in the sample sits between two clusters: see [`descend_tree`].
-    pub node: usize,
-    /// Leaf ids beneath `node` — one element when `node` is itself a leaf.
-    pub desc_leaves: Vec<usize>,
-    /// Markers pooled along the unique path (the leaf's own plus attributable ancestors').
-    pub panel: usize,
-    pub detected: usize,
-    pub coverage: f64,
-    pub depth: f64,
-    /// Nodes whose markers were pooled — leaf first, then ancestors.
-    pub path: Vec<usize>,
-}
-
-/// Evidence for one marker set.
-fn set_evidence(markers: &[Marker], counts: &MarkerCounts) -> (usize, usize, f64) {
-    let ev = marker_panel_evidence(markers, counts);
-    (ev.panel, ev.detected1, ev.depth)
-}
-
-/// Descend the Cluster Search Tree, returning the leaves it accepts.
-///
-/// Two mechanisms matter, and they are the entire reason to build a tree:
-///
-/// **Pruning.** A node whose own marker set is informative but unobserved rules out its whole
-/// subtree in one test, instead of scoring every leaf independently.
-///
-/// **Unique-path pooling.** A leaf is accepted on the union of its own markers *and* those of
-/// every ancestor whose sibling branch was never entered. If the descent went left at a node and
-/// never right, that node's group-specific markers are attributable to the left subtree, so a
-/// leaf with too few markers of its own can borrow them. This is what the flat unique-marker
-/// algorithm has no way to do: it sees only the leaf's own set and calls the leaf undetectable.
-/// Once a sibling *is* entered, the ancestor's markers become ambiguous between the two branches
-/// and pooling stops there.
-/// Descend the tree with no cross-species restriction. See [`descend_tree_masked`].
-pub fn descend_tree(cst: &Cst, counts: &MarkerCounts, p: &Params) -> Vec<TreeCall> {
-    let node_markers: Vec<Vec<Marker>> = cst
-        .node_markers
-        .iter()
-        .map(|set| set.iter().copied().collect())
-        .collect();
-    descend_tree_inner(cst, counts, p, &node_markers)
-}
-
-/// The tree descent, honouring `multi-profile`'s cross-species marker restriction.
-///
-/// `masked_nodes`, when provided, holds the pre-filtered marker set for every CST node (built
-/// once by [`StrainDb::restrict_to`] from the DB's `quant_mask`). Using the precomputed slices
-/// removes the per-node allocation that the old on-the-fly filter introduced.
-pub fn descend_tree_masked(
-    cst: &Cst,
-    counts: &MarkerCounts,
-    p: &Params,
-    masked_nodes: Option<&[Vec<Marker>]>,
-) -> Vec<TreeCall> {
-    let owned: Vec<Vec<Marker>>;
-    let node_markers: &[Vec<Marker>] = match masked_nodes {
-        Some(nodes) => nodes,
-        None => {
-            owned = cst
-                .node_markers
-                .iter()
-                .map(|set| set.iter().copied().collect())
-                .collect();
-            &owned
-        }
-    };
-    descend_tree_inner(cst, counts, p, node_markers)
-}
-
-fn descend_tree_inner(
-    cst: &Cst,
-    counts: &MarkerCounts,
-    p: &Params,
-    node_markers: &[Vec<Marker>],
-) -> Vec<TreeCall> {
-    if cst.n_leaves() == 0 {
-        return Vec::new();
-    }
-    if cst.n_leaves() == 1 {
-        // Degenerate tree: the single leaf is the root; test it directly.
-        let ms = &node_markers[0];
-        let (panel, detected, depth) = set_evidence(ms, counts);
-        if panel > 0 && detected >= p.min_support_markers {
-            let coverage = detected as f64 / panel as f64;
-            if coverage >= p.min_coverage {
-                return vec![TreeCall {
-                    node: 0,
-                    desc_leaves: vec![0],
-                    panel,
-                    detected,
-                    coverage,
-                    depth,
-                    path: vec![0],
-                }];
-            }
-        }
-        return Vec::new();
-    }
-
-    // A node "fires" when its own marker set is informative AND observed.
-    let fires = |v: usize| -> bool {
-        let ms = &node_markers[v];
-        if ms.len() < MIN_NODE_MARKERS {
-            return false; // uninformative: cannot rule the subtree in or out
-        }
-        let (panel, detected, depth) = set_evidence(ms, counts);
-        let min_count = if p.adaptive_singleton {
-            min_count_for(depth)
-        } else {
-            2
-        };
-        let support = if min_count >= 2 {
-            ms.iter()
-                .filter(|&&m| counts.get(&m).copied().unwrap_or(0) >= 2)
-                .count()
-        } else {
-            detected
-        };
-        support >= p.min_support_markers && (detected as f64 / panel as f64) >= p.min_coverage
-    };
-    let informative = |v: usize| node_markers[v].len() >= MIN_NODE_MARKERS;
-
-    // Descend, recording which nodes were entered.
-    let mut entered: Vec<bool> = vec![false; cst.n_nodes()];
-    let mut reached: Vec<usize> = Vec::new();
-    let mut stack = vec![cst.root];
-    entered[cst.root] = true;
-    while let Some(v) = stack.pop() {
-        if cst.is_leaf(v) {
-            reached.push(v);
-            continue;
-        }
-        let (a, b) = cst.children[v].expect("internal node has children");
-        let mut descended = false;
-        for c in [a, b] {
-            // Enter a child if it has its own evidence, or if it cannot be tested at all.
-            // An uninformative child is not evidence of absence, so we descend and let a
-            // deeper node decide.
-            if !informative(c) || fires(c) {
-                entered[c] = true;
-                stack.push(c);
-                descended = true;
-            }
-        }
-        if !descended {
-            // `v` fired but neither child does: a strain between the two clusters, carrying
-            // `v`'s group-specific markers and too little of either child's.
-            reached.push(v);
-        }
-    }
-
-    // Accept reached nodes on pooled evidence along the unique path.
-    let mut out: Vec<TreeCall> = Vec::new();
-    let mut rejected: Vec<usize> = Vec::new();
-    for &node in &reached {
-        let mut path = vec![node];
-        let mut pooled: Vec<Marker> = node_markers[node].clone();
-        let mut v = node;
-        while let Some(par) = cst.parent[v] {
-            match cst.sibling(v) {
-                // The sibling branch was never entered, so this ancestor's group-specific
-                // markers belong to our side and can be pooled.
-                Some(s) if !entered[s] => {
-                    pooled.extend(node_markers[par].iter().copied());
-                    path.push(par);
-                    v = par;
-                }
-                // Sibling entered: the ancestor's markers are shared between both branches and
-                // attributing them here would double-count. Stop.
-                _ => break,
-            }
-        }
-        let (panel, detected, depth) = set_evidence(&pooled, counts);
-        if panel == 0 {
-            continue;
-        }
-        let min_count = if p.adaptive_singleton {
-            min_count_for(depth)
-        } else {
-            2
-        };
-        let support = if min_count >= 2 {
-            pooled
-                .iter()
-                .filter(|m| counts.get(m).copied().unwrap_or(0) >= 2)
-                .count()
-        } else {
-            detected
-        };
-        if support < p.min_support_markers {
-            rejected.push(node);
-            continue;
-        }
-        let coverage = detected as f64 / panel as f64;
-        if coverage < p.min_coverage {
-            rejected.push(node);
-            continue;
-        }
-        let expected = detectable_fraction(depth);
-        if expected > 0.0 && coverage / expected < p.min_consistency {
-            rejected.push(node);
-            continue;
-        }
-        out.push(TreeCall {
-            node,
-            desc_leaves: cst.desc_leaves[node].clone(),
-            panel,
-            detected,
-            coverage,
-            depth,
-            path,
-        });
-    }
-
-    // Fall back to the clade when an entire subtree was rejected.
-    //
-    // A strain that sits between two clusters fires both of them on the fraction of each one's
-    // distinguishing markers it happens to carry — and the depth-breadth consistency test then
-    // correctly rejects both as shadows, because the markers seen are far deeper than their
-    // breadth allows. Correct, but on its own it loses a real organism: the reads exist and the
-    // ancestor's group-specific markers are fully covered.
-    //
-    // So for each rejected node, walk up to the deepest ancestor that (a) has an informative
-    // marker set of its own, (b) passes the gates on it, and (c) has no accepted descendant, and
-    // report that instead. This is the resolution the data actually supports — StrainScan reports
-    // the internal node for the same reason — and it is strictly better than the two
-    // alternatives, which are to invent two strains or to report nothing.
-    if !rejected.is_empty() {
-        let accepted_under = |v: usize, out: &[TreeCall]| -> bool {
-            out.iter()
-                .any(|c| cst.desc_leaves[v].contains(&cst.desc_leaves[c.node][0]))
-        };
-        let mut added: Vec<usize> = Vec::new();
-        for &r in &rejected {
-            let mut v = r;
-            while let Some(par) = cst.parent[v] {
-                if accepted_under(par, &out) || added.contains(&par) {
-                    break;
-                }
-                // Stop climbing once the clade is too broad to be an answer.
-                //
-                // The fallback exists for a strain sitting BETWEEN two clusters, so the honest
-                // resolution is a clade of a few leaves. Nothing bounded the climb, so when a
-                // whole region of the tree was rejected it walked up to a near-root node whose
-                // panel is the species core — fully covered in any sample of that species, so it
-                // passes every gate — and reported it. On the C. acnes panel that produced a
-                // single call spanning 332 of 419 clusters: no strain resolution at all, and it
-                // counts as a false positive while masking the true clusters underneath. Above
-                // this width, report nothing and let the species layer say "present, not
-                // resolvable" — which is the truth.
-                if cst.desc_leaves[par].len() > MAX_FALLBACK_CLADE {
-                    break;
-                }
-                let ms = &node_markers[par];
-                if ms.len() >= MIN_NODE_MARKERS {
-                    let (panel, detected, depth) = set_evidence(ms, counts);
-                    let coverage = detected as f64 / panel as f64;
-                    let expected = detectable_fraction(depth);
-                    let consistent = expected <= 0.0 || coverage / expected >= p.min_consistency;
-                    if detected >= p.min_support_markers && coverage >= p.min_coverage && consistent
-                    {
-                        out.push(TreeCall {
-                            node: par,
-                            desc_leaves: cst.desc_leaves[par].clone(),
-                            panel,
-                            detected,
-                            coverage,
-                            depth,
-                            path: vec![par],
-                        });
-                        added.push(par);
-                        break;
-                    }
-                }
-                v = par;
-            }
-        }
-    }
-    out
-}
-
-// ===== Layer-2: shared-marker deconvolution (StrainScan port) ==============
-//
-// The flat algorithm scores each cluster on markers **no other cluster carries**, which on a
-// low-diversity species is a small minority of the panel. StrainScan instead fits all co-present
-// clusters jointly over the *shared* markers too: a marker carried by clusters {A,C} constrains
-// `w_A + w_C` against its observed count, which is information the unique-only path throws away.
-//
-// Three pieces, in StrainScan's order:
-//   1. `L2Design`      — the marker × cluster incidence matrix, shared markers included.
-//   2. `pre_scan`      — greedy selection by *residually* covered markers, consuming each
-//                        winner's markers so the next candidate is judged on what is left.
-//   3. `nonneg_elastic_net` — joint abundance over the selected columns.
-
-/// Marker × cluster incidence for one species' co-detected clusters.
-#[derive(Debug, Clone)]
-pub struct L2Design {
-    /// Row order: the markers used, each carried by 1..n of the candidate clusters.
-    pub markers: Vec<Marker>,
-    /// Column order: indices into the `StrainDb`.
-    pub clusters: Vec<usize>,
-    /// `cols[j][i] == 1.0` iff cluster `clusters[j]` carries `markers[i]`.
-    pub cols: Vec<Vec<f64>>,
-    /// Observed count per row.
-    pub y: Vec<f64>,
-}
-
-impl L2Design {
-    pub fn n_rows(&self) -> usize {
-        self.markers.len()
-    }
-    /// Fraction of rows carried by more than one candidate — the data the unique-only path
-    /// discards. If this is ~0 the clusters share nothing and a joint fit cannot beat
-    /// per-cluster means.
-    pub fn shared_fraction(&self) -> f64 {
-        if self.markers.is_empty() {
-            return 0.0;
-        }
-        let shared = (0..self.markers.len())
-            .filter(|&i| self.cols.iter().filter(|c| c[i] > 0.0).count() > 1)
-            .count();
-        shared as f64 / self.markers.len() as f64
-    }
-}
-
-/// Build the design matrix over `candidates` within one species database.
-///
-/// A marker enters as a row when at least one candidate carries it — **including** markers all
-/// of them carry.
-///
-/// This is a deliberate deviation from StrainScan, which drops the all-carried rows. It is right
-/// there and wrong here, because the two setups differ in what is already known. StrainScan's
-/// Layer-2 candidates are strains *within one cluster* whose total depth Layer-1 has already
-/// pinned down, so a row carried by every candidate adds no information about the split. Our
-/// candidates are co-detected *clusters* with no separately determined total, so those rows are
-/// the only thing constraining the sum: with A ⊃ B, the markers they share observe `w_A + w_B`
-/// and the ones only A carries observe `w_A`, and it takes both to recover `w_B`. Dropping them
-/// would break exactly the case this matrix exists for.
-/// Minimum share of the total fitted depth for a cluster with **no unique evidence** to be
-/// reported. Its every marker is also a co-present relative's, so the fitted weight is the only
-/// thing separating "genuinely present" from "the relative's reads leaking in"; a trace weight
-/// is the latter. Relative, because the absolute scale is the sample's depth.
-pub const MIN_SUBSET_SHARE: f64 = 0.02;
-
-/// Clusters that Layer-1 **structurally cannot see**, but that the shared-marker fit can resolve.
-///
-/// This function is what makes Layer-2 reachable at all. `profile_unique` skips any cluster
-/// whose unique panel is empty (`panel == 0`), and the tree descent skips it too — so the one
-/// case the joint fit was built for, a cluster whose markers are a subset of a co-present
-/// relative's, never reached it. The layer's own test proves the maths by handing
-/// `build_l2_design` the candidate list `[A, B]` directly; through `profile()` the list was
-/// always just `[A]`, and with a single column the fit does not even run. The algorithm was
-/// correct and unreachable.
-///
-/// Three conditions, and the first two are what keep this from becoming a way to override
-/// Layer-1:
-///
-/// 1. **Not already called**, and **too few unique markers to have been judged on its own**.
-///    A cluster with a usable unique panel that Layer-1 turned down was rejected on
-///    *unambiguous* evidence — its own markers, carried by nobody else. Re-admitting it here on
-///    *ambiguous* evidence would be second-guessing the stronger test with the weaker one. Only
-///    clusters the flat path was blind to are eligible.
-/// 2. **Contained in a single called cluster**, to within fewer markers than the support
-///    floor. That is the decomposable case: every row supporting it is a row its anchor also
-///    explains, so the fit has to apportion, and the anchor's extra markers are what pin
-///    `w_A` and let the shared rows give up `w_B`. A candidate with markers of its own that
-///    went unobserved is not ambiguous — it is absent.
-/// 3. **Actually observed** at the usual breadth floor, so a candidate with no reads behind it
-///    never enters the matrix.
-pub fn subset_candidates(
-    db: &StrainDb,
-    counts: &MarkerCounts,
-    called: &[usize],
-    p: &Params,
-) -> Vec<usize> {
-    if called.is_empty() {
-        return Vec::new();
-    }
-    let is_called = |j: usize| called.contains(&j);
-
-    let mut out = Vec::new();
-    for j in 0..db.n_strains() {
-        if is_called(j) || db.unique_marker_count(j) >= p.min_support_markers {
-            continue;
-        }
-        let ms = &db.strain_markers[j];
-        if ms.is_empty() {
-            continue;
-        }
-        // Containment must be against ONE called cluster, not the union of them.
-        //
-        // Union containment sounds equivalent and is not: on a dense within-species panel
-        // every cluster shares the species core with every other, so the union of two or
-        // three called clusters already covers almost any cluster in the database and the
-        // test admits nearly everything. Measured on 543 C. acnes genomes, the union form
-        // admitted the same spurious cluster in 4 of 5 samples. The case this layer exists
-        // for is a cluster contained in a *single* co-present relative — that is the
-        // relationship the design matrix can decompose, because the relative's own extra
-        // markers are what pin `w_A` and let the shared rows give up `w_B`. Spread the
-        // containment over several clusters and no such anchor exists.
-        // The test is ABSOLUTE, on the markers the candidate holds that its anchor does not.
-        //
-        // A fractional containment cannot express "subset" on a within-species panel: two
-        // conspecific genomes already share well over 95% of their tags, so a 0.95 threshold
-        // is satisfied by ordinary relatedness and admits nearly every low-unique cluster in
-        // the database — measured here, it admitted the same spurious cluster in 4 of 5
-        // samples. What matters is not the ratio but the count: 5% of a 33 000-tag set is
-        // 1 650 markers the candidate carries and the anchor lacks, and if those went
-        // unobserved that is evidence of absence, not ambiguity for the fit to resolve.
-        // Requiring fewer such markers than the support floor says the candidate has no
-        // testable evidence of its own — which is precisely when the joint fit is the only
-        // instrument left, and the only situation in which it should be trusted.
-        let outside = called
-            .iter()
-            .map(|&k| {
-                let other = &db.strain_markers[k];
-                ms.iter().filter(|m| !other.contains(m)).count()
-            })
-            .min()
-            .unwrap_or(usize::MAX);
-        if outside >= p.min_support_markers {
-            continue;
-        }
-        let v: Vec<Marker> = ms.iter().copied().collect();
-        let (panel, detected, _) = set_evidence(&v, counts);
-        if panel == 0 || (detected as f64 / panel as f64) < p.min_coverage {
-            continue;
-        }
-        out.push(j);
-    }
-    out
-}
-
-pub fn build_l2_design(db: &StrainDb, candidates: &[usize], counts: &MarkerCounts) -> L2Design {
-    let mut markers: Vec<Marker> = Vec::new();
-    let mut seen: crate::fxhash::FxHashSet<Marker> = crate::fxhash::FxHashSet::default();
-    for &j in candidates {
-        for &m in &db.strain_markers[j] {
-            if seen.insert(m) {
-                markers.push(m);
-            }
-        }
-    }
-    markers.sort_unstable();
-
-    let cols: Vec<Vec<f64>> = candidates
-        .iter()
-        .map(|&j| {
-            markers
-                .iter()
-                .map(|m| {
-                    if db.strain_markers[j].contains(m) {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                })
-                .collect()
-        })
-        .collect();
-    let y: Vec<f64> = markers
-        .iter()
-        .map(|m| counts.get(m).copied().unwrap_or(0) as f64)
-        .collect();
-    L2Design {
-        markers,
-        clusters: candidates.to_vec(),
-        cols,
-        y,
-    }
-}
-
-/// StrainScan's iterative pre-scan: greedily pick the cluster explaining the most **not yet
-/// explained** markers, then consume its markers so later candidates are judged on the residual.
-///
-/// This is the step the unique-only path cannot have: cluster-unique sets are disjoint by
-/// construction, so consuming one leaves the others untouched and the iteration is a no-op. It
-/// only bites once shared markers are in the matrix.
-///
-/// Returns column indices into `design.clusters`, in selection order.
-pub fn pre_scan(design: &L2Design, max_iter: usize, min_new_markers: usize) -> Vec<usize> {
-    let n_rows = design.n_rows();
-    let n_cols = design.cols.len();
-    if n_rows == 0 || n_cols == 0 {
-        return Vec::new();
-    }
-    let mut used = vec![false; n_rows];
-    let mut chosen: Vec<usize> = Vec::new();
-    let mut taken = vec![false; n_cols];
-
-    for _ in 0..max_iter.min(n_cols) {
-        let mut best = (0usize, 0usize); // (residual support, column)
-        for (j, is_taken) in taken.iter().enumerate() {
-            if *is_taken {
-                continue;
-            }
-            // Score by how many *residual* markers this cluster explains at count >= 1.
-            let score = (0..n_rows)
-                .filter(|&i| !used[i] && design.cols[j][i] > 0.0 && design.y[i] >= 1.0)
-                .count();
-            if score > best.0 {
-                best = (score, j);
-            }
-        }
-        if best.0 < min_new_markers {
-            break;
-        }
-        let j = best.1;
-        chosen.push(j);
-        taken[j] = true;
-        // Consume this cluster's markers unconditionally — this is what makes the loop
-        // terminate and what stops a near-duplicate cluster being selected on the same
-        // evidence as the winner.
-        for (i, u) in used.iter_mut().enumerate() {
-            if design.cols[j][i] > 0.0 {
-                *u = true;
-            }
-        }
-    }
-    chosen
-}
-
-/// Joint abundance for the selected clusters, via the non-negative Elastic Net.
-///
-/// Returns one depth per entry of `selected` (indices into `design.clusters`), in the same order.
-pub fn l2_abundance(design: &L2Design, selected: &[usize], alpha: f64, l1_ratio: f64) -> Vec<f64> {
-    if selected.is_empty() || design.n_rows() == 0 {
-        return vec![0.0; selected.len()];
-    }
-    let cols: Vec<Vec<f64>> = selected.iter().map(|&j| design.cols[j].clone()).collect();
-    nonneg_elastic_net(&cols, &design.y, alpha, l1_ratio, 2000, 1e-8)
 }
