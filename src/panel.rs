@@ -423,24 +423,6 @@ mod tests {
     use strain2bscan::db::StrainDb;
     use strain2bscan::depth::detectable_fraction;
 
-    fn kmer_db() -> StrainDb {
-        let mut db = StrainDb::build(vec![
-            ("A".into(), vec![1, 2, 3, 10]),
-            ("B".into(), vec![1, 2, 3, 20]),
-        ]);
-        db.enzymes = vec!["kmer15s1".to_string()];
-        db
-    }
-
-    fn enzyme_db() -> StrainDb {
-        let mut db = StrainDb::build(vec![
-            ("A".into(), vec![1, 2, 3, 10]),
-            ("B".into(), vec![1, 2, 3, 20]),
-        ]);
-        db.enzymes = vec!["BcgI".to_string()];
-        db
-    }
-
     #[test]
     fn multi_profile_panel_load_failure_propagates() {
         let dir = std::env::temp_dir().join(format!("s2bs_panel_test_{}", std::process::id()));
